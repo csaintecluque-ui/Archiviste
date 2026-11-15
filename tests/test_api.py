@@ -1,5 +1,5 @@
 """Tests de bout en bout de l'API Archiviste (avec le faux Ollama)."""
-import json, os, re, sys, urllib.request, urllib.parse
+import json, os, re, socket, sys, threading, time, urllib.request, urllib.parse
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8766"
 HOME = "/tmp/archi-home"
@@ -106,8 +106,50 @@ sr = call("GET", "/api/fs/search?path=" + urllib.parse.quote(HOME) + "&q=vacance
 check(len(sr["results"]) == 2, f"recherche par nom ({len(sr['results'])})")
 sr = call("GET", "/api/fs/search?path=" + urllib.parse.quote(HOME) + "&q=perso&content=1")
 check(any(e["name"] == "envoi été.txt" or e.get("extrait") for e in sr["results"]) or True, "recherche contenu")
+check(sr["incomplet"] is None and sr["tronque"] is False, "recherche complète : rien à signaler")
+for i in range(30):
+    open(f"{HOME}/Documents/lot-{i:02d}.txt", "w").write("x")
+sr = call("GET", "/api/fs/search?rapide=1&path=" + urllib.parse.quote(HOME) + "&q=lot-")
+check(len(sr["results"]) == 24 and sr["incomplet"] == "limite" and sr["tronque"], "recherche coupée : signalée (limite)")
+os.makedirs(HOME + "/Documents/lot-dossier", exist_ok=True)
+sr = call("GET", "/api/fs/search?path=" + urllib.parse.quote(HOME) + "&q=lot-")
+check(sr["results"][0]["dir"] and len(sr["results"]) == 31, "recherche : dossiers d'abord, un seul parcours")
 du = call("GET", "/api/fs/duplicates?path=" + urllib.parse.quote(dl))
-check(du["nb_groupes"] == 1, "doublons détectés")
+check(du["nb_groupes"] == 1 and du["incomplet"] is None, "doublons détectés")
+
+print("— liens symboliques")
+doc = HOME + "/Documents"
+os.makedirs(doc + "/Projet", exist_ok=True)
+open(doc + "/Projet/contrat.txt", "w").write("important")
+open(doc + "/rapport.txt", "w").write("rapport")
+os.makedirs(HOME + "/Bureau", exist_ok=True)
+os.symlink(doc + "/Projet", HOME + "/Bureau/Lien Projet")
+os.symlink("../Documents/rapport.txt", HOME + "/Bureau/lien-rapport.txt")  # lien relatif
+os.symlink(doc + "/n-existe-pas", HOME + "/Bureau/lien-casse")
+r = call("POST", "/api/fs/rename", {"path": HOME + "/Bureau/lien-rapport.txt", "new_name": "raccourci.txt"})
+check(os.path.islink(HOME + "/Bureau/raccourci.txt") and os.path.exists(doc + "/rapport.txt"), "renommer un lien : la cible ne bouge pas")
+r = call("POST", "/api/fs/move", {"paths": [HOME + "/Bureau/raccourci.txt"], "dest_dir": doc + "/Projet"})
+moved = doc + "/Projet/raccourci.txt"
+check(os.path.islink(moved) and open(moved).read() == "rapport" and os.path.exists(doc + "/rapport.txt"),
+      "déplacer un lien relatif : il mène toujours à sa cible")
+r = call("POST", "/api/fs/move", {"paths": [HOME + "/Bureau/Lien Projet"], "dest_dir": dl, "copy": True})
+check(os.path.islink(dl + "/Lien Projet") and os.path.islink(HOME + "/Bureau/Lien Projet"), "copier un lien : un lien, pas le dossier")
+r = call("POST", "/api/fs/move", {"paths": [HOME + "/Bureau/Lien Projet"], "dest_dir": HOME + "/Bureau"})
+check(os.listdir(HOME + "/Bureau").count("Lien Projet") == 1 and not os.path.lexists(HOME + "/Bureau/Lien Projet (2)"),
+      "déplacer un lien là où il est déjà : rien ne change")
+r = call("POST", "/api/fs/trash", {"paths": [HOME + "/Bureau/Lien Projet", dl + "/Lien Projet", HOME + "/Bureau/lien-casse"]})
+check(len(r["ok"]) == 3 and not os.path.lexists(HOME + "/Bureau/Lien Projet") and not os.path.lexists(HOME + "/Bureau/lien-casse")
+      and open(doc + "/Projet/contrat.txt").read() == "important", "corbeille sur un lien : le dossier visé reste intact")
+tl = {t["name"]: t for t in call("GET", "/api/trash")}
+call("POST", "/api/trash/restore", {"ids": [tl["Lien Projet"]["id"]]})
+check(any(os.path.islink(p) for p in (HOME + "/Bureau/Lien Projet", dl + "/Lien Projet")), "lien restauré depuis la corbeille")
+for p in (HOME + "/Bureau/Lien Projet", dl + "/Lien Projet"):
+    if os.path.islink(p):
+        os.unlink(p)
+os.symlink(doc + "/rapport.txt", dl + "/lien-a-trier.txt")
+sc = call("POST", "/api/sort/scan", {"path": dl})
+check(not any(f["name"] == "lien-a-trier.txt" for f in sc["files"]), "tri : les liens symboliques restent en place")
+os.unlink(dl + "/lien-a-trier.txt")
 
 print("— prompts / agents")
 pr = call("GET", "/api/prompts")
@@ -144,6 +186,49 @@ check(ev[-1]["t"] == "done", "modèle sans réflexion : repli automatique")
 call("POST", "/api/conversations/" + c["id"], {"modele": "inconnu:1b"})
 ev = stream("/api/chat", {"conv_id": c["id"], "message": "x"})
 check(ev[-1]["t"] == "error" and "ollama pull" in ev[-1]["d"], "modèle absent → conseil ollama pull")
+cv = call("GET", "/api/conversations/" + c["id"])
+last = cv["messages"][-1]
+check(last["role"] == "error" and "ollama pull" in last["content"] and last["reessayer"], "l'erreur reste dans la discussion")
+call("POST", "/api/conversations/" + c["id"], {"modele": ""})
+ev = stream("/api/chat", {"conv_id": c["id"], "regenerate": True})
+cv = call("GET", "/api/conversations/" + c["id"])
+check(ev[-1]["t"] == "done" and [m["role"] for m in cv["messages"][-2:]] == ["user", "assistant"]
+      and not any(m["role"] == "error" for m in cv["messages"]), "réessayer : l'erreur laisse la place à la réponse")
+ev = stream("/api/chat", {"conv_id": c["id"], "message": "avec un fichier absent", "attachments": [dl + "/absent.pdf"]})
+cv = call("GET", "/api/conversations/" + c["id"])
+check(ev[-1]["t"] == "error" and cv["messages"][-1]["role"] == "error" and cv["messages"][-1]["reessayer"] is False
+      and cv["messages"][-2]["content"] == "avec un fichier absent", "pièce jointe introuvable : question et erreur gardées")
+ev = stream("/api/chat", {"conv_id": c["id"], "message": "suite"})
+check(ev[-1]["t"] == "done", "la discussion continue après une erreur")
+
+print("— une seule réponse à la fois par discussion")
+c = call("POST", "/api/conversations", {})
+res = {}
+t = threading.Thread(target=lambda: res.update(ev=stream("/api/chat", {"conv_id": c["id"], "message": "[lent] bonjour"})))
+t.start()
+time.sleep(0.5)
+r = call("POST", "/api/conversations/" + c["id"], {"titre": "pendant la réponse"}, expect=409)
+check("en cours" in r.get("message", ""), "modifier la discussion pendant une réponse : refusé")
+r = call("POST", "/api/chat", {"conv_id": c["id"], "message": "deuxième"}, expect=409)
+check("déjà en cours" in r.get("message", ""), "deuxième réponse en même temps : refusée")
+t.join()
+cv = call("GET", "/api/conversations/" + c["id"])
+check(res["ev"][-1]["t"] == "done" and [m["role"] for m in cv["messages"]] == ["user", "assistant"], "la première réponse arrive entière")
+r = call("POST", "/api/conversations/" + c["id"], {"titre": "après"})
+check(r["titre"] == "après", "modifier la discussion une fois la réponse finie")
+c = call("POST", "/api/conversations", {})
+body = json.dumps({"conv_id": c["id"], "message": "[lent] abandonnée"}).encode()
+host, port = BASE.split("//")[1].split(":")
+sk = socket.create_connection((host, int(port)))
+sk.sendall((f"POST /api/chat HTTP/1.1\r\nHost: {host}:{port}\r\nX-Archiviste-Token: {TOKEN}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body)
+time.sleep(0.5)
+sk.close()  # la fenêtre est fermée (ou « Stop ») pendant que le modèle réfléchit encore
+ev = stream("/api/chat", {"conv_id": c["id"], "message": "après abandon"})
+time.sleep(1.8)  # le temps que la réponse abandonnée se termine côté Ollama
+cv = call("GET", "/api/conversations/" + c["id"])
+check(ev[-1]["t"] == "done" and [m["role"] for m in cv["messages"]] == ["user", "user", "assistant"],
+      f"réponse abandonnée : la suivante passe et n'est pas écrasée ({[m['role'] for m in cv['messages']]})")
 
 print("— ouvrir une appli depuis la discussion libre")
 c2 = call("POST", "/api/conversations", {})
@@ -234,13 +319,58 @@ r = call("POST", "/api/raccourcis/ajouter", {"type": "fichier", "cible": "/etc/h
 check("refusé" in r.get("message", ""), "épingler hors des dossiers autorisés refusé")
 ids = [x["id"] for x in call("GET", "/api/raccourcis")]
 r = call("POST", "/api/raccourcis/ordre", {"ids": ids[::-1][:-1]})
-check(len(r) == len(ids) - 1 and r[0]["titre"] == "Mémo.md", "réordonner, retirer")
+check(len(r) == len(ids) and r[0]["titre"] == "Mémo.md" and r[-1]["id"] == ids[0],
+      "réordonner : un raccourci absent de la liste est gardé")
+r = call("POST", "/api/raccourcis/retirer", {"id": ids[0]})
+check(len(r) == len(ids) - 1, "retirer un raccourci")
+for i in range(25):
+    open(f"{HOME}/Documents/epingle-{i}.txt", "w").write("x")
+base_n, stop = len(r), []
+def bascule():
+    k = 0
+    while not stop:
+        call("POST", "/api/bureau/reglages", {"volet": k % 2 == 0, "tri": ("nom", "date")[k % 2]})
+        k += 1
+ths = [threading.Thread(target=bascule) for _ in range(3)]
+[t.start() for t in ths]
+for i in range(25):
+    call("POST", "/api/raccourcis/ajouter", {"type": "fichier", "cible": f"{HOME}/Documents/epingle-{i}.txt"})
+stop.append(1)
+[t.join() for t in ths]
+n = len(call("GET", "/api/raccourcis"))
+check(n == base_n + 25, f"écritures simultanées : aucun raccourci perdu ({n - base_n}/25)")
+call("POST", "/api/raccourcis/defaut", {})
+b = call("POST", "/api/bureau/reglages", {"volet_largeur": 5000, "conv_heures": 12})
+check(b["volet_largeur"] == 900 and b["conv_heures"] == 12, "largeur du volet bornée, délai de nouvelle discussion")
+b = call("POST", "/api/bureau/reglages", {"volet_largeur": 0, "conv_heures": 4, "volet": True})
+check(b["volet_largeur"] is None and b["conv_heures"] == 4, "largeur du volet remise d'origine")
 apps = call("GET", "/api/apps")
 check(isinstance(apps["apps"], list), f"applications installées ({len(apps['apps'])})")
 ar = call("GET", "/api/bureau/a-ranger")
 check(ar["telechargements"]["fichiers"] >= 1, "fichiers à ranger")
 c1, c2 = call("GET", "/api/bureau/conv"), call("GET", "/api/bureau/conv")
 check(c1["id"] == c2["id"], "discussion du volet persistante")
+stream("/api/chat", {"conv_id": c1["id"], "message": "question d'hier"})
+check(call("GET", "/api/bureau/conv")["id"] == c1["id"], "discussion récente : gardée")
+cf = f"{HOME}/.local/share/archiviste/conversations/{c1['id']}.json"
+old = json.load(open(cf))
+old["modifie"] = "2020-01-01T08:00:00"
+json.dump(old, open(cf, "w"))
+check(call("GET", "/api/bureau/conv?rotation=0")["id"] == c1["id"], "simple relecture : pas de nouvelle discussion")
+c3 = call("GET", "/api/bureau/conv")
+check(c3["id"] != c1["id"] and c3["auto"] and c3["precedente"] == c1["id"] and not c3["messages"],
+      "longue pause : nouvelle discussion, l'ancienne reste disponible")
+c4 = call("POST", "/api/bureau/conv/nouvelle", {})
+check(c4["id"] == c3["id"], "« + » sur une discussion vide : pas de discussion vide en plus")
+c5 = call("POST", "/api/bureau/conv/reprendre", {})
+check(c5["id"] == c1["id"] and call("GET", "/api/bureau/conv")["id"] == c1["id"]
+      and not os.path.exists(cf.replace(c1["id"], c3["id"])), "reprendre la discussion précédente")
+call("POST", "/api/bureau/reglages", {"conv_heures": 0})
+json.dump(old, open(cf, "w"))
+check(call("GET", "/api/bureau/conv")["id"] == c1["id"], "délai « jamais » : la discussion est gardée")
+call("POST", "/api/bureau/reglages", {"conv_heures": 4})
+sg = call("GET", "/api/bureau/sig")
+check(sg["cv"].startswith(c1["id"] + ":"), "signature de la discussion du volet")
 r = call("POST", "/api/app/ouvrir", {"vue": "files"})
 check(r["ok"] is False, "sans fenêtre GTK : ouverture déclinée proprement")
 check(call("GET", "/bureau", raw=True).startswith("<!doctype html>"), "page du bureau servie")

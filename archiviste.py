@@ -21,7 +21,9 @@ import mimetypes
 import os
 import re
 import secrets
+import select
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -37,7 +39,7 @@ from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -109,6 +111,14 @@ class Store:
         with self.lock:
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
             os.replace(tmp, path)
+
+    def update(self, name: str, default, fn):
+        """Lecture, modification puis écriture d'un seul tenant : aucune autre requête ne s'intercale."""
+        with self.lock:
+            data = self.read(name, default)
+            out = fn(data)
+            self.write(name, data)
+            return out
 
     def delete(self, name: str) -> None:
         with self.lock:
@@ -193,6 +203,11 @@ def get_settings() -> dict:
 
 
 def save_settings(body: dict) -> dict:
+    with store.lock:
+        return _save_settings(body)
+
+
+def _save_settings(body: dict) -> dict:
     s = get_settings()
     for key in DEFAULT_SETTINGS:
         if key in body:
@@ -248,7 +263,9 @@ def within(path: str, root: str) -> bool:
 
 
 def safe_path(p, base: str | None = None, roots: list[str] | None = None,
-              must_exist: bool = False) -> str:
+              must_exist: bool = False, nofollow: bool = False) -> str:
+    """Chemin réel, vérifié dans les dossiers autorisés. Avec nofollow, un lien symbolique reste le lien
+    lui-même (pour le renommer, le déplacer ou le mettre à la corbeille sans toucher à sa cible)."""
     roots = roots or allowed_roots()
     p = str(p or "").strip()
     if "\x00" in p:
@@ -259,12 +276,38 @@ def safe_path(p, base: str | None = None, roots: list[str] | None = None,
         p = os.path.expanduser(p)
     if not os.path.isabs(p):
         p = os.path.join(base or roots[0], p)
-    real = os.path.realpath(p)
+    real = lexical_path(p) if nofollow else os.path.realpath(p)
     if not any(within(real, r) for r in roots):
         raise ApiError(f"Accès refusé : « {p} » est en dehors des dossiers autorisés.", 403)
     if must_exist and not os.path.lexists(real):
         raise ApiError(f"Introuvable : « {p} ».", 404)
     return real
+
+
+def lexical_path(p: str) -> str:
+    """Dossier parent résolu (liens suivis), dernier élément gardé tel quel : désigne un lien, pas sa cible."""
+    p = os.path.normpath(p)
+    folder, name = os.path.split(p)
+    if not name:
+        return os.path.realpath(p)
+    return os.path.join(os.path.realpath(folder), name)
+
+
+def link_target(link: str) -> str:
+    """Cible d'un lien symbolique, en chemin absolu."""
+    t = os.readlink(link)
+    return t if os.path.isabs(t) else os.path.normpath(os.path.join(os.path.dirname(link), t))
+
+
+def move_entry(src: str, target: str) -> None:
+    """Déplace un élément. Un lien symbolique relatif changé de dossier est recréé vers la même cible,
+    sinon il ne mènerait plus nulle part."""
+    if os.path.islink(src) and not os.path.isabs(os.readlink(src)) \
+            and os.path.dirname(target) != os.path.dirname(src):
+        os.symlink(link_target(src), target)
+        os.unlink(src)
+    else:
+        shutil.move(src, target)
 
 
 def is_root(path: str, roots: list[str] | None = None) -> bool:
@@ -551,7 +594,7 @@ def fs_mkdir(path: str, roots=None, base=None) -> dict:
 
 def fs_move(src: str, dest: str, roots=None, base=None, copy: bool = False) -> dict:
     roots = roots or allowed_roots()
-    s = safe_path(src, base=base, roots=roots, must_exist=True)
+    s = safe_path(src, base=base, roots=roots, must_exist=True, nofollow=True)  # un lien : le lien, pas sa cible
     if is_root(s, roots) and not copy:
         raise ApiError("On ne déplace pas un dossier racine autorisé.")
     d = safe_path(dest, base=base, roots=roots)
@@ -560,24 +603,27 @@ def fs_move(src: str, dest: str, roots=None, base=None, copy: bool = False) -> d
     else:
         target = d
         os.makedirs(os.path.dirname(target), exist_ok=True)
-    if os.path.isdir(s) and within(os.path.realpath(target), s):
+    link = os.path.islink(s)
+    if not link and os.path.isdir(s) and within(os.path.realpath(target), s):
         raise ApiError("Impossible de mettre un dossier dans lui-même.")
-    if os.path.realpath(target) == s:
+    if lexical_path(target) == s:
         return {"de": s, "vers": s, "inchange": True}
     target = unique_path(target)
     if copy:
-        if os.path.isdir(s):
+        if link:
+            os.symlink(link_target(s), target)
+        elif os.path.isdir(s):
             shutil.copytree(s, target, symlinks=True)
         else:
             shutil.copy2(s, target)
     else:
-        shutil.move(s, target)
+        move_entry(s, target)
     return {"de": s, "vers": target}
 
 
 def fs_rename(path: str, new_name: str, roots=None, base=None) -> dict:
     roots = roots or allowed_roots()
-    s = safe_path(path, base=base, roots=roots, must_exist=True)
+    s = safe_path(path, base=base, roots=roots, must_exist=True, nofollow=True)
     if is_root(s, roots):
         raise ApiError("On ne renomme pas un dossier racine autorisé.")
     new_name = check_name(new_name)
@@ -591,10 +637,10 @@ def fs_rename(path: str, new_name: str, roots=None, base=None) -> dict:
 # ── Corbeille (norme freedesktop : visible et restaurable depuis Nemo) ──
 def trash(path: str, roots=None, base=None) -> dict:
     roots = roots or allowed_roots()
-    real = safe_path(path, base=base, roots=roots, must_exist=True)
+    real = safe_path(path, base=base, roots=roots, must_exist=True, nofollow=True)
     if is_root(real, roots):
         raise ApiError("On ne met pas un dossier racine autorisé à la corbeille.")
-    if within(str(TRASH_DIR), real):
+    if not os.path.islink(real) and within(str(TRASH_DIR), real):
         raise ApiError("Ce dossier contient la corbeille elle-même.")
     files, info = TRASH_DIR / "files", TRASH_DIR / "info"
     files.mkdir(parents=True, exist_ok=True)
@@ -683,7 +729,10 @@ def trash_purge(tid: str) -> dict:
 
 
 # ── Recherche & doublons ──
-def walk_files(base: str, show_hidden: bool, max_items: int = 20000, deadline: float | None = None):
+def walk_files(base: str, show_hidden: bool, max_items: int = 20000, deadline: float | None = None,
+               etat: dict | None = None):
+    """Parcourt les fichiers d'un dossier. Si le parcours s'arrête avant la fin, etat["coupe"] dit pourquoi :
+    « temps » (délai dépassé) ou « limite » (trop de fichiers)."""
     count = 0
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = sorted(d for d in dirnames
@@ -691,58 +740,82 @@ def walk_files(base: str, show_hidden: bool, max_items: int = 20000, deadline: f
         for name in sorted(filenames):
             if not show_hidden and name.startswith("."):
                 continue
+            if count >= max_items or (deadline and time.time() > deadline):
+                if etat is not None:
+                    etat["coupe"] = "limite" if count >= max_items else "temps"
+                return
             yield dirpath, dirnames, name
             count += 1
-            if count >= max_items or (deadline and time.time() > deadline):
-                return
 
 
 def fs_search(base: str, query: str, in_content: bool, roots=None, show_hidden=False, limit=300,
               delay: float = 12) -> dict:
+    """Cherche par nom (et dans le contenu si demandé), en un seul parcours. Si la recherche s'arrête avant
+    d'avoir tout vu, « incomplet » dit pourquoi : « temps » (délai dépassé) ou « limite » (trop de résultats)."""
     real = safe_path(base, roots=roots, must_exist=True)
     q = (query or "").strip()
     if not q:
         raise ApiError("Que faut-il chercher ?")
     wildcard = any(c in q for c in "*?[")
     ql = q.casefold()
-    results, deadline = [], time.time() + delay
-    # dossiers dont le nom correspond
-    for dirpath, dirnames, _ in os.walk(real):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and (show_hidden or not d.startswith("."))]
+    match = (lambda n: fnmatch(n.casefold(), ql)) if wildcard else (lambda n: ql in n.casefold())
+    results, cut, deadline = [], None, time.time() + delay
+    max_dirs, ndirs = max(1, limit // 3), 0
+    for dirpath, dirnames, filenames in os.walk(real):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and (show_hidden or not d.startswith(".")))
         for d in dirnames:
-            if (fnmatch(d.casefold(), ql) if wildcard else ql in d.casefold()):
-                results.append(entry_info(os.path.join(dirpath, d), d))
-        if len(results) >= limit // 3 or time.time() > deadline:
-            break
-    for dirpath, _, name in walk_files(real, show_hidden, 100000, deadline):
-        full = os.path.join(dirpath, name)
-        hit = fnmatch(name.casefold(), ql) if wildcard else ql in name.casefold()
-        snippet = None
-        if not hit and in_content and not wildcard:
-            try:
-                if os.path.getsize(full) < 3_000_000:
-                    txt, _ = extract_text(full, 200000)
-                    if txt:
-                        pos = txt.casefold().find(ql)
-                        if pos >= 0:
-                            hit = True
-                            snippet = txt[max(0, pos - 60): pos + 100].replace("\n", " ")
-            except OSError:
-                pass
-        if hit:
-            e = entry_info(full, name)
-            if snippet:
-                e["extrait"] = snippet
-            results.append(e)
-            if len(results) >= limit:
+            if ndirs < max_dirs and match(d):
+                try:
+                    results.append(entry_info(os.path.join(dirpath, d), d))
+                    ndirs += 1
+                except OSError:
+                    pass
+        for name in sorted(filenames):
+            if not show_hidden and name.startswith("."):
+                continue
+            if time.time() > deadline:
+                cut = "temps"
                 break
-    return {"base": real, "query": q, "results": results, "tronque": len(results) >= limit}
+            full = os.path.join(dirpath, name)
+            hit = match(name)
+            snippet = None
+            if not hit and in_content and not wildcard:
+                try:
+                    if os.path.getsize(full) < 3_000_000:
+                        txt, _ = extract_text(full, 200000)
+                        if txt:
+                            pos = txt.casefold().find(ql)
+                            if pos >= 0:
+                                hit = True
+                                snippet = txt[max(0, pos - 60): pos + 100].replace("\n", " ")
+                except OSError:
+                    pass
+            if hit:
+                try:
+                    e = entry_info(full, name)
+                except OSError:
+                    continue
+                if snippet:
+                    e["extrait"] = snippet
+                results.append(e)
+                if len(results) >= limit:
+                    cut = "limite"
+                    break
+        if cut:
+            break
+        if time.time() > deadline:
+            cut = "temps"
+            break
+    results.sort(key=lambda e: not e["dir"])  # dossiers d'abord, sans changer l'ordre du reste
+    return {"base": real, "query": q, "results": results, "tronque": cut is not None, "incomplet": cut,
+            "delai": delay}
 
 
 def find_duplicates(base: str, roots=None, show_hidden=False) -> dict:
     real = safe_path(base, roots=roots, must_exist=True)
     by_size: dict[int, list[str]] = {}
-    for dirpath, _, name in walk_files(real, show_hidden, 30000, time.time() + 40):
+    etat: dict = {}
+    for dirpath, _, name in walk_files(real, show_hidden, 30000, time.time() + 40, etat):
         full = os.path.join(dirpath, name)
         try:
             if os.path.islink(full):
@@ -788,7 +861,7 @@ def find_duplicates(base: str, roots=None, show_hidden=False) -> dict:
     groups.sort(key=lambda g: g["taille"] * (len(g["fichiers"]) - 1), reverse=True)
     gain = sum(g["taille"] * (len(g["fichiers"]) - 1) for g in groups)
     return {"dossier": real, "groupes": groups[:100], "nb_groupes": len(groups),
-            "place_recuperable": human_size(gain)}
+            "place_recuperable": human_size(gain), "incomplet": etat.get("coupe")}
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1069,20 +1142,27 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
             if not os.path.isdir(path):
                 raise ApiError("Ce n'est pas un dossier.")
             items = []
+            etat: dict = {}
             if to_bool(a.get("recursif")):
-                for dirpath, dirnames, name_ in walk_files(path, hidden, 300):
+                for dirpath, dirnames, name_ in walk_files(path, hidden, 300, etat=etat):
                     full = os.path.join(dirpath, name_)
                     e = entry_info(full, name_)
                     items.append({"nom": os.path.relpath(full, path), "taille": human_size(e["size"]),
                                   "modifie": dt.datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d")})
             else:
-                for e in fs_list(path, hidden)["entries"][:300]:
+                entries = fs_list(path, hidden)["entries"]
+                if len(entries) > 300:
+                    etat["coupe"] = "limite"
+                for e in entries[:300]:
                     items.append({"nom": e["name"] + ("/" if e["dir"] else ""),
                                   "type": "dossier" if e["dir"] else (e["ext"] or "fichier"),
                                   "taille": None if e["dir"] else human_size(e["size"]),
                                   "modifie": dt.datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d")})
             res = {"dossier": _short(path, base), "nombre": len(items), "elements": items}
-            return res, f"{len(items)} élément(s) dans « {_short(path, base)} »", True
+            if etat.get("coupe"):
+                res["incomplet"] = "Liste coupée à 300 éléments : il y en a d'autres."
+            return res, (f"{len(items)} élément(s) dans « {_short(path, base)} »"
+                         + (" — liste incomplète" if etat.get("coupe") else "")), True
         if name == "lire_fichier":
             path = safe_path(a.get("chemin"), base=base, roots=roots, must_exist=True)
             if os.path.isdir(path):
@@ -1104,7 +1184,13 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
                           to_bool(a.get("dans_contenu")), roots=roots, show_hidden=hidden, limit=60)
             items = [{"chemin": _short(e["path"], base), "taille": human_size(e["size"]),
                       **({"extrait": e["extrait"]} if e.get("extrait") else {})} for e in r["results"]]
-            return {"motif": r["query"], "nombre": len(items), "resultats": items}, f"{len(items)} résultat(s)", True
+            res = {"motif": r["query"], "nombre": len(items), "resultats": items}
+            if r["incomplet"]:
+                res["incomplet"] = ("Recherche arrêtée avant la fin (dossier trop volumineux) : d'autres fichiers "
+                                    "peuvent correspondre. Cherche dans un sous-dossier plus précis."
+                                    if r["incomplet"] == "temps" else
+                                    "Seuls les premiers résultats sont listés : précise le motif.")
+            return res, f"{len(items)} résultat(s)" + (" — recherche incomplète" if r["incomplet"] else ""), True
         if name == "infos_fichier":
             path = safe_path(a.get("chemin"), base=base, roots=roots, must_exist=True)
             e = entry_info(path)
@@ -1124,9 +1210,11 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
                                 roots=roots, show_hidden=hidden)
             groups = [{"taille": g["taille_lisible"], "fichiers": [_short(p, base) for p in g["fichiers"]]}
                       for g in r["groupes"][:40]]
-            return ({"groupes": groups, "nb_groupes": r["nb_groupes"],
-                     "place_recuperable": r["place_recuperable"]},
-                    f"{r['nb_groupes']} groupe(s) de doublons, {r['place_recuperable']} récupérables", True)
+            res = {"groupes": groups, "nb_groupes": r["nb_groupes"], "place_recuperable": r["place_recuperable"]}
+            if r["incomplet"]:
+                res["incomplet"] = "Dossier trop volumineux : tous les fichiers n'ont pas été comparés."
+            return (res, f"{r['nb_groupes']} groupe(s) de doublons, {r['place_recuperable']} récupérables"
+                    + (" — analyse incomplète" if r["incomplet"] else ""), True)
         if name == "creer_dossier":
             r = fs_mkdir(a.get("chemin"), roots=roots, base=base)
             return r, ("Existait déjà : " if r["existait"] else "Créé : ") + _short(r["path"], base), True
@@ -1168,6 +1256,9 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
                 msg = f"Aucune application installée ne s'appelle « {a.get('nom', '')} »."
                 return ({"erreur": msg, "applications_proches": proches},
                         msg + (f" Proches : {', '.join(proches)}" if proches else ""), False)
+            if raise_app(app["id"]):
+                return ({"application": app["nom"], "deja_ouverte": True, "affichee": True},
+                        f"Déjà ouverte, ramenée devant : {app['nom']}", True)
             launch_app(app)
             return {"application": app["nom"], "lancee": True}, f"Lancée : {app['nom']}", True
         if name == "ouvrir":
@@ -1253,19 +1344,21 @@ def default_agents() -> list[dict]:
 
 
 def get_prompts() -> list[dict]:
-    data = store.read("prompts.json", None)
-    if data is None:
-        data = default_prompts()
-        store.write("prompts.json", data)
-    return data
+    with store.lock:
+        data = store.read("prompts.json", None)
+        if data is None:
+            data = default_prompts()
+            store.write("prompts.json", data)
+        return data
 
 
 def get_agents() -> list[dict]:
-    data = store.read("agents.json", None)
-    if data is None:
-        data = default_agents()
-        store.write("agents.json", data)
-    return data
+    with store.lock:
+        data = store.read("agents.json", None)
+        if data is None:
+            data = default_agents()
+            store.write("agents.json", data)
+        return data
 
 
 def find_agent(aid: str | None) -> dict | None:
@@ -1275,6 +1368,11 @@ def find_agent(aid: str | None) -> dict | None:
 
 
 def upsert(kind: str, item: dict) -> dict:
+    with store.lock:
+        return _upsert(kind, item)
+
+
+def _upsert(kind: str, item: dict) -> dict:
     file = f"{kind}.json"
     items = get_prompts() if kind == "prompts" else get_agents()
     t = now_iso()
@@ -1318,9 +1416,10 @@ def upsert(kind: str, item: dict) -> dict:
 
 
 def remove(kind: str, iid: str) -> dict:
-    items = get_prompts() if kind == "prompts" else get_agents()
-    items = [i for i in items if i["id"] != iid]
-    store.write(f"{kind}.json", items)
+    with store.lock:
+        items = get_prompts() if kind == "prompts" else get_agents()
+        items = [i for i in items if i["id"] != iid]
+        store.write(f"{kind}.json", items)
     return {"ok": True}
 
 
@@ -1496,7 +1595,65 @@ def tool_message(call: dict) -> dict:
             "refuse": call.get("refuse", False), "ts": now_iso()}
 
 
+# Une seule réponse à la fois par discussion : deux fenêtres (volet, « Demander », fenêtre principale) qui
+# écriraient en même temps dans le même fichier se feraient perdre des messages.
+_RUNS: dict[str, object] = {}  # identifiant de discussion → requête (Handler) qui y écrit en ce moment
+_RUNS_LOCK = threading.RLock()
+
+
+def _client_gone(h) -> bool:
+    """Le navigateur a-t-il coupé la connexion de cette requête (bouton Stop, fenêtre fermée) ?"""
+    try:
+        sock = h.connection
+        if not select.select([sock], [], [], 0)[0]:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
+
+
+def conv_busy(cid: str) -> bool:
+    with _RUNS_LOCK:
+        return cid in _RUNS
+
+
+def conv_claim(cid: str, h=None) -> bool:
+    """Réserve la discussion pour la requête h (ou vérifie seulement qu'elle est libre si h est None).
+    Une réponse dont le navigateur est parti est écartée : elle n'écrira plus rien."""
+    with _RUNS_LOCK:
+        old = _RUNS.get(cid)
+        if old is not None:
+            if not (old.cancelled or _client_gone(old)):
+                return False
+            old.cancelled = True
+            del _RUNS[cid]
+        if h is not None:
+            _RUNS[cid] = h
+        return True
+
+
+def conv_release(cid: str, h=None) -> None:
+    """Libère la discussion. Sans h : écarte aussi la réponse en cours (discussion supprimée)."""
+    with _RUNS_LOCK:
+        old = _RUNS.get(cid)
+        if old is not None and (h is None or old is h):
+            if h is None:
+                old.cancelled = True
+            del _RUNS[cid]
+
+
 def run_chat(h, body: dict) -> None:
+    cid = str(body.get("conv_id") or "")
+    conv_path(cid)
+    if not conv_claim(cid, h):
+        raise ApiError("Une réponse est déjà en cours dans cette discussion : attends-la ou arrête-la.", 409)
+    try:
+        _run_chat(h, body)
+    finally:
+        conv_release(cid, h)
+
+
+def _run_chat(h, body: dict) -> None:
     s = get_settings()
     conv = load_conv(body.get("conv_id", ""))
     agent = find_agent(conv.get("agent_id"))
@@ -1513,9 +1670,32 @@ def run_chat(h, body: dict) -> None:
     confirm = (agent or {}).get("confirmer", True)
     ctx = conv_context(conv, agent, s)
 
+    def save() -> None:
+        with _RUNS_LOCK:
+            if h.cancelled:  # une autre requête a repris cette discussion : ne rien écraser
+                raise ClientGone()
+            save_conv(conv)
+
+    def fail(msg: str, retry: bool = True) -> None:
+        """L'erreur est gardée dans la discussion : elle reste à l'écran au lieu de disparaître au rafraîchissement."""
+        conv["messages"].append({"role": "error", "content": msg, "reessayer": retry, "ts": now_iso()})
+        save()
+        h.emit({"t": "error", "d": msg, "reessayer": retry})
+
     h.start_stream()
     h.emit({"t": "start", "model": model, "agent": (agent or {}).get("nom")})
+    try:
+        _chat_turn(h, body, s, conv, agent, model, think, temperature, confirm, ctx, save, fail)
+    except ClientGone:
+        raise
+    except (ApiError, OllamaError) as e:
+        fail(str(e))
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        fail(f"Erreur interne : {e}")
 
+
+def _chat_turn(h, body, s, conv, agent, model, think, temperature, confirm, ctx, save, fail) -> None:
     # 1) Décisions sur les actions en attente
     pending = conv.get("pending")
     if pending:
@@ -1534,9 +1714,9 @@ def run_chat(h, body: dict) -> None:
         for call in pending:
             conv["messages"].append(tool_message(call))
         conv["pending"] = None
-        save_conv(conv)
+        save()
 
-    # 2) Régénérer : on retire la dernière réponse
+    # 2) Régénérer / réessayer : on retire la dernière réponse (ou la dernière erreur)
     if body.get("regenerate"):
         while conv["messages"] and conv["messages"][-1].get("role") != "user":
             conv["messages"].pop()
@@ -1548,19 +1728,28 @@ def run_chat(h, body: dict) -> None:
     message = str(body.get("message") or "").strip()
     attachments = body.get("attachments") or []
     if message or attachments:
-        ctx_text, atts, images = expand_attachments(attachments, s) if attachments else ("", [], [])
-        um = {"role": "user", "content": message, "ts": now_iso()}
-        if ctx_text:
-            um["ctx"] = (message + "\n\n" + ctx_text).strip()
-        if atts:
-            um["attachments"] = atts
-        if images:
-            um["images"] = images
-        conv["messages"].append(um)
-        if not conv.get("titre"):
-            conv["titre"] = (message or atts[0]["name"])[:70]
-        save_conv(conv)
-        h.emit({"t": "user_saved", "titre": conv["titre"]})
+        att_err = None
+        try:
+            ctx_text, atts, images = expand_attachments(attachments, s) if attachments else ("", [], [])
+        except (ApiError, OSError) as e:
+            ctx_text, atts, images = "", [], []
+            att_err = str(e) if isinstance(e, ApiError) else f"lecture impossible ({e.strerror or e})"
+        if message or atts:
+            um = {"role": "user", "content": message, "ts": now_iso()}
+            if ctx_text:
+                um["ctx"] = (message + "\n\n" + ctx_text).strip()
+            if atts:
+                um["attachments"] = atts
+            if images:
+                um["images"] = images
+            conv["messages"].append(um)
+            if not conv.get("titre"):
+                conv["titre"] = (message or atts[0]["name"])[:70]
+            save()
+            h.emit({"t": "user_saved", "titre": conv["titre"]})
+        if att_err:
+            fail(f"Pièce jointe refusée : {att_err}", retry=False)
+            return
 
     if not conv["messages"]:
         h.emit({"t": "error", "d": "Message vide."})
@@ -1587,7 +1776,10 @@ def run_chat(h, body: dict) -> None:
                 conv["messages"].append({"role": "assistant", "content": part.get("content", ""),
                                          "thinking": part.get("thinking", ""), "interrompu": True,
                                          "ts": now_iso()})
-                save_conv(conv)
+                try:
+                    save()
+                except ClientGone:
+                    pass
             raise
         except OllamaError as e:
             low = str(e).lower()
@@ -1597,7 +1789,7 @@ def run_chat(h, body: dict) -> None:
                 rnd -= 1
                 h.emit({"t": "notice", "d": "Le modèle a mal formé un appel d'outil, nouvelle tentative…"})
                 continue
-            h.emit({"t": "error", "d": str(e)})
+            fail(str(e))
             return
 
         msg = {"role": "assistant", "content": res["content"], "ts": now_iso(), "model": model}
@@ -1609,7 +1801,7 @@ def run_chat(h, body: dict) -> None:
         if st.get("eval_count") and st.get("eval_duration"):
             msg["vitesse"] = round(st["eval_count"] / (st["eval_duration"] / 1e9), 1)
         conv["messages"].append(msg)
-        save_conv(conv)
+        save()
         h.emit({"t": "message_end", "vitesse": msg.get("vitesse"), "tokens": st.get("eval_count")})
 
         if not res["tool_calls"]:
@@ -1640,16 +1832,16 @@ def run_chat(h, body: dict) -> None:
 
         if any(c["needs"] for c in calls):
             conv["pending"] = calls
-            save_conv(conv)
+            save()
             h.emit({"t": "confirm", "pending": [
                 {"id": c["id"], "name": c["name"], "label": c["label"], "description": c["description"],
                  "args": c["args"]} for c in calls if c["needs"]]})
             return
         for c in calls:
             conv["messages"].append(tool_message(c))
-        save_conv(conv)
+        save()
 
-    h.emit({"t": "error", "d": f"Arrêt de sécurité : l'agent a enchaîné {MAX_ROUNDS} étapes sans conclure."})
+    fail(f"Arrêt de sécurité : l'agent a enchaîné {MAX_ROUNDS} étapes sans conclure.")
 
 
 def run_oneshot(h, body: dict) -> None:
@@ -1704,7 +1896,7 @@ def sort_scan(base: str, recursive: bool, with_content: bool, show_hidden: bool)
             e = entry_info(full, name)
         except OSError:
             continue
-        if e["dir"]:
+        if e["dir"] or e["link"]:  # un lien symbolique reste où il est : le déplacer pourrait le casser
             continue
         e["rel"] = os.path.relpath(full, real)
         e["categorie"] = EXT_CAT.get(e["ext"], "Autres")
@@ -1823,7 +2015,9 @@ def sort_apply(body: dict) -> dict:
     moves, errors, created = [], [], []
     for mv in body.get("moves") or []:
         try:
-            src = safe_path(mv.get("path"), must_exist=True)
+            src = safe_path(mv.get("path"), must_exist=True, nofollow=True)
+            if os.path.islink(src):
+                raise ApiError("lien symbolique laissé en place")
             if not within(src, base) or not os.path.isfile(src):
                 raise ApiError("fichier hors du dossier trié")
             folder = clean_folder(mv.get("dossier"))
@@ -1849,11 +2043,14 @@ def sort_apply(body: dict) -> dict:
             errors.append({"fichier": mv.get("path"), "erreur": str(e)})
     jid = None
     if moves:
-        journal = store.read("journal.json", list)
         jid = new_id("j_")
-        journal.insert(0, {"id": jid, "date": now_iso(), "base": base, "mode": body.get("mode", ""),
-                           "moves": moves, "crees": created, "annule": False})
-        store.write("journal.json", journal[:60])
+        entry = {"id": jid, "date": now_iso(), "base": base, "mode": body.get("mode", ""),
+                 "moves": moves, "crees": created, "annule": False}
+
+        def add(journal):
+            journal.insert(0, entry)
+            del journal[60:]
+        store.update("journal.json", list, add)
     return {"deplaces": len(moves), "erreurs": errors, "journal_id": jid}
 
 
@@ -1881,9 +2078,12 @@ def sort_undo(jid: str) -> dict:
             os.rmdir(d)
         except OSError:
             pass
-    entry["annule"] = True
-    entry["annule_le"] = now_iso()
-    store.write("journal.json", journal)
+    def mark(current):  # relu au dernier moment : un tri fait entre-temps n'est pas perdu
+        for j in current:
+            if j["id"] == jid:
+                j["annule"] = True
+                j["annule_le"] = now_iso()
+    store.update("journal.json", list, mark)
     return {"restaures": ok, "erreurs": errors}
 
 
@@ -2483,7 +2683,12 @@ BUREAU_DEFAUT = {
     "fond": "auto",            # auto | archiviste : dessiner soi-même le fond d'écran
     "nemo_avant": None,        # réglage du bureau de Nemo avant activation (pour le rétablir)
     "touche": None,            # raccourci clavier « Demander à l'Archiviste » posé dans Cinnamon
+    "volet_largeur": None,     # largeur du volet en pixels (None : largeur d'origine)
+    "conv_heures": 4,          # après tant d'heures sans échange, le volet repart sur une nouvelle discussion (0 : jamais)
+    "conv_precedente": None,   # discussion du volet d'avant, pour « Reprendre la précédente »
 }
+CONV_HEURES = (0, 1, 4, 12, 24)
+VOLET_MIN, VOLET_MAX = 440, 900
 
 
 def bureau_state() -> dict:
@@ -2492,8 +2697,9 @@ def bureau_state() -> dict:
     return st
 
 
-def bureau_save(st: dict) -> None:
-    store.write("bureau.json", st)
+def bureau_patch(**changes) -> dict:
+    """Change quelques réglages du bureau sans écraser ce qu'une autre fenêtre vient d'écrire (raccourcis…)."""
+    return store.update("bureau.json", dict, lambda st: st.update(changes) or dict(st))
 
 
 def user_dir(key: str, *fallbacks: str) -> str:
@@ -2663,7 +2869,8 @@ def app_info(aid: str, path: str, e: dict) -> dict:
     return {"id": aid, "nom": desk_val(e, "Name") or aid[:-8], "generique": desk_val(e, "GenericName"),
             "description": desk_val(e, "Comment"), "icone": e.get("Icon", ""), "fichier": path,
             "categories": desk_list(e, "Categories"), "mots": desk_list(e, "Keywords", True),
-            "mime": desk_list(e, "MimeType"), "exec": e.get("Exec", ""), "terminal": to_bool(e.get("Terminal"))}
+            "mime": desk_list(e, "MimeType"), "exec": e.get("Exec", ""), "terminal": to_bool(e.get("Terminal")),
+            "wmclass": e.get("StartupWMClass", "")}
 
 
 def public_app(a: dict) -> dict:
@@ -3046,6 +3253,150 @@ def apps_for(path: str) -> dict:
     return {"mime": mime, "defaut": defaut if defaut in idx["by_id"] else None, "apps": [public_app(a) for a in apps]}
 
 
+# ── fenêtres ouvertes (le volet sert de dock : repère « appli ouverte », ramener ou réduire d'un clic) ──
+WINDOWS_HOOK = None  # renseigné par fenetre.py : suivi des fenêtres du bureau — .version, .snapshot(), .act(xids, action)
+_GENERIC_CMDS = {"env", "sh", "bash", "dash", "python", "python3", "flatpak", "snap", "gtk-launch", "xdg-open",
+                 "electron", "java", "wine", "node", "perl", "ruby", "exo-open", "gio", "pkexec", "sudo"}
+
+
+def _proc_names(pid) -> set[str]:
+    """Noms sous lesquels tourne un processus (exécutable, premiers arguments), pour le rattacher à une appli."""
+    out = set()
+    try:
+        out.add(os.path.basename(os.readlink(f"/proc/{int(pid)}/exe")))
+    except (OSError, TypeError, ValueError):
+        pass
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            args = f.read(4096).split(b"\0")
+        for a in args[:2]:
+            a = a.decode("utf-8", "replace")
+            if a and not a.startswith("-"):
+                out.add(os.path.basename(a))
+    except (OSError, TypeError, ValueError):
+        pass
+    return {_compact(_fold(n)) for n in out if n and n.lower() not in _GENERIC_CMDS} - {""}
+
+
+def _app_wm_names(a: dict) -> tuple[str, str, str]:
+    """Nom du fichier .desktop (entier et dernier segment) et commande, réduits à leurs lettres et chiffres."""
+    aid = os.path.basename(a["id"])
+    stem = aid[:-8] if aid.endswith(".desktop") else aid
+    cmd = _exec_cmd(a)
+    return (_compact(_fold(stem)), _compact(_fold(stem.rsplit(".", 1)[-1])),
+            "" if cmd.lower() in _GENERIC_CMDS else _compact(_fold(cmd)))
+
+
+def window_app(win: dict, cands: list[dict]) -> dict | None:
+    """Appli (.desktop) à laquelle appartient une fenêtre, d'après sa classe X11, comme le fait une barre des
+    tâches : StartupWMClass d'abord, puis nom du fichier .desktop, commande, processus, enfin début de nom commun."""
+    cls, inst = _fold(win.get("cls") or ""), _fold(win.get("inst") or "")
+    ccls, cinst = _compact(cls), _compact(inst)
+    if not (ccls or cinst):
+        return None
+    procs = None
+    best, best_score = None, 99.0
+    for a in cands:
+        wc = _fold(a.get("wmclass") or "")
+        stem, last, cmd = _app_wm_names(a)
+        if wc and wc in (cls, inst):
+            score = 0
+        elif ccls and ccls in (stem, last):
+            score = 1
+        elif cinst and cinst in (stem, last):
+            score = 2
+        elif cmd and cmd == ccls:
+            score = 3
+        elif cmd and cmd == cinst:
+            score = 4
+        else:
+            if procs is None:
+                procs = _proc_names(win.get("pid")) if win.get("pid") else set()
+            if cmd and cmd in procs:
+                score = 5
+            else:
+                score = None
+                for k in {stem, last, cmd} - {""}:
+                    for c in {ccls, cinst} - {""}:
+                        short, long_ = sorted((k, c), key=len)
+                        if len(short) >= 4 and long_.startswith(short):
+                            sc = 6 + (len(long_) - len(short)) / 100
+                            score = sc if score is None else min(score, sc)
+                if score is None:
+                    continue
+        if score < best_score:
+            best, best_score = a, score
+    return best
+
+
+def window_groups(internal: bool = False) -> dict:
+    """Fenêtres ouvertes, regroupées par appli, de la plus récemment utilisée à la plus ancienne.
+    Clés : « app:<id du raccourci> », « archiviste » (la fenêtre principale), « win:<classe> » (appli inconnue)."""
+    hook = WINDOWS_HOOK
+    if hook is None:
+        return {"dispo": False, "groupes": [], "sig": ""}
+    wins = hook.snapshot()
+    idx = apps_index()
+    pinned = []
+    for sc in store.read("bureau.json", dict).get("raccourcis") or []:  # lanceurs épinglés par leur fichier
+        c = sc.get("cible", "")
+        if sc.get("type") == "app" and os.path.isabs(c):
+            e = read_ini_section(c)
+            if e:
+                pinned.append(app_info(c, c, e))
+    cands = pinned + idx["list"] + idx["ailleurs"]
+    groups: dict[str, dict] = {}
+    for w in wins:
+        if w.get("soi"):
+            key, nom, icone, app = "archiviste", "Archiviste", "", None
+        else:
+            a = window_app(w, cands)
+            if a:
+                key, nom, icone, app = "app:" + a["id"], a["nom"], a["icone"], a["id"]
+            else:
+                cls = w.get("cls") or w.get("inst") or "Fenêtre"
+                key, nom, icone, app = "win:" + cls.casefold(), cls, (w.get("inst") or cls).lower(), None
+        g = groups.setdefault(key, {"cle": key, "app": app, "nom": nom, "icone": icone, "n": 0, "reduit": True,
+                                    "devant": False, "titres": [], "xids": []})
+        g["n"] += 1
+        g["titres"].append(str(w.get("titre") or "")[:90])
+        g["xids"].append(w["xid"])
+        if not w.get("reduit"):
+            g["reduit"] = False
+    top = next((w for w in wins if not w.get("reduit")), None)
+    if top is not None:
+        next(g for g in groups.values() if top["xid"] in g["xids"])["devant"] = True
+    out = list(groups.values())
+    sig = hashlib.sha1(json.dumps([[g["cle"], g["n"], g["reduit"], g["devant"], g["titres"]] for g in out])
+                       .encode()).hexdigest()[:12]
+    if not internal:
+        out = [{k: v for k, v in g.items() if k != "xids"} for g in out]
+    return {"dispo": True, "groupes": out, "sig": sig}
+
+
+def window_action(cle: str, action: str) -> dict:
+    """basculer : ramène l'appli devant, ou la réduit si elle y est déjà (comme un dock) ; afficher, reduire, fermer."""
+    if WINDOWS_HOOK is None:
+        return {"ok": False, "ouverte": False, "dispo": False}
+    if action not in ("basculer", "afficher", "reduire", "fermer"):
+        raise ApiError("Action inconnue.")
+    g = next((g for g in window_groups(internal=True)["groupes"] if g["cle"] == cle), None)
+    if g is None:
+        return {"ok": False, "ouverte": False, "dispo": True}
+    if action == "basculer":
+        action = "reduire" if g["devant"] and not g["reduit"] else "afficher"
+    WINDOWS_HOOK.act(g["xids"], action)
+    return {"ok": True, "ouverte": True, "dispo": True, "action": action, "nom": g["nom"]}
+
+
+def raise_app(app_id: str) -> bool:
+    """Si l'appli est déjà ouverte, ramène sa fenêtre devant (au lieu d'en lancer une autre). Vrai si c'est fait."""
+    try:
+        return bool(window_action("app:" + app_id, "afficher").get("ouverte"))
+    except Exception:  # noqa: BLE001 — le suivi des fenêtres ne doit jamais empêcher de lancer une appli
+        return False
+
+
 # ── icônes du thème (Mint-Y…) ──
 _ICON_IDX: dict = {}
 _ICON_LOCK = threading.Lock()
@@ -3312,17 +3663,16 @@ def default_shortcuts() -> list[dict]:
 
 
 def shortcuts_raw() -> list[dict]:
-    st = store.read("bureau.json", dict)
-    if not isinstance(st.get("raccourcis"), list):
-        st["raccourcis"] = default_shortcuts()
-        store.write("bureau.json", st)
-    return st["raccourcis"]
+    with store.lock:
+        st = store.read("bureau.json", dict)
+        if not isinstance(st.get("raccourcis"), list):
+            st["raccourcis"] = default_shortcuts()
+            store.write("bureau.json", st)
+        return st["raccourcis"]
 
 
 def shortcuts_save(lst: list[dict]) -> None:
-    st = store.read("bureau.json", dict)
-    st["raccourcis"] = lst
-    store.write("bureau.json", st)
+    bureau_patch(raccourcis=lst)
 
 
 def resolve_shortcut(s: dict) -> dict:
@@ -3359,7 +3709,6 @@ def shortcuts() -> list[dict]:
 def shortcut_add(b: dict) -> dict:
     t = str(b.get("type") or "")
     cible = str(b.get("cible") or "")
-    lst = shortcuts_raw()
     if t == "archiviste":
         cible = ""
     elif t == "app":
@@ -3380,17 +3729,19 @@ def shortcut_add(b: dict) -> dict:
         t = "dossier" if os.path.isdir(cible) else "fichier"
     else:
         raise ApiError("Type de raccourci inconnu.")
-    for s in lst:
-        if s.get("type") == t and s.get("cible", "") == cible:
-            return {"deja": True, "raccourci": resolve_shortcut(s), "raccourcis": shortcuts()}
-    if len(lst) >= MAX_SHORTCUTS:
-        raise ApiError(f"Le volet est plein ({MAX_SHORTCUTS} raccourcis) : retires-en un d'abord.")
-    item = {"id": new_id("r_"), "type": t, "cible": cible}
-    nom = str(b.get("nom") or "").strip()[:60]
-    if nom:
-        item["nom"] = nom
-    lst.append(item)
-    shortcuts_save(lst)
+    with store.lock:  # vérifier puis ajouter d'un seul tenant : deux épinglages simultanés ne se marchent pas dessus
+        lst = shortcuts_raw()
+        for s in lst:
+            if s.get("type") == t and s.get("cible", "") == cible:
+                return {"deja": True, "raccourci": resolve_shortcut(s), "raccourcis": shortcuts()}
+        if len(lst) >= MAX_SHORTCUTS:
+            raise ApiError(f"Le volet est plein ({MAX_SHORTCUTS} raccourcis) : retires-en un d'abord.")
+        item = {"id": new_id("r_"), "type": t, "cible": cible}
+        nom = str(b.get("nom") or "").strip()[:60]
+        if nom:
+            item["nom"] = nom
+        lst.append(item)
+        shortcuts_save(lst)
     return {"deja": False, "raccourci": resolve_shortcut(item), "raccourcis": shortcuts()}
 
 
@@ -3524,8 +3875,7 @@ def set_autostart(on: bool) -> dict:
 def bureau_activer(on: bool) -> dict:
     st = bureau_state()
     rapport = [set_autostart(on), set_nemo_desktop(not on, st), set_keybinding(on, st)]
-    st["actif"] = on
-    bureau_save(st)
+    bureau_patch(actif=on, nemo_avant=st.get("nemo_avant"), touche=st.get("touche"))
     if UI_HOOK:
         UI_HOOK("bureau", {"actif": on})
     return {"actif": on, "rapport": rapport, "fenetre": UI_HOOK is not None,
@@ -3539,21 +3889,82 @@ def bureau_public() -> dict:
               images=user_dir("PICTURES", "Images", "Pictures"), musique=user_dir("MUSIC", "Musique", "Music"),
               videos=user_dir("VIDEOS", "Vidéos", "Videos"),
               home=str(HOME), touche_label=accel_label(st.get("touche")), demarrage=AUTOSTART.exists(),
-              fenetre=UI_HOOK is not None, cinnamon="CINNAMON" in ":".join(CUR_DESKTOPS).upper())
+              fenetre=UI_HOOK is not None, cinnamon="CINNAMON" in ":".join(CUR_DESKTOPS).upper(),
+              fenetres=WINDOWS_HOOK is not None)
     return st
 
 
-def bureau_conv(new: bool = False, agent_id=None) -> dict:
-    st = bureau_state()
-    if not new and st.get("conv"):
-        try:
-            return load_conv(st["conv"])
-        except ApiError:
-            pass
-    c = create_conv({"agent_id": agent_id} if agent_id else {})
-    st["conv"] = c["id"]
-    bureau_save(st)
-    return c
+def conv_idle_hours(c: dict) -> float:
+    try:
+        last = dt.datetime.fromisoformat(c.get("modifie") or c.get("cree") or "")
+    except (TypeError, ValueError):
+        return 0.0
+    return (dt.datetime.now() - last).total_seconds() / 3600
+
+
+def _previous_conv(st: dict, current: str | None) -> str | None:
+    pid = st.get("conv_precedente")
+    if not pid or pid == current:
+        return None
+    try:
+        return pid if load_conv(pid).get("messages") else None
+    except ApiError:
+        return None
+
+
+def bureau_conv(new: bool = False, agent_id=None, rotation: bool = True) -> dict:
+    """Discussion du volet (et de « Demander »). Après une longue pause (réglage conv_heures), on repart sur une
+    discussion neuve : un vieux sujet ne pollue pas la question suivante. L'ancienne reste dans la liste des
+    discussions et peut être reprise (« precedente »)."""
+    with store.lock:
+        st = bureau_state()
+        cur, auto = None, False
+        if st.get("conv"):
+            try:
+                cur = load_conv(st["conv"])
+            except ApiError:
+                cur = None
+        if cur is not None and not new:
+            hours = st.get("conv_heures") or 0
+            auto = bool(rotation and hours and cur.get("messages") and not cur.get("pending")
+                        and not conv_busy(cur["id"]) and conv_idle_hours(cur) >= hours)
+            if not auto:
+                return {**cur, "precedente": None if cur.get("messages") else _previous_conv(st, cur["id"])}
+        if cur is not None and not cur.get("messages") and not conv_busy(cur["id"]):
+            # « + » sur une discussion encore vide : on la garde au lieu d'en empiler des vides
+            if (cur.get("agent_id") or None) != (agent_id or None):
+                if agent_id and not find_agent(agent_id):
+                    raise ApiError("Agent introuvable.")
+                cur.update(agent_id=agent_id or None, workspace="", pending=None)
+                save_conv(cur)
+            return {**cur, "precedente": _previous_conv(st, cur["id"])}
+        prev = cur["id"] if cur is not None and cur.get("messages") else st.get("conv_precedente")
+        c = create_conv({"agent_id": agent_id} if agent_id else {})
+        st = bureau_patch(conv=c["id"], conv_precedente=prev)
+        return {**c, "precedente": _previous_conv(st, c["id"]), "auto": auto}
+
+
+def bureau_conv_resume() -> dict:
+    """Revient à la discussion d'avant dans le volet."""
+    with store.lock:
+        st = bureau_state()
+        pid = _previous_conv(st, st.get("conv"))
+        if not pid:
+            raise ApiError("La discussion précédente n'existe plus.", 404)
+        c = load_conv(pid)
+        cur = st.get("conv")
+        if cur and conv_busy(cur):
+            raise ApiError("Une réponse est en cours : attends-la ou arrête-la.", 409)
+        if cur and cur != pid:
+            try:
+                if not load_conv(cur).get("messages"):
+                    store.delete(conv_path(cur))  # la discussion vide qu'on quitte ne sert à rien
+            except ApiError:
+                pass
+        if not conv_busy(pid):
+            save_conv(c)  # « modifiée maintenant » : elle ne sera pas remplacée au prochain message
+        bureau_patch(conv=pid, conv_precedente=None)
+        return {**c, "precedente": None}
 
 
 SETTINGS_MODULES = {"backgrounds", "display", "desktop", "keyboard", "themes", "panel", "applets"}
@@ -3927,11 +4338,12 @@ def r_prompt_del(h, q, b, pid):
 
 @route("POST", "/api/prompts/([\\w-]+)/used")
 def r_prompt_used(h, q, b, pid):
-    items = get_prompts()
-    for p in items:
-        if p["id"] == pid:
-            p["utilisations"] = int(p.get("utilisations", 0)) + 1
-    store.write("prompts.json", items)
+    with store.lock:
+        items = get_prompts()
+        for p in items:
+            if p["id"] == pid:
+                p["utilisations"] = int(p.get("utilisations", 0)) + 1
+        store.write("prompts.json", items)
     return {"ok": True}
 
 
@@ -4000,6 +4412,8 @@ def r_conv_get(h, q, b, cid):
 
 @route("POST", "/api/conversations/(c_[0-9a-f]{10})")
 def r_conv_update(h, q, b, cid):
+    if not conv_claim(cid):
+        raise ApiError("Une réponse est en cours dans cette discussion : attends-la ou arrête-la.", 409)
     c = load_conv(cid)
     if "titre" in b:
         c["titre"] = str(b["titre"]).strip()[:100]
@@ -4020,6 +4434,7 @@ def r_conv_update(h, q, b, cid):
 
 @route("POST", "/api/conversations/(c_[0-9a-f]{10})/delete")
 def r_conv_del(h, q, b, cid):
+    conv_release(cid)  # une réponse encore en cours n'écrira plus rien
     store.delete(conv_path(cid))
     return {"ok": True}
 
@@ -4042,18 +4457,31 @@ def r_bureau(h, q, b):
 
 @route("POST", "/api/bureau/reglages")
 def r_bureau_reglages(h, q, b):
-    st = bureau_state()
+    patch = {}
     if "volet" in b:
-        st["volet"] = to_bool(b["volet"])
+        patch["volet"] = to_bool(b["volet"])
     if b.get("tri") in ("nom", "date", "type"):
-        st["tri"] = b["tri"]
+        patch["tri"] = b["tri"]
     if b.get("dossiers") in ("archiviste", "systeme"):
-        st["dossiers"] = b["dossiers"]
+        patch["dossiers"] = b["dossiers"]
     if b.get("fond") in ("auto", "archiviste"):
-        st["fond"] = b["fond"]
-        if UI_HOOK:
-            UI_HOOK("fond", {"fond": b["fond"]})
-    bureau_save(st)
+        patch["fond"] = b["fond"]
+    if "volet_largeur" in b:
+        try:
+            w = int(b["volet_largeur"] or 0)
+        except (TypeError, ValueError):
+            w = 0
+        patch["volet_largeur"] = max(VOLET_MIN, min(VOLET_MAX, w)) if w > 0 else None
+    if "conv_heures" in b:
+        try:
+            hours = int(b["conv_heures"])
+        except (TypeError, ValueError):
+            hours = -1
+        if hours in CONV_HEURES:
+            patch["conv_heures"] = hours
+    bureau_patch(**patch)
+    if "fond" in patch and UI_HOOK:
+        UI_HOOK("fond", {"fond": patch["fond"]})
     return bureau_public()
 
 
@@ -4073,7 +4501,13 @@ def r_bureau_sig(h, q, b):
         rv = str(os.stat(DATA_DIR / "bureau.json").st_mtime_ns)
     except OSError:
         rv = "0"
-    return {"sig": bureau_sig(), "rv": rv}
+    cid = store.read("bureau.json", dict).get("conv") or ""
+    try:  # « cv » change quand la discussion du volet avance ailleurs (fenêtre « Demander », fenêtre principale)
+        cv = f"{cid}:{os.stat(DATA_DIR / conv_path(cid)).st_mtime_ns}"
+    except (ApiError, OSError):
+        cv = ""
+    hook = WINDOWS_HOOK  # « fv » change quand une fenêtre s'ouvre, se ferme, est réduite ou passe devant
+    return {"sig": bureau_sig(), "rv": rv, "cv": cv, "fv": hook.version if hook is not None else -1}
 
 
 @route("GET", "/api/bureau/a-ranger")
@@ -4096,7 +4530,12 @@ def r_bureau_fond_image(h, q, b):
 
 @route("GET", "/api/bureau/conv")
 def r_bureau_conv(h, q, b):
-    return bureau_conv()
+    return bureau_conv(rotation=q1(q, "rotation") != "0")
+
+
+@route("POST", "/api/bureau/conv/reprendre")
+def r_bureau_conv_resume(h, q, b):
+    return bureau_conv_resume()
 
 
 @route("POST", "/api/bureau/conv/nouvelle")
@@ -4161,6 +4600,17 @@ def r_app_ask(h, q, b):
     return {"ok": True}
 
 
+# ── Fenêtres ouvertes ──
+@route("GET", "/api/fenetres")
+def r_windows(h, q, b):
+    return window_groups()
+
+
+@route("POST", "/api/fenetres/action")
+def r_windows_action(h, q, b):
+    return window_action(str(b.get("cle") or ""), str(b.get("action") or "basculer"))
+
+
 # ── Applications installées et raccourcis ──
 @route("GET", "/api/apps")
 def r_apps(h, q, b):
@@ -4182,6 +4632,8 @@ def r_apps_launch(h, q, b):
         a = apps_index()["by_id"].get(str(b["id"]))
         if not a:
             raise ApiError("Cette application n'est plus installée.", 404)
+        if to_bool(b.get("ramener")) and not files and raise_app(a["id"]):
+            return {"ok": True, "nom": a["nom"], "ramenee": True}  # déjà ouverte : sa fenêtre revient devant
         launch_app(a, files)
         return {"ok": True, "nom": a["nom"]}
     path = os.path.realpath(str(b.get("fichier") or ""))
@@ -4233,32 +4685,36 @@ def r_shortcut_add(h, q, b):
 
 @route("POST", "/api/raccourcis/ordre")
 def r_shortcut_order(h, q, b):
-    """Nouvel ordre (les identifiants absents sont retirés)."""
+    """Nouvel ordre. Un raccourci absent de la liste envoyée (épinglé entre-temps depuis une autre fenêtre)
+    est gardé, à la fin : seul « retirer » en supprime."""
     ids = [str(x) for x in (b.get("ids") or [])]
-    cur = {s["id"]: s for s in shortcuts_raw()}
-    shortcuts_save([cur[i] for i in dict.fromkeys(ids) if i in cur])
+    with store.lock:
+        cur = {s["id"]: s for s in shortcuts_raw()}
+        order = [i for i in dict.fromkeys(ids) if i in cur]
+        shortcuts_save([cur[i] for i in order] + [s for i, s in cur.items() if i not in order])
     return shortcuts()
 
 
 @route("POST", "/api/raccourcis/renommer")
 def r_shortcut_rename(h, q, b):
-    lst = shortcuts_raw()
-    for s in lst:
-        if s.get("id") == b.get("id"):
-            nom = str(b.get("nom") or "").strip()[:60]
-            if nom:
-                s["nom"] = nom
-            else:
-                s.pop("nom", None)
-            shortcuts_save(lst)
-            return shortcuts()
+    with store.lock:
+        lst = shortcuts_raw()
+        for s in lst:
+            if s.get("id") == b.get("id"):
+                nom = str(b.get("nom") or "").strip()[:60]
+                if nom:
+                    s["nom"] = nom
+                else:
+                    s.pop("nom", None)
+                shortcuts_save(lst)
+                return shortcuts()
     raise ApiError("Raccourci introuvable.", 404)
 
 
 @route("POST", "/api/raccourcis/retirer")
 def r_shortcut_remove(h, q, b):
-    lst = shortcuts_raw()
-    shortcuts_save([s for s in lst if s.get("id") != b.get("id")])
+    with store.lock:
+        shortcuts_save([s for s in shortcuts_raw() if s.get("id") != b.get("id")])
     return shortcuts()
 
 
@@ -4272,6 +4728,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "Archiviste/" + VERSION
     protocol_version = "HTTP/1.1"
     streaming = False
+    cancelled = False  # vrai quand une autre requête a repris la discussion que celle-ci écrivait
 
     def log_message(self, fmt, *args):
         if os.environ.get("ARCHIVISTE_DEBUG"):
@@ -4311,6 +4768,8 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def emit(self, obj):
+        if self.cancelled:
+            raise ClientGone()
         try:
             self.wfile.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
             self.wfile.flush()

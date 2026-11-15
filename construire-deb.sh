@@ -88,6 +88,7 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-3.0, gir1.2-webkit2-4.1, poppler-utils, xdg-utils
+Recommends: gir1.2-wnck-3.0
 Installed-Size: $SIZE
 Maintainer: Cyril SAINTE-CLUQUE <csaintecluque-ui@users.noreply.github.com>
 Homepage: https://github.com/csaintecluque-ui/Archiviste

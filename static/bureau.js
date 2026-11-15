@@ -11,6 +11,8 @@ const MODE = Q.get('mode') === 'demander' ? 'demander' : 'bureau';
 const D = {
   b: null, items: [], sel: new Set(), anchor: null, sig: '', rv: '', apps: null, favs: [], sc: [], todo: null,
   conv: null, busy: false, ctrl: null, atts: [], editSc: false, ownFond: Q.get('fond') === '1', fondKey: '',
+  cv: undefined, resizing: false, autoNew: false,
+  fv: undefined, win: { dispo: false, groupes: [], map: {}, sig: '' }, scDrag: false, winDirty: false,
 };
 const IS_WRITING = () => { const a = document.activeElement; return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable); };
 const appIconUrl = (name, size = 64) => `/api/icone?t=${enc(TOKEN)}&n=${enc(name)}&s=${size}`;
@@ -122,6 +124,19 @@ function renderIcons() {
     return `<div class="dicon ${D.sel.has(it.key) ? 'sel' : ''}" data-i="${i}" role="option" ${drag ? 'draggable="true"' : ''} title="${esc(it.path ? tildify(it.path) : it.label)}">
       <div class="pic">${itemPic(it)}</div><div class="lbl">${esc(it.label)}</div></div>`;
   }).join('');
+  iconFades();
+}
+// Les icônes ne passent plus sous le volet : la grille s'arrête à son bord et défile (molette) s'il y en a trop.
+// Un fondu à gauche / à droite signale qu'il en reste.
+function iconFades() {
+  const el = $('#icons');
+  if (!el) return;
+  const left = el.scrollLeft > 2;
+  const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
+  el.classList.toggle('fade-l', left);
+  el.classList.toggle('fade-r', right);
+  $('#icPrev').hidden = !left;
+  $('#icNext').hidden = !right;
 }
 function refreshSel() { $$('#icons .dicon').forEach((el) => el.classList.toggle('sel', D.sel.has(D.items[+el.dataset.i].key))); }
 const selItems = () => D.items.filter((x) => D.sel.has(x.key));
@@ -136,11 +151,14 @@ async function poll() {
   if (r.rv !== D.rv) {
     const first = !D.rv;
     D.rv = r.rv;
-    if (!first) {
+    if (!first && !D.resizing) {
       try { D.b = await api('/api/bureau'); } catch { /* */ }
       applyVolet(); loadShortcuts();
     }
   }
+  // la discussion du volet a avancé ailleurs (fenêtre « Demander », fenêtre principale) : on la remet à jour
+  if (r.cv !== D.cv) { D.cv = r.cv; if (!D.busy) syncConv(false); }
+  if (r.fv !== D.fv) { D.fv = r.fv; loadWindows(); }  // une fenêtre s'est ouverte, fermée, réduite…
 }
 
 // ───────────────────────── Ouvrir, lancer ─────────────────────────
@@ -156,11 +174,13 @@ function openFolder(p) {
   if (D.b?.dossiers === 'systeme') return openWithSystem(p);
   return openMain({ vue: 'files', chemin: p });
 }
-async function launchApp(id, nom, fichiers) {
+async function launchApp(id, nom, fichiers, fresh = false) {
   try {
-    const r = await post('/api/apps/lancer', { id, fichiers });
-    toast(`Lancement de ${nom || r.nom || 'l\'application'}…`);
+    // déjà ouverte : sa fenêtre revient devant au lieu d'en lancer une autre (sauf « Nouvelle fenêtre »)
+    const r = await post('/api/apps/lancer', { id, fichiers, ramener: !fresh && !fichiers?.length });
+    toast(r.ramenee ? `${nom || r.nom} est déjà ouvert : je le ramène devant` : `Lancement de ${nom || r.nom || 'l\'application'}…`);
     if (MODE === 'demander') closePopup();
+    else setTimeout(loadWindows, 1200);
   } catch (e) { toast(e.message, 'err'); }
 }
 async function launchLauncher(path) {
@@ -206,6 +226,13 @@ async function renameEntry(e) {
 }
 async function trashPaths(paths) {
   if (!paths.length) return;
+  // Comme dans la fenêtre principale : un dossier ou plusieurs éléments ne partent pas à la corbeille sur une
+  // simple touche. (Un lien vers un dossier ne compte pas : seul le lien part, sa cible reste.)
+  const folder = (p) => { const it = D.items.find((x) => x.path === p); return !it || (it.e?.dir && !it.e.link); };
+  if (paths.length > 1 || paths.some(folder)) {
+    const what = paths.length > 1 ? `ces ${paths.length} éléments` : `« ${basename(paths[0])} »`;
+    if (!(await ask(`Mettre ${what} à la corbeille ?\nTu pourras les restaurer depuis la Corbeille (ici ou dans Nemo).`, { ok: 'Mettre à la corbeille', danger: true }))) return;
+  }
   try {
     const r = await post('/api/fs/trash', { paths });
     if (r.erreurs.length) toast(r.erreurs.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
@@ -412,6 +439,7 @@ function bindDesk() {
       const step = { ArrowDown: 1, ArrowUp: -1, ArrowRight: rows, ArrowLeft: -rows }[k];
       const i = Math.max(0, Math.min(D.items.length - 1, cur < 0 ? 0 : cur + step));
       selectOnly(D.items[i]);
+      $(`#icons .dicon[data-i="${i}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
       return;
     }
     if (k.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {  // taper n'importe où : on écrit à l'Archiviste
@@ -421,6 +449,18 @@ function bindDesk() {
       inp.focus(); inp.value += k; inp.dispatchEvent(new Event('input'));
     }
   });
+
+  // trop d'icônes pour la place à gauche du volet : la molette fait défiler la grille
+  icons.addEventListener('wheel', (ev) => {
+    if (ev.ctrlKey || icons.scrollWidth <= icons.clientWidth) return;
+    ev.preventDefault();
+    icons.scrollLeft += Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+  }, { passive: false });
+  icons.addEventListener('scroll', iconFades, { passive: true });
+  window.addEventListener('resize', iconFades);
+  const page = (dir) => icons.scrollBy({ left: dir * Math.max(122, Math.floor((icons.clientWidth - 40) / 122) * 122), behavior: 'smooth' });
+  $('#icPrev').addEventListener('click', () => page(-1));
+  $('#icNext').addEventListener('click', () => page(1));
 
   // glisser-déposer
   icons.addEventListener('dragstart', (ev) => {
@@ -607,7 +647,7 @@ function specialDirs(q) {
     .map(([, path, name]) => ({ name, path, dir: true, kind: 'folder', ext: '', special: true }));
 }
 function makeLauncher({ input, box, onAsk, always = false }) {
-  const L = { q: '', target: '', intent: null, weak: false, items: [], idx: 0, seq: 0, files: null, loading: false };
+  const L = { q: '', target: '', intent: null, weak: false, items: [], idx: 0, seq: 0, files: null, loading: false, cut: false };
   const visible = () => !box.hidden;
   const hide = () => { box.hidden = true; box.innerHTML = ''; L.items = []; reportSize(); };
   const search = debounce(async (q, seq) => {
@@ -615,13 +655,14 @@ function makeLauncher({ input, box, onAsk, always = false }) {
       const r = await api(`/api/fs/search?rapide=1&path=${enc(S.home)}&q=${enc(q)}`);
       if (seq !== L.seq) return;
       L.files = r.results.slice(0, 7);
+      L.cut = r.incomplet === 'temps';
     } catch { if (seq === L.seq) L.files = []; }
     L.loading = false;
     build();
   }, 220);
   function update() {
     const text = input.value.trim();
-    L.q = text; L.seq++; L.idx = 0; L.files = null; L.loading = false;
+    L.q = text; L.seq++; L.idx = 0; L.files = null; L.loading = false; L.cut = false;
     if (text.length < 2 || text.length > 90 || text.includes('\n')) return hide();
     const pi = parseIntent(text);
     L.intent = pi ? pi.target : null;
@@ -650,7 +691,7 @@ function makeLauncher({ input, box, onAsk, always = false }) {
     const strong = L.intent ? (L.weak ? (dirFirst || (apps.length > 0 && apps[0].s <= 7)) : acts.length > 0) : oneApp;
     L.items = strong ? [acts[0], ask, ...acts.slice(1)] : [ask, ...acts];
     L.idx = Math.min(L.idx, L.items.length - 1);
-    if (!always && !acts.length && !(L.intent && L.loading)) return hide();
+    if (!always && !acts.length && !(L.intent && L.loading) && !(L.intent && L.cut)) return hide();
     let html = '';
     let section = '';
     L.items.forEach((it, i) => {
@@ -671,6 +712,7 @@ function makeLauncher({ input, box, onAsk, always = false }) {
       html += `<div class="ri ${i === L.idx ? 'on' : ''}" data-r="${i}"><span class="ico">${ico}</span><span class="t"><b>${esc(t)}</b><small>${esc(sub)}</small></span>${k ? `<span class="k">${k}</span>` : ''}</div>`;
     });
     if (L.loading && L.files === null) html += '<div class="wait"><span class="spinner"></span> Recherche dans tes fichiers…</div>';
+    else if (L.cut) html += `<div class="wait cut">${ic('alert', 'sm')} Recherche de fichiers incomplète : ton dossier personnel est trop volumineux pour être parcouru en entier d'ici. Cherche depuis l'onglet Fichiers d'Archiviste.</div>`;
     box.innerHTML = html;
     box.hidden = false;
     reportSize();
@@ -746,7 +788,7 @@ async function loadApps() {
 function buildVolet() {
   const v = $('#volet');
   // Deux colonnes : la discussion prend toute la hauteur, les raccourcis sont en colonne à droite.
-  v.innerHTML = `<div class="vmain">
+  v.innerHTML = `<div class="vgrip" id="vGrip" title="Glisse pour élargir ou rétrécir le volet — double-clic : largeur d'origine"></div><div class="vmain">
     <div class="hd"><img src="/static/logo-seal.svg" alt="Anamnesis · CSC" width="42" height="42">
       <div style="min-width:0"><b class="serif">Archiviste</b><small id="vStatus"><span class="dot"></span><span>…</span></small></div>
       <div class="acts"><button class="vbtn maj" data-v="maj" id="vMaj" hidden title="Mise à jour">${ic('download')}</button><button class="vbtn" data-v="main" title="Ouvrir Archiviste">${ic('external')}</button><button class="vbtn" data-v="fold" title="Replier le volet">${ic('panel')}</button></div></div>
@@ -767,10 +809,14 @@ function buildVolet() {
   v.addEventListener('contextmenu', onVoletContext);
   const inp = $('#vIn');
   inp.addEventListener('input', () => { inp.style.height = 'auto'; inp.style.height = Math.min(inp.scrollHeight, 160) + 'px'; });
+  // On s'apprête à écrire après une longue pause : la nouvelle discussion s'ouvre maintenant, avant l'envoi,
+  // avec « Reprendre la discussion précédente » sous la main. Relire ou copier une réponse ne change rien.
+  inp.addEventListener('focus', () => { if (!D.busy && convStale()) syncConv(true, true); });
   makeLauncher({ input: inp, box: $('#vSugg'), onAsk: () => sendFromComposer() });
   $('#vAgent').addEventListener('change', (ev) => changeAgent(ev.target.value || null));
   $('#voletTab').addEventListener('click', () => setVolet(true));
   bindShortcutDnD();
+  bindVoletResize();
   const conv = $('#conv');
   const convOver = (ev) => { ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy'; conv.classList.add('drop-on'); };
   conv.addEventListener('dragenter', convOver);
@@ -789,7 +835,49 @@ function applyVolet() {
   $('#volet').hidden = !open;
   $('#voletTab').hidden = open;
   document.body.classList.toggle('volet-ferme', !open);
+  applyVoletWidth();
   if (open) scFades(); // replié, la colonne n'avait pas de hauteur : le fondu est recalculé à l'ouverture
+  iconFades();
+}
+// Largeur du volet : réglable à la souris (poignée sur son bord gauche), gardée d'une session à l'autre.
+const VOLET_MIN = 440;
+const VOLET_MAX = 900;
+const voletWidth = (w) => Math.round(Math.max(VOLET_MIN, Math.min(w, VOLET_MAX, innerWidth * 0.6)));
+function applyVoletWidth(w = D.b?.volet_largeur) {
+  const r = document.documentElement.style;
+  if (w) { const px = voletWidth(w); r.setProperty('--sidew', `${px}px`); r.setProperty('--vw', `${px + 24}px`); }
+  else { r.removeProperty('--sidew'); r.removeProperty('--vw'); }
+}
+function bindVoletResize() {
+  const grip = $('#vGrip');
+  let drag = null;
+  grip.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault(); ev.stopPropagation();
+    drag = { x: ev.clientX, w: $('#volet').getBoundingClientRect().width, now: 0 };
+    D.resizing = true;
+    document.body.classList.add('volet-resize');
+  });
+  window.addEventListener('mousemove', (ev) => {
+    if (!drag) return;
+    drag.now = voletWidth(drag.w + (drag.x - ev.clientX));
+    applyVoletWidth(drag.now);
+    scFades(); iconFades();
+  });
+  window.addEventListener('mouseup', () => {
+    if (!drag) return;
+    const w = drag.now;
+    drag = null; D.resizing = false;
+    document.body.classList.remove('volet-resize');
+    if (w) { D.b.volet_largeur = w; post('/api/bureau/reglages', { volet_largeur: w }).catch(() => {}); }
+    scrollMsgs();
+  });
+  grip.addEventListener('dblclick', () => {
+    D.b.volet_largeur = null;
+    applyVoletWidth(null); scFades(); iconFades();
+    post('/api/bureau/reglages', { volet_largeur: 0 }).catch(() => {});
+  });
+  window.addEventListener('resize', () => { if (!D.resizing) applyVoletWidth(); });
 }
 function setVolet(open) {
   D.b.volet = open;
@@ -797,13 +885,14 @@ function setVolet(open) {
   post('/api/bureau/reglages', { volet: open }).catch(() => {});
 }
 async function onVoletClick(ev) {
-  const b = ev.target.closest('[data-v], [data-act], [data-sc], [data-todo], [data-chip]');
+  const b = ev.target.closest('[data-v], [data-act], [data-sc], [data-run], [data-todo], [data-chip]');
   if (!b) return;
   if (b.dataset.sc !== undefined) {
     if (ev.target.closest('.x')) return removeShortcut(b.dataset.sc);
     if (D.editSc) return;
     return runShortcut(D.sc.find((s) => s.id === b.dataset.sc));
   }
+  if (b.dataset.run !== undefined) return toggleWindows(b.dataset.run);
   if (b.dataset.todo !== undefined) return openMain({ vue: 'sort', chemin: b.dataset.todo });
   if (b.dataset.chip !== undefined) return CHIPS[+b.dataset.chip].run();
   if (b.dataset.act) return chatAct(b, ev);
@@ -819,6 +908,7 @@ async function onVoletClick(ev) {
       return renderShortcuts();
     case 'addSc': return addShortcutMenu(b);
     case 'newConv': return newConv();
+    case 'resume': return resumeConv();
     case 'convMain': return D.conv && openMain({ vue: 'chat', conv: D.conv.id });
     case 'attach': {
       const paths = await pickPath({ title: 'Joindre à la discussion', mode: 'files', start: D.b.dossier });
@@ -833,6 +923,8 @@ async function onVoletClick(ev) {
 function onVoletContext(ev) {
   const t = ev.target.closest('[data-sc]');
   if (t) { ev.preventDefault(); return shortcutMenu(D.sc.find((s) => s.id === t.dataset.sc), ev.clientX, ev.clientY); }
+  const o = ev.target.closest('[data-run]');
+  if (o) { ev.preventDefault(); return openAppMenu(D.win.map[o.dataset.run], ev.clientX, ev.clientY); }
   if (!ev.target.closest('textarea, input, .msgs')) ev.preventDefault();
   return null;
 }
@@ -860,7 +952,11 @@ async function refreshVMaj() {
 
 // ── raccourcis ──
 async function loadShortcuts() {
-  try { D.sc = await api('/api/raccourcis'); } catch { D.sc = []; }
+  let sc;
+  try { sc = await api('/api/raccourcis'); } catch { if (D.sc.length) return; sc = []; }
+  // rien n'a changé : on ne redessine pas (un glisser ou le mode « modifier » en cours ne sont pas interrompus)
+  if ($('#sc')?.children.length && JSON.stringify(sc) === JSON.stringify(D.sc)) return;
+  D.sc = sc;
   renderShortcuts();
 }
 function scIcon(s) {
@@ -869,13 +965,64 @@ function scIcon(s) {
   if (s.type === 'dossier') return `<span class="ico">${ic(s.cible === D.b?.home ? 'home' : 'folder')}</span>`;
   return `<span class="ico" style="color:${KIND_COLOR[s.kind] || '#f0b98f'}">${ic(KIND_ICON[s.kind] || 'file')}</span>`;
 }
+// ── fenêtres ouvertes : le volet sert de dock ──
+// Un repère sur le raccourci dit que l'appli est ouverte (trait plein), devant (trait long) ou réduite (trait creux).
+// Un clic la ramène devant, ou la réduit si elle y est déjà. Les applis ouvertes sans raccourci apparaissent
+// à la suite, le temps qu'elles restent ouvertes : une fenêtre réduite ne « disparaît » plus.
+const winKey = (s) => (s.type === 'archiviste' ? 'archiviste' : s.type === 'app' ? `app:${s.cible}` : null);
+const winOf = (s) => { const k = winKey(s); return k ? D.win.map[k] : null; };
+function winClass(g) { return g && g.n ? `run${g.devant ? ' front' : ''}${g.reduit ? ' mini' : ''}` : ''; }
+function winHint(g) {
+  if (!g || !g.n) return '';
+  const what = g.n > 1 ? `${g.n} fenêtres ouvertes` : g.reduit ? 'Ouverte, réduite' : 'Ouverte';
+  return `\n${what} — clic : ${g.devant && !g.reduit ? 'réduire' : 'ramener devant'}`;
+}
+function winMarks(g) { return g && g.n ? `<i class="run-dot"></i>${g.n > 1 ? `<span class="nb">${g.n}</span>` : ''}` : ''; }
+async function loadWindows() {
+  if (MODE !== 'bureau') return;
+  let r;
+  try { r = await api('/api/fenetres'); } catch { return; }
+  if (r.sig === D.win.sig && r.dispo === D.win.dispo) return;
+  D.win = { ...r, map: Object.fromEntries(r.groupes.map((g) => [g.cle, g])) };
+  if (D.scDrag) { D.winDirty = true; return; }  // pas de nouveau dessin au milieu d'un glisser
+  renderShortcuts();
+}
+window.archivisteFenetres = debounce(loadWindows, 60);  // appelé par la fenêtre GTK dès qu'une fenêtre change
+async function toggleWindows(cle, fallback, action = 'basculer') {
+  let r;
+  try { r = await post('/api/fenetres/action', { cle, action }); } catch (e) { return toast(e.message, 'err'); }
+  if (!r.ouverte && fallback) return fallback();  // fermée entre-temps : on la lance
+  setTimeout(loadWindows, 350);
+  return null;
+}
+function winMenuItems(g) {
+  if (!g || !g.n) return [];
+  const front = g.devant && !g.reduit;
+  return [
+    { label: front ? 'Réduire' : 'Ramener devant', icon: front ? 'down' : 'up', act: () => toggleWindows(g.cle, null, front ? 'reduire' : 'afficher') },
+    { label: g.n > 1 ? `Fermer les ${g.n} fenêtres` : 'Fermer la fenêtre', icon: 'x', act: () => toggleWindows(g.cle, null, 'fermer') },
+  ];
+}
+function openAppMenu(g, x, y) {
+  if (!g) return;
+  const m = [{ header: g.nom }, ...winMenuItems(g)];
+  if (g.app && !g.app.startsWith('/')) m.push('sep', { label: 'Épingler aux raccourcis', icon: 'star', act: () => pinShortcut('app', g.app).then(loadShortcuts) });
+  showMenu(x, y, m);
+}
 function renderShortcuts() {
   const el = $('#sc');
   if (!el) return;
   el.classList.toggle('edit', D.editSc);
-  el.innerHTML = D.sc.map((s) => `<button class="t ${s.ok ? '' : 'ko'}" data-sc="${esc(s.id)}" draggable="true" title="${esc(s.titre)}${s.description ? '\n' + esc(s.description) : ''}">
-    ${scIcon(s)}<span class="lbl">${esc(s.titre)}</span>${D.editSc ? '<span class="x" title="Retirer">×</span>' : ''}</button>`).join('')
-    || `<button class="t add" data-v="addSc" title="Épingler une appli, un dossier ou un fichier"><span class="ico">${ic('plus')}</span><span class="lbl">Ajouter</span></button>`;
+  const pinned = new Set(D.sc.map(winKey).filter(Boolean));
+  const others = D.win.groupes.filter((g) => !pinned.has(g.cle));
+  el.innerHTML = (D.sc.map((s) => {
+    const g = winOf(s);
+    return `<button class="t ${s.ok ? '' : 'ko'} ${winClass(g)}" data-sc="${esc(s.id)}" draggable="true" title="${esc(s.titre)}${s.description ? '\n' + esc(s.description) : ''}${esc(winHint(g))}">
+    ${scIcon(s)}<span class="lbl">${esc(s.titre)}</span>${winMarks(g)}${D.editSc ? '<span class="x" title="Retirer">×</span>' : ''}</button>`;
+  }).join('')
+    || `<button class="t add" data-v="addSc" title="Épingler une appli, un dossier ou un fichier"><span class="ico">${ic('plus')}</span><span class="lbl">Ajouter</span></button>`)
+    + (others.length ? `<div class="sep" title="Applis ouvertes sans raccourci"></div>${others.map((g) => `<button class="t open ${winClass(g)}" data-run="${esc(g.cle)}" title="${esc(g.titres[0] || g.nom)}${esc(winHint(g))}\nClic droit : épingler, fermer">
+    <span class="ico app"><img class="app-ic" src="${appIconUrl(g.icone || 'application-x-executable', 48)}" alt="" draggable="false"></span><span class="lbl">${esc(g.nom)}</span>${winMarks(g)}</button>`).join('')}` : '');
   scFades();
 }
 // Colonne des raccourcis : un fondu en haut / en bas signale qu'il y en a d'autres en faisant défiler.
@@ -885,11 +1032,13 @@ function scFades() {
   el.classList.toggle('fade-t', el.scrollTop > 2);
   el.classList.toggle('fade-b', el.scrollTop + el.clientHeight < el.scrollHeight - 2);
 }
-function runShortcut(s) {
+function runShortcut(s, fresh = false) {
   if (!s) return null;
   if (!s.ok) return toast(`Introuvable : ${s.cible || s.titre}. Clic droit › Retirer des raccourcis.`, 'err');
+  // déjà ouverte : le clic ramène sa fenêtre devant, ou la réduit si elle y est déjà (« Nouvelle fenêtre » au clic droit)
+  if (!fresh && winOf(s)?.n) return toggleWindows(winKey(s), () => runShortcut(s, true));
   if (s.type === 'archiviste') return openMain({});
-  if (s.type === 'app') return s.cible.startsWith('/') ? launchLauncher(s.cible) : launchApp(s.cible, s.titre);
+  if (s.type === 'app') return s.cible.startsWith('/') ? launchLauncher(s.cible) : launchApp(s.cible, s.titre, undefined, true);
   if (s.type === 'dossier') return openFolder(s.cible);
   return openFile({ path: s.cible, name: basename(s.cible), dir: false, ext: s.ext || '', kind: s.kind });
 }
@@ -904,7 +1053,9 @@ function shortcutMenu(s, x, y) {
   const i = D.sc.indexOf(s);
   const ids = D.sc.map((z) => z.id);
   const swap = (j) => { const c = ids.slice(); [c[i], c[j]] = [c[j], c[i]]; reorderShortcuts(c); };
-  const m = [{ header: s.titre }, { label: s.type === 'app' ? 'Lancer' : 'Ouvrir', icon: s.type === 'app' ? 'play' : 'external', act: () => runShortcut(s) }];
+  const g = winOf(s);
+  const m = [{ header: s.titre }, ...winMenuItems(g),
+    { label: g?.n ? 'Nouvelle fenêtre' : s.type === 'app' ? 'Lancer' : 'Ouvrir', icon: s.type === 'app' ? 'play' : 'external', act: () => runShortcut(s, true) }];
   if (s.type === 'dossier' || s.type === 'fichier') {
     m.push({ label: 'Afficher dans Archiviste', icon: 'folder', act: () => openMain(s.type === 'dossier' ? { vue: 'files', chemin: s.cible } : { vue: 'files', chemin: dirname(s.cible), select: s.cible }) });
     if (s.type === 'fichier') m.push({ label: 'En discuter', icon: 'chat', act: () => attachToChat([s.cible]) });
@@ -980,10 +1131,15 @@ function bindShortcutDnD() {
     const t = ev.target.closest('[data-sc]');
     if (!t) return;
     dragId = t.dataset.sc;
+    D.scDrag = true;
     ev.dataTransfer.setData('text/plain', t.querySelector('.lbl')?.textContent || 'raccourci');
     ev.dataTransfer.effectAllowed = 'move';
   });
-  sc.addEventListener('dragend', () => { dragId = null; $$('.drag-over', sc).forEach((x) => x.classList.remove('drag-over')); sc.classList.remove('drop-on'); });
+  sc.addEventListener('dragend', () => {
+    dragId = null; D.scDrag = false;
+    $$('.drag-over', sc).forEach((x) => x.classList.remove('drag-over')); sc.classList.remove('drop-on');
+    if (D.winDirty) { D.winDirty = false; renderShortcuts(); }
+  });
   sc.addEventListener('dragenter', (ev) => { ev.preventDefault(); ev.dataTransfer.dropEffect = dragId ? 'move' : 'copy'; });
   sc.addEventListener('dragover', (ev) => {
     ev.preventDefault();
@@ -1054,6 +1210,42 @@ async function loadConv() {
   renderAgentSelect();
   if (MODE === 'bureau') renderConv();
 }
+// Remet la discussion du volet à jour d'après le serveur. Avec rotation : après une longue pause, une nouvelle
+// discussion commence (un vieux sujet ne pollue pas la question suivante) ; la précédente peut être reprise.
+async function syncConv(rotation, quiet = false) {
+  let c;
+  try { c = await api(`/api/bureau/conv${rotation ? '' : '?rotation=0'}`); } catch { return; }
+  if (D.busy && !rotation) return;
+  const other = c.id !== D.conv?.id;
+  if (c.auto && c.precedente) D.autoNew = true;
+  if (other || c.modifie !== D.conv.modifie) {
+    D.conv = c;
+    renderAgentSelect();
+    if (MODE === 'bureau') renderConv();
+    else if (other) { const box = $('#answer'); box.hidden = true; box.innerHTML = ''; reportSize(); }
+  }
+  if (c.auto && c.precedente && !quiet) {
+    toast(`Nouvelle discussion : la précédente avait plus de ${D.b?.conv_heures || 4} h.`, 'info', { label: 'Reprendre la précédente', action: resumeConv, timeout: 12000 });
+  }
+}
+// La discussion du volet est-elle assez ancienne pour qu'on reparte sur une neuve ? (le serveur a le dernier mot)
+function convStale() {
+  const h = D.b?.conv_heures;
+  return !!(h && D.conv?.messages?.length && !D.conv.pending && Date.now() - new Date(D.conv.modifie).getTime() >= h * 36e5);
+}
+async function resumeConv() {
+  if (D.busy) {  // on reprend l'ancienne pendant que la nouvelle répond : on arrête d'abord cette réponse
+    D.ctrl?.abort();
+    for (let i = 0; i < 50 && D.busy; i++) await new Promise((r) => setTimeout(r, 100));
+    if (D.busy) return toast('Attends la fin de la réponse (ou arrête-la).');
+  }
+  try { D.conv = await post('/api/bureau/conv/reprendre'); } catch (e) { return toast(e.message, 'err'); }
+  D.autoNew = false;
+  renderAgentSelect();
+  if (MODE === 'bureau') renderConv();
+  else if (D.conv.messages.length) { showAnswer(); finishAnswer(D.conv.messages.length); }
+  return null;
+}
 function renderAgentSelect() {
   const sel = $('#vAgent');
   if (!sel) return;
@@ -1062,7 +1254,9 @@ function renderAgentSelect() {
 }
 async function changeAgent(agent_id) {
   if (!D.conv) return;
-  try { D.conv = await post(`/api/conversations/${D.conv.id}`, { agent_id, workspace: '' }); } catch (e) { toast(e.message, 'err'); }
+  // pendant une réponse, changer d'agent effaçait l'affichage en cours et le choix était perdu à la fin
+  if (D.busy) { toast('Attends la fin de la réponse (ou arrête-la) pour changer d\'agent.'); renderAgentSelect(); return; }
+  try { D.conv = { ...(await post(`/api/conversations/${D.conv.id}`, { agent_id, workspace: '' })), precedente: D.conv.precedente }; } catch (e) { toast(e.message, 'err'); }
   renderAgentSelect(); renderConv();
 }
 async function newConv(agent_id) {
@@ -1088,6 +1282,7 @@ function convHtml(msgs, from = 0) {
     if (m.role === 'user') { flush(); out.push(attChips(m.attachments)); if (m.content) out.push(`<div class="q">${esc(m.content)}</div>`); return; }
     if (!turn) turn = [];
     if (m.role === 'tool') { turn.push(stepHtml({ ...m, name: m.tool_name, id: m.call_id })); return; }
+    if (m.role === 'error') { turn.push(errorHtml(m.content, i === msgs.length - 1 && m.reessayer !== false && !D.conv?.pending)); return; }
     if (m.content) turn.push(`<div class="md">${md(m.content)}</div>${msgActs(i)}`);
   });
   if (D.conv?.pending?.length) {
@@ -1104,11 +1299,14 @@ function renderConv() {
   const msgs = D.conv?.messages || [];
   if (!msgs.length) {
     const a = agentById(D.conv?.agent_id);
-    el.innerHTML = `<div class="hello"><img src="/static/logo-seal.svg" alt="" width="54" height="54"><b>${a ? `${esc(a.icone)} ${esc(a.nom)}` : `Bonjour ${esc(S.settings.prenom || '')}`}</b>
+    const fresh = D.autoNew && D.conv?.precedente ? `<small class="fresh">Nouvelle discussion : la précédente avait plus de ${D.b?.conv_heures || 4} h.</small>` : '';
+    el.innerHTML = `<div class="hello"><img src="/static/logo-seal.svg" alt="" width="54" height="54"><b>${a ? `${esc(a.icone)} ${esc(a.nom)}` : `Bonjour ${esc(S.settings.prenom || '')}`}</b>${fresh}
       ${a ? esc(a.description || '') : 'Je tourne sur ton PC, rien ne sort de ta machine. Glisse un fichier ici pour en parler.'}
-      ${a ? '' : `<div class="chips">${CHIPS.map((c, i) => `<button class="pill" data-chip="${i}">${ic(c.icon)}${esc(c.t)}</button>`).join('')}</div>`}</div>`;
+      ${a ? '' : `<div class="chips">${CHIPS.map((c, i) => `<button class="pill" data-chip="${i}">${ic(c.icon)}${esc(c.t)}</button>`).join('')}</div>`}
+      ${D.conv?.precedente ? `<div class="chips"><button class="pill" data-v="resume" title="Rouvre ici la discussion d'avant">${ic('undo')}Reprendre la discussion précédente</button></div>` : ''}</div>`;
     return;
   }
+  D.autoNew = false;
   el.innerHTML = convHtml(msgs);
   scrollMsgs(true);
 }
@@ -1170,12 +1368,12 @@ function liveTurn(container) {
         }
         case 'confirm': untype(); body.insertAdjacentHTML('beforeend', confirmHtml(ev.pending)); scrollMsgs(true); break;
         case 'notice': body.insertAdjacentHTML('beforeend', `<div class="notice">${esc(ev.d)}</div>`); break;
-        case 'error': untype(); body.insertAdjacentHTML('beforeend', `<div class="err-box">${ic('alert', 'sm')} ${esc(ev.d)}</div>`); scrollMsgs(true); break;
+        case 'error': untype(); body.insertAdjacentHTML('beforeend', errorHtml(ev.d, false)); scrollMsgs(true); break;
         default: break;
       }
       reportSize();
     },
-    error(msg) { untype(); body.insertAdjacentHTML('beforeend', `<div class="err-box">${esc(msg)}</div>`); },
+    error(msg) { untype(); body.insertAdjacentHTML('beforeend', errorHtml(msg, false)); },
   };
 }
 function setVBusy(on) {
@@ -1183,48 +1381,65 @@ function setVBusy(on) {
   const b = MODE === 'demander' ? $('#askGo') : $('#vSend');
   if (!b) return;
   if (MODE === 'bureau') { b.classList.toggle('stop', on); b.innerHTML = ic(on ? 'stop' : 'send'); b.title = on ? 'Arrêter' : 'Envoyer'; }
+  const sel = $('#vAgent');
+  if (sel) sel.disabled = on;  // on ne change pas d'agent au milieu d'une réponse
 }
-async function sendChat({ text = '', atts = [], decisions = null, agentName = null, workspace = null } = {}) {
+async function sendChat({ text = '', atts = [], decisions = null, regenerate = false, agentName = null, workspace = null } = {}) {
   if (D.busy) return toast('Une réponse est en cours : attends-la ou arrête-la.');
   if (MODE === 'bureau' && !D.b.volet) setVolet(true);
-  if (agentName) {
-    const a = S.agents.find((x) => x.nom === agentName);
-    if (a && (!D.conv || D.conv.agent_id !== a.id || D.conv.messages.length)) {
-      try { D.conv = await post('/api/bureau/conv/nouvelle', { agent_id: a.id }); } catch (e) { return toast(e.message, 'err'); }
-      if (workspace) { try { D.conv = await post(`/api/conversations/${D.conv.id}`, { workspace }); } catch { /* */ } }
-      renderAgentSelect();
-    }
-  }
-  if (!D.conv) await loadConv();
-  if (!D.conv) return null;
-  const body = { conv_id: D.conv.id };
-  let container;
-  if (MODE === 'demander') {
-    container = showAnswer();
-  } else {
-    container = $('#vMsgs');
-    if (!D.conv.messages.length) container.innerHTML = '';
-  }
-  if (text || atts.length) {
-    body.message = text; body.attachments = atts;
-    container.insertAdjacentHTML('beforeend', attChips(atts.map((p) => ({ path: p, name: basename(p), kind: 'file' }))) + (text ? `<div class="q">${esc(text)}</div>` : ''));
-  }
-  if (decisions) { body.decisions = decisions; $$('.confirm-card', container).forEach((x) => x.remove()); }
-  const live = liveTurn(container);
-  scrollMsgs(true);
-  setVBusy(true);
-  D.ctrl = new AbortController();
+  setVBusy(true);  // tout de suite : une deuxième touche Entrée ne lance pas deux envois
+  let container = null;
+  let live = null;
+  let localErr = null;  // erreur que le serveur n'a pas pu enregistrer (Archiviste injoignable, discussion occupée…)
+  let failed = false;
+  let from = 0;
   try {
-    await streamApi('/api/chat', body, (ev) => live.on(ev), D.ctrl.signal);
+    if (agentName) {
+      const a = S.agents.find((x) => x.nom === agentName);
+      if (a && (!D.conv || D.conv.agent_id !== a.id || D.conv.messages.length)) {
+        try { D.conv = await post('/api/bureau/conv/nouvelle', { agent_id: a.id }); } catch (e) { return toast(e.message, 'err'); }
+        if (workspace) { try { D.conv = await post(`/api/conversations/${D.conv.id}`, { workspace }); } catch { /* */ } }
+        renderAgentSelect();
+        if (MODE === 'bureau') renderConv();
+      }
+    } else if (!decisions && !regenerate) await syncConv(true);  // longue pause : on repart sur une discussion neuve
+    if (!D.conv) await loadConv();
+    if (!D.conv) return null;
+    const body = { conv_id: D.conv.id };
+    if (MODE === 'demander') {
+      container = showAnswer();
+    } else {
+      container = $('#vMsgs');
+      if (!D.conv.messages.length) container.innerHTML = '';
+    }
+    if (text || atts.length) {
+      body.message = text; body.attachments = atts;
+      container.insertAdjacentHTML('beforeend', attChips(atts.map((p) => ({ path: p, name: basename(p), kind: 'file' }))) + (text ? `<div class="q">${esc(text)}</div>` : ''));
+    }
+    if (decisions) { body.decisions = decisions; $$('.confirm-card', container).forEach((x) => x.remove()); }
+    if (regenerate) { body.regenerate = true; $$('.err-box', container).pop()?.remove(); }
+    live = liveTurn(container);
+    scrollMsgs(true);
+    D.ctrl = new AbortController();
+    from = D.conv.messages.length;
+    await streamApi('/api/chat', body, (ev) => { if (ev.t === 'error') failed = true; live.on(ev); }, D.ctrl.signal);
   } catch (e) {
-    if (e.name !== 'AbortError') live.error(e.message);
+    if (e.name !== 'AbortError') { localErr = e.message; live?.error(e.message); }
   } finally {
     setVBusy(false);
     D.ctrl = null;
-    const from = D.conv.messages.length;
-    try { D.conv = await api(`/api/conversations/${D.conv.id}`); } catch { /* */ }
-    if (MODE === 'bureau') renderConv();
-    else finishAnswer(from);
+    if (container && D.conv) {
+      try { D.conv = await api(`/api/conversations/${D.conv.id}`); } catch { /* */ }
+      if (MODE === 'bureau') renderConv();
+      else finishAnswer(from);
+      if (localErr) {  // le rafraîchissement vient d'effacer l'affichage en direct : on remet le message
+        const saved = D.conv.messages.some((m) => m.role === 'user' && m.content === text);
+        if (text && !saved) container.insertAdjacentHTML('beforeend', `<div class="q">${esc(text)}</div>`);
+        container.insertAdjacentHTML('beforeend', errorHtml(localErr, false));
+        scrollMsgs(true); reportSize();
+      }
+    } else if (localErr) toast(localErr, 'err');
+    if (failed || localErr || !S.status?.ok) refreshVStatus();  // la pastille dit tout de suite si Ollama est tombé, ou revenu
   }
   return null;
 }
@@ -1234,6 +1449,7 @@ function chatAct(b) {
   const card = b.closest('.confirm-card');
   const text = () => D.conv?.messages?.[+b.dataset.m]?.content || '';
   if (act === 'copy') return copyText(text());
+  if (act === 'retry') return sendChat({ regenerate: true });
   if (act === 'docx') return sendToOffice(text(), 'docx', D.conv?.titre);
   if (act === 'cfYes' || act === 'cfNo') { $$('button', seg).forEach((x) => x.classList.toggle('on', x === b)); return null; }
   if (act === 'cfAll' || act === 'cfNone') {
@@ -1285,7 +1501,7 @@ function finishAnswer(from) {
   reportSize();
   $('#askIn').focus();
 }
-window.archivisteMontrer = () => { const i = $('#askIn'); i.focus(); i.select(); reportSize(); };
+window.archivisteMontrer = () => { const i = $('#askIn'); i.focus(); i.select(); reportSize(); if (!D.busy) syncConv(false); };
 
 // ───────────────────────── Fond d'écran (si Archiviste le dessine) ─────────────────────────
 async function applyFond() {
@@ -1332,6 +1548,7 @@ async function initBureau() {
   bindDesk();
   applyFond();
   await Promise.all([loadElements(), loadShortcuts(), loadConv(), loadTodo()]);
+  loadWindows();
   try { D.rv = (await api('/api/bureau/sig')).rv; } catch { /* */ }
   loadApps();
   setInterval(poll, 2500);
@@ -1340,8 +1557,6 @@ async function initBureau() {
   setInterval(applyFond, 60000);
   setTimeout(refreshVMaj, 30000);
   setInterval(refreshVMaj, 30 * 60000);
-  window.addEventListener('focus', () => {
-    if (!D.busy && D.conv) api(`/api/conversations/${D.conv.id}`).then((c) => { if (c.modifie !== D.conv.modifie) { D.conv = c; renderAgentSelect(); renderConv(); } }).catch(() => loadConv());
-  });
+  window.addEventListener('focus', () => { if (!D.busy) syncConv(false); });
 }
 initBureau();

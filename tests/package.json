@@ -1,0 +1,8 @@
+{
+  "name": "archiviste-tests",
+  "private": true,
+  "description": "Tests d'interface d'Archiviste : le volet du bureau et la fenêtre principale dans Chrome sans affichage",
+  "devDependencies": {
+    "playwright-core": "^1.50.0"
+  }
+}

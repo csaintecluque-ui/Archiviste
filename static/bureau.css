@@ -21,9 +21,24 @@ body.volet-ferme { --vw: 84px; }
 
 /* ── icônes du bureau ── */
 #desk { position: fixed; inset: 0; outline: none; }
-.icons { position: absolute; top: calc(var(--mt) + 20px); left: calc(var(--ml) + 16px);
+/* la grille s'arrête au bord du volet (ou de son onglet) ; s'il y a trop d'icônes, elle défile au lieu de passer dessous */
+.icons { position: absolute; top: calc(var(--mt) + 20px); left: calc(var(--ml) + 16px); right: calc(var(--mr) + var(--vw) + 12px);
          height: calc(100vh - var(--mt) - var(--mb) - 36px); display: grid; grid-auto-flow: column;
-         grid-template-rows: repeat(auto-fill, 114px); grid-auto-columns: 118px; gap: 4px; align-content: start; }
+         grid-template-rows: repeat(auto-fill, 114px); grid-auto-columns: 118px; gap: 4px; align-content: start;
+         overflow-x: auto; overflow-y: hidden; scrollbar-width: none; --fade-l: 0px; --fade-r: 0px;
+         -webkit-mask-image: linear-gradient(to right, transparent 0, #000 var(--fade-l), #000 calc(100% - var(--fade-r)), transparent 100%);
+         mask-image: linear-gradient(to right, transparent 0, #000 var(--fade-l), #000 calc(100% - var(--fade-r)), transparent 100%); }
+.icons::-webkit-scrollbar { display: none; }
+.icons.fade-l { --fade-l: 46px; }
+.icons.fade-r { --fade-r: 46px; }
+/* flèches « il reste des icônes » : visibles seulement quand la grille déborde */
+.icnav { position: fixed; z-index: 6; top: calc(var(--mt) + (100vh - var(--mt) - var(--mb)) / 2 - 24px); width: 34px; height: 48px; padding: 0 0 4px;
+         border-radius: 12px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: #f1e6d4; font: 400 26px/1 var(--font-ui); }
+.icnav[hidden] { display: none; }
+.icnav:hover { border-color: rgba(233, 167, 115, .6); color: #fff; }
+#icPrev { left: calc(var(--ml) + 4px); }
+#icNext { right: calc(var(--mr) + var(--vw) + 14px); }
+body.mode-demander .icnav { display: none; }
 .dicon { width: 118px; height: 114px; display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 7px 4px 5px;
          border-radius: 12px; border: 1px solid transparent; cursor: default; position: relative; }
 .dicon .pic { width: 64px; height: 64px; flex: none; display: flex; align-items: center; justify-content: center; position: relative; }
@@ -126,7 +141,16 @@ body.mode-bureau #ask { display: none; }
 .sc .t.drag-over { border-color: #8cb874; }
 .sc .t .x { position: absolute; top: 1px; right: 3px; width: 20px; height: 20px; border-radius: 50%; background: #e0705a; color: #fff;
             font: 700 13px/20px var(--font-ui); text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
-.sc.edit .t:not(.add) { animation: wiggle .28s ease-in-out infinite alternate; }
+.sc.edit .t:not(.add):not(.open) { animation: wiggle .28s ease-in-out infinite alternate; }
+/* repères « appli ouverte » : trait plein = ouverte, trait long et lumineux = devant, trait creux = réduite */
+.sc .t .run-dot { position: absolute; left: 1px; top: 22px; width: 4px; height: 12px; margin-top: -6px; border-radius: 3px; background: #e09a68; }
+.sc .t.front .run-dot { height: 26px; margin-top: -13px; background: #f6c198; box-shadow: 0 0 8px rgba(240, 180, 130, .75); }
+.sc .t.mini .run-dot { left: 0; width: 7px; height: 7px; margin-top: -3px; border-radius: 50%; background: transparent; box-shadow: inset 0 0 0 1.6px #e09a68; }
+.sc .t.front { background: rgba(201, 128, 79, .13); }
+.sc .t.mini .ico { opacity: .62; }
+.sc .t .nb { position: absolute; top: 2px; right: 8px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: #c9804f; color: #1b1512;
+             font: 700 10px/16px var(--font-ui); text-align: center; box-shadow: 0 1px 3px rgba(0, 0, 0, .45); }
+.sc .sep { flex: none; height: 1px; margin: 5px 12px; background: rgba(234, 217, 184, .16); }
 @keyframes wiggle { from { transform: rotate(-1.2deg); } to { transform: rotate(1.2deg); } }
 .todo { display: flex; align-items: center; gap: 12px; padding: 11px 13px; border-radius: 14px; background: rgba(201, 128, 79, .14);
         border: 1px solid rgba(201, 128, 79, .3); flex: none; }
@@ -134,7 +158,8 @@ body.mode-bureau #ask { display: none; }
 .todo p { margin: 0; font-size: 12.5px; color: rgba(241, 230, 212, .82); line-height: 1.35; flex: 1; }
 .todo .btn { white-space: nowrap; }
 .conv { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.conv select { max-width: 170px; padding: 3px 8px; border-radius: 99px; background: rgba(255, 255, 255, .06); border: 1px solid rgba(234, 217, 184, .14);
+.side h3 .r { min-width: 0; }
+.conv select { max-width: 170px; min-width: 0; flex: 0 1 auto; padding: 3px 8px; border-radius: 99px; background: rgba(255, 255, 255, .06); border: 1px solid rgba(234, 217, 184, .14);
                color: #efe3d1; font-size: 12px; height: 26px; }
 .msgs { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 4px; user-select: text; -webkit-user-select: text; }
 .msgs .q { align-self: flex-end; max-width: 86%; background: rgba(201, 128, 79, .26); padding: 8px 12px; border-radius: 13px 13px 4px 13px; font-size: 13px;
@@ -155,6 +180,7 @@ body.mode-bureau #ask { display: none; }
 .msgs .md .codeb, .answer .md .codeb { background: rgba(0, 0, 0, .3); }
 .hello { text-align: center; margin: auto 0; padding: 12px 8px; color: rgba(241, 230, 212, .75); font-size: 13px; }
 .hello img { display: block; margin: 0 auto 8px; }
+.hello .fresh { display: block; margin: 0 0 6px; font-size: 12px; color: #e6c27a; }
 .hello b { display: block; font-family: 'Cormorant Garamond', var(--font-title); font-size: 22px; font-weight: 600; color: #f1e6d4; margin-bottom: 4px; }
 .hello .chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 12px; }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px; border-radius: 99px; font-size: 12.5px; cursor: pointer;
@@ -171,7 +197,7 @@ body.mode-bureau #ask { display: none; }
 .vcomp .row1 { display: flex; align-items: flex-end; gap: 6px; }
 .vcomp textarea { flex: 1; min-width: 0; resize: none; border: 0 !important; box-shadow: none !important; outline: none; background: none !important; color: #f1e6d4; font-size: 13px; line-height: 1.45;
                      max-height: 160px; padding: 6px 2px; }
-.vcomp textarea::placeholder { color: rgba(241, 230, 212, .5); }
+.vcomp textarea::placeholder { color: rgba(241, 230, 212, .5); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vcomp .send { width: 32px; height: 32px; border-radius: 9px; border: 0; background: #c9804f; color: #1b1512; display: flex; align-items: center; justify-content: center; cursor: pointer; flex: none; }
 .vcomp .send.stop { background: #e0705a; color: #fff; }
 .vcomp .send .i { width: 16px; height: 16px; stroke-width: 2.1; }
@@ -179,6 +205,15 @@ body.mode-bureau #ask { display: none; }
 .vcomp .clip:hover { color: #fff; background: rgba(255, 255, 255, .06); }
 .vcomp .clip .i { width: 17px; height: 17px; }
 .conv.drop-on .vcomp { border-color: #8cb874; box-shadow: 0 0 0 3px rgba(140, 184, 116, .25); }
+/* poignée de largeur, sur le bord gauche du volet */
+.vgrip { position: absolute; left: -6px; top: 26px; bottom: 26px; width: 12px; cursor: ew-resize; z-index: 2; }
+.vgrip::after { content: ''; position: absolute; left: 4px; top: 50%; width: 4px; height: 54px; margin-top: -27px; border-radius: 4px;
+                background: rgba(234, 217, 184, .0); transition: background .15s; }
+.vgrip:hover::after, body.volet-resize .vgrip::after { background: rgba(233, 167, 115, .85); }
+body.volet-resize, body.volet-resize * { cursor: ew-resize !important; }
+.msgs .err-box { font-size: 12.5px; padding: 8px 10px; }
+.results .wait.cut { color: #e6c27a; align-items: flex-start; line-height: 1.35; }
+.results .wait.cut .i { width: 14px; height: 14px; flex: none; margin-top: 1px; }
 .vtab { position: fixed; z-index: 15; right: calc(var(--mr) + 16px); top: calc(var(--mt) + 16px); width: 52px; height: 52px; border-radius: 16px;
         display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; }
 .vtab:hover { border-color: rgba(233, 167, 115, .6); }
