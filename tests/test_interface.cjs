@@ -373,6 +373,63 @@ with zipfile.ZipFile("${DESK}/Photos.zip", "w") as z:
   const again = await page.evaluate((p) => api(`/api/fs/versions?path=${encodeURIComponent(p)}`), vfile);
   check(again.versions.length === 3, 'l\'état remplacé est devenu une version lui aussi');
 
+  console.log('— accès rapide aux raccourcis : dock au bord de l\'écran, Super + Espace');
+  const qjson = (o) => ({ status: 200, contentType: 'application/json', body: JSON.stringify(o) });
+  const qsc = [
+    { id: 'q1', type: 'app', cible: 'firefox.desktop', nom: '', titre: 'Firefox', icone: 'firefox', ok: true, description: '' },
+    { id: 'q2', type: 'app', cible: 'org.gnome.Terminal.desktop', nom: '', titre: 'Terminal', icone: 'terminal', ok: true, description: '' },
+  ];
+  const qwin = { dispo: true, sig: 'q', groupes: [
+    { cle: 'app:firefox.desktop', app: 'firefox.desktop', nom: 'Firefox', icone: 'firefox', n: 2, reduit: true, devant: false, titres: ['A', 'B'],
+      fenetres: [{ id: 31, titre: 'Boîte de réception', reduit: true }, { id: 32, titre: 'Archiviste sur GitHub', reduit: true }] }] };
+  const quick = async (mode) => {
+    const p = watch(await ctx.newPage());
+    const acts2 = []; const starts2 = []; const gtk = [];
+    await p.route('**/api/raccourcis', (r) => r.fulfill(qjson(qsc)));
+    await p.route('**/api/fenetres', (r) => r.fulfill(qjson(qwin)));
+    await p.route('**/api/fenetres/action', (r) => { acts2.push(JSON.parse(r.request().postData())); r.fulfill(qjson({ ok: true, ouverte: true, dispo: true })); });
+    await p.route('**/api/apps/lancer', (r) => { starts2.push(JSON.parse(r.request().postData())); r.fulfill(qjson({ ok: true, nom: 'x' })); });
+    await p.addInitScript(() => { window.__gtk = []; window.webkit = { messageHandlers: { archiviste: { postMessage: (m) => window.__gtk.push(JSON.parse(m)) } } }; });
+    await p.goto(`${BASE}/bureau?mode=${mode}&fond=1`);
+    await p.waitForSelector('#sc .t[data-sc="q1"]');
+    await sleep(300);
+    return { p, acts2, starts2, gtk: () => p.evaluate(() => window.__gtk) };
+  };
+  // dock : seulement la colonne des raccourcis
+  let q = await quick('dock');
+  const vis = (sel) => q.p.evaluate((s) => { const e = document.querySelector(s); return !!e && getComputedStyle(e).display !== 'none' && e.getBoundingClientRect().width > 0; }, sel);
+  check(await vis('#rail') && !(await vis('#desk')) && !(await vis('#ask')) && await q.p.locator('#rail .vmain, #rail textarea').count() === 0,
+    'dock : la colonne des raccourcis seule, rien du bureau ni de la discussion');
+  check(/\brun\b/.test(await q.p.getAttribute('#sc [data-sc="q1"]', 'class')) && (await q.p.innerText('#sc [data-sc="q1"] .nb')) === '2', 'dock : repères des applis ouvertes');
+  await q.p.click('#sc [data-sc="q1"]');
+  await q.p.waitForSelector('.menu', { timeout: 3000 }).catch(() => {});
+  check((await q.p.innerText('.menu').catch(() => '')).includes('Archiviste sur GitHub') && (await q.gtk()).some((m) => m.t === 'menu' && m.ouvert),
+    'dock : plusieurs fenêtres → choix, et la fenêtre GTK sait qu\'un menu est ouvert (elle ne se ferme pas)');
+  await q.p.click('.menu button:has-text("Archiviste sur GitHub")');
+  await sleep(500);
+  check(q.acts2.length === 1 && q.acts2[0].fenetre === 32 && (await q.gtk()).some((m) => m.t === 'fermer'), 'dock : la fenêtre choisie vient devant, puis le dock s\'efface');
+  await q.p.click('#sc [data-sc="q2"]');
+  await sleep(500);
+  check(q.starts2.length === 1 && q.starts2[0].id === 'org.gnome.Terminal.desktop', 'dock : une appli fermée est lancée');
+  await q.p.mouse.move(20, 300);
+  await sleep(400);
+  check((await q.gtk()).filter((m) => m.t === 'fermer').length >= 2, 'dock : la souris s\'éloigne de la colonne → il s\'efface');
+  await q.p.close();
+  // Super + Espace : les raccourcis en ligne sous la saisie
+  q = await quick('demander');
+  check(await vis('#askSc') && await q.p.locator('#askSc #sc .t').count() === 2, 'Super + Espace : les raccourcis en ligne sous la saisie');
+  await q.p.fill('#askIn', 'fire');
+  await sleep(200);
+  check(!(await vis('#askSc')), '… cachés pendant qu\'on tape (les suggestions prennent la place)');
+  await q.p.fill('#askIn', '');
+  await q.p.dispatchEvent('#askIn', 'input');
+  await sleep(200);
+  await q.p.click('#askSc [data-sc="q1"]');
+  await sleep(500);
+  check(q.acts2.length === 1 && q.acts2[0].cle === 'app:firefox.desktop' && q.acts2[0].action === 'afficher' && (await q.gtk()).some((m) => m.t === 'fermer'),
+    'Super + Espace : un clic ramène l\'appli devant et referme la petite fenêtre');
+  await q.p.close();
+
   console.log('— fenêtre principale');
   const main = watch(await ctx.newPage());
   await main.goto(`${BASE}/#/chat`);

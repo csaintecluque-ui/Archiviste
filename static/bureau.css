@@ -212,6 +212,24 @@ body.mode-bureau #ask { display: none; }
 .vcomp .clip .i { width: 17px; height: 17px; }
 .conv.drop-on .vcomp { border-color: #8cb874; box-shadow: 0 0 0 3px rgba(140, 184, 116, .25); }
 .dicon.cut { opacity: .45; }
+/* dock au bord de l'écran (fenêtre à part, transparente) : seule la colonne des raccourcis */
+body.mode-dock { background: transparent; overflow: hidden; }
+body.mode-dock #desk, body.mode-dock #ask, body.mode-dock #voletTab, body.mode-dock .icnav { display: none !important; }
+body.mode-dock #volet.dock { position: fixed; inset: 0; pointer-events: none; }
+body.mode-dock .rail { pointer-events: auto; position: fixed; top: 50%; right: 8px; transform: translateY(-50%); max-height: calc(100vh - 16px);
+  width: var(--railw); border: 1px solid rgba(234, 217, 184, .14); border-radius: 22px; background: rgba(24, 18, 15, .9);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .45); padding: 12px 0; }
+body.mode-dock.volet-gauche .rail { right: auto; left: 8px; }
+body.mode-dock .rail.in { animation: dock-in .16s ease-out; }
+body.mode-dock.volet-gauche .rail.in { animation-name: dock-in-g; }
+@keyframes dock-in { from { transform: translate(40px, -50%); opacity: 0; } to { transform: translate(0, -50%); opacity: 1; } }
+@keyframes dock-in-g { from { transform: translate(-40px, -50%); opacity: 0; } to { transform: translate(0, -50%); opacity: 1; } }
+body.mode-dock .sc { max-height: calc(100vh - 40px); }
+/* « Demander » (Super + Espace) : les raccourcis en ligne sous la saisie */
+.ask-sc { margin-top: 8px; padding: 8px 10px; border-radius: 18px; }
+.ask-sc .sc.row { display: flex; flex-direction: row; gap: 4px; overflow-x: auto; overflow-y: hidden; max-height: none; }
+.ask-sc .sc.row .t { flex: none; width: 76px; }
+.ask-sc .sc.row .sep { width: 1px; height: auto; align-self: stretch; margin: 6px 4px; background: rgba(234, 217, 184, .14); }
 /* volet à gauche : tout est en miroir (colonne des raccourcis contre le bord de l'écran, poignée côté bureau) */
 body.volet-gauche .side { right: auto; left: calc(var(--ml) + 16px); flex-direction: row-reverse; }
 body.volet-gauche .rail { border-left: 0; border-right: 1px solid rgba(234, 217, 184, .1); border-radius: 21px 0 0 21px; }

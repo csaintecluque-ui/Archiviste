@@ -1,5 +1,9 @@
 # Nouveautés
 
+## 1.6.1
+- **Les raccourcis par-dessus les applis** : une appli en plein écran (Claude, Firefox…) ? Pousse la souris contre le bord droit de l'écran (celui du volet) : la colonne des raccourcis apparaît par-dessus, sans rien réduire. Un clic ramène l'appli choisie devant (ou propose de choisir sa fenêtre s'il y en a plusieurs), et la colonne s'efface dès que la souris s'en éloigne. Elle ne prend pas le clavier, ne gêne pas les barres de défilement (il faut laisser la souris un instant contre le bord, sans bouton enfoncé) ni le bouton « fermer » dans le coin. Réglages → Bureau → « Raccourcis par-dessus les applis » pour la désactiver.
+- **Super + Espace** montre aussi les raccourcis, en ligne sous la saisie : un clic ramène l'appli devant et referme la petite fenêtre.
+
 ## 1.6.0
 - **Archives** : double-clic sur un zip, un rar, un 7z, un tar.gz… pour voir ce qu'il contient, puis « Extraire ici » ou « Extraire vers… » (aussi au clic droit, sur le bureau et dans la fenêtre principale). Comme dans Nemo, une archive qui ne contient qu'un dossier le dépose tel quel ; sinon ses fichiers sont rangés dans un dossier à son nom. Les noms de fichiers des zips faits sous Windows (« Été », « Facture n° ») sont bien lus, une archive protégée demande son mot de passe, et rien ne peut s'écrire en dehors du dossier choisi. Les .rar et .7z passent par 7-Zip (`sudo apt install 7zip` s'il manque).
 - **« Compresser… »** un ou plusieurs éléments en .zip (s'ouvre partout) ou en .tar.gz.
