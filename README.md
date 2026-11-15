@@ -11,7 +11,7 @@ Rien ne quitte ta machine.
 | **Agents** | Assistants spécialisés : consignes + outils (lister, lire, chercher, écrire, déplacer, renommer, mettre à la corbeille, trouver les doublons) + un dossier de travail dont ils ne sortent pas. 4 agents fournis : Rangeur, Lecteur, Rédacteur, Nettoyeur. |
 | **Prompts** | Bibliothèque de consignes réutilisables, avec variables `{{comme_ceci}}` demandées au moment de l'utilisation. |
 | **Corbeille** | La même que celle de Nemo : restaurer ou supprimer définitivement. |
-| **Bureau** | En option, Archiviste remplace les icônes du bureau de Mint : tes fichiers, une barre « Demande à l'Archiviste… » qui cherche aussi tes applis et tes fichiers, et un volet à droite (raccourcis, fichiers à ranger, discussion). Clic droit sur une appli, un dossier ou un fichier → **Épingler aux raccourcis**. <kbd>Super</kbd>+<kbd>Espace</kbd> pose une question depuis n'importe quelle fenêtre. |
+| **Bureau** | En option, Archiviste remplace les icônes du bureau de Mint : tes fichiers, et un volet à droite (raccourcis, fichiers à ranger, discussion). La discussion sert aussi de lanceur : « ouvre Grimoire » l'ouvre tout de suite, et elle propose tes applis et tes fichiers pendant que tu tapes. Clic droit sur une appli, un dossier ou un fichier → **Épingler aux raccourcis**. <kbd>Super</kbd>+<kbd>Espace</kbd> pose une question depuis n'importe quelle fenêtre. |
 | **Grimoire** | Si l'appli de bureau Grimoire est installée : les .docx et .xlsx s'ouvrent dedans d'un double-clic, « Fichier ▾ » crée un document Word ou un classeur qui s'y ouvre, et chaque réponse de l'IA peut partir dans Grimoire en document mis en forme (titres, listes, tableaux) ou, si elle contient des tableaux, en classeur. Les agents ont un outil « Créer un document Word/Excel ». |
 
 ## Installation
@@ -42,8 +42,10 @@ Relancer Archiviste ramène la fenêtre existante au premier plan (une seule fen
 | Double-clic | ouvre (Word/Excel dans Grimoire, dossiers dans Archiviste ou Nemo selon le réglage, lanceurs .desktop) |
 | Clic droit sur un élément | Ouvrir avec…, Résumer avec l'IA, En discuter, **Épingler aux raccourcis**, Renommer, Corbeille… |
 | Clic droit sur le fond | nouveau dossier / document Word / classeur / fichier texte, ranger le bureau avec l'IA, trier les icônes, masquer le volet, fond d'écran |
-| Clavier | <kbd>Entrée</kbd> ouvrir · <kbd>F2</kbd> renommer · <kbd>Suppr</kbd> corbeille · <kbd>Ctrl</kbd>+<kbd>A</kbd> · flèches · taper du texte → barre de l'Archiviste |
+| Clavier | <kbd>Entrée</kbd> ouvrir · <kbd>F2</kbd> renommer · <kbd>Suppr</kbd> corbeille · <kbd>Ctrl</kbd>+<kbd>A</kbd> · flèches · taper du texte → discussion du volet |
 | Glisser-déposer | sur un dossier : déplacer (<kbd>Ctrl</kbd> : copier) · sur la corbeille · sur les raccourcis : épingler · sur la discussion : joindre · depuis Nemo : vers le bureau |
+
+La discussion du volet : « ouvre Grimoire », « lance Firefox », « ouvre mes téléchargements » ouvrent tout de suite (sans l'IA) ; pendant que tu tapes, elle propose tes applis et tes fichiers (flèches puis <kbd>Entrée</kbd>, clic droit pour épingler) ; tout le reste part à l'Archiviste, qui peut lui aussi ouvrir des applis et des fichiers.
 
 Les raccourcis du volet : clic pour ouvrir, glisser pour réordonner, clic droit pour renommer ou retirer, « Modifier » pour retirer plusieurs, « + » pour ajouter une application (toutes celles du menu, tes favoris en premier), un dossier ou un fichier.
 

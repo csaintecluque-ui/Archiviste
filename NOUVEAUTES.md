@@ -1,5 +1,11 @@
 # Nouveautés
 
+## 1.4.1
+- **Une seule saisie sur le bureau** : la barre du haut disparaît, tout passe par la discussion du volet. Pendant que tu tapes, elle propose tes applis, tes fichiers et tes dossiers ; taper n'importe où sur le bureau y écrit directement.
+- **« ouvre Grimoire », « lance Firefox », « ouvre mes téléchargements »** : ouvert tout de suite, sans attendre l'IA.
+- L'IA sait maintenant **ouvrir une application, un fichier ou un dossier** (nouveaux outils, aussi dans la fenêtre principale et pour les agents), et n'a plus le droit de prétendre avoir lancé quelque chose sans l'avoir fait.
+- Les applis s'ouvrent sans terminal : si un ancien lanceur (script lancé dans un terminal) masque l'appli installée par son paquet, Archiviste lance l'appli du paquet.
+
 ## 1.4.0
 - **Bureau Archiviste** (Réglages → Bureau → « Activer ») : il remplace les icônes du bureau de Nemo. Tes fichiers du dossier Bureau, avec double-clic, clic droit (ouvrir avec…, Grimoire, résumer, en discuter, renommer, corbeille), sélection au lasso, glisser-déposer, clés USB et corbeille.
 - En haut, la barre **« Demande à l'Archiviste… »** : elle trouve aussi tes applis et tes fichiers pendant que tu tapes, et Entrée pose la question à l'IA. Taper n'importe où sur le bureau y écrit directement.

@@ -138,7 +138,7 @@ async function poll() {
     D.rv = r.rv;
     if (!first) {
       try { D.b = await api('/api/bureau'); } catch { /* */ }
-      applyVolet(); loadShortcuts(); renderKeys();
+      applyVolet(); loadShortcuts();
     }
   }
 }
@@ -414,9 +414,10 @@ function bindDesk() {
       selectOnly(D.items[i]);
       return;
     }
-    if (k.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {  // taper n'importe où : la barre de l'Archiviste
+    if (k.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {  // taper n'importe où : on écrit à l'Archiviste
       ev.preventDefault();
-      const inp = $('#askIn');
+      if (!D.b.volet) setVolet(true);
+      const inp = $('#vIn');
       inp.focus(); inp.value += k; inp.dispatchEvent(new Event('input'));
     }
   });
@@ -480,138 +481,168 @@ function pathsFromUris(list) {
     .map((u) => { try { return decodeURIComponent(new URL(u).pathname); } catch { return null; } }).filter(Boolean);
 }
 
-// ───────────────────────── Barre « Demande à l'Archiviste » ─────────────────────────
-const AQ = { q: '', items: [], idx: 0, seq: 0, files: null, loading: false };
-function renderKeys() {
-  const el = $('#askKeys');
-  if (!el) return;
-  const t = D.b?.touche_label;
-  el.innerHTML = MODE === 'bureau' && t ? t.split(' + ').map((k) => `<span class="kbd">${esc(k)}</span>`).join('') : '';
+// ───────────────────────── Lanceur : une seule saisie pour l'IA, les applis et les fichiers ─────────────────────────
+// « ouvre Grimoire », « lance firefox », « ouvre mes téléchargements » : ouvert tout de suite, sans passer par l'IA.
+// Le reste part à l'Archiviste. Utilisé par la discussion du volet et par la fenêtre « Demander » (Super + Espace).
+const OPEN_RE = /^(?:(?:peux|pourrais)[- ]tu\s+|tu\s+peux\s+|merci\s+d['’]\s*)?(?:ouvre|ouvrir|ouvres|lance|lancer|lances|d[ée]marre|d[ée]marrer|affiche|afficher|montre|montrer|va\s+dans|aller\s+dans)\b\s*(?:-?\s*moi\s+)?(.*)$/i;
+const ART_RE = /^(?:l['’]\s*appli(?:cation)?|l['’]\s*app|le\s+logiciel|le\s+programme|le\s+dossier|le\s+fichier|la\s+|le\s+|les\s+|l['’]\s*|mes\s+|mon\s+|ma\s+)\s*/i;
+function parseIntent(text) {
+  const m = String(text || '').trim().replace(/[?!.…]+$/, '').match(OPEN_RE);
+  if (!m) return null;
+  let t = m[1].trim();
+  for (let i = 0; i < 3; i++) t = t.replace(ART_RE, '').trim();
+  return t || null;
+}
+function scoreApp(a, n) {
+  const name = norm(a.nom);
+  if (name === n || norm(a.id.replace(/\.desktop$/, '').split('.').pop()) === n) return 0;
+  if (name.startsWith(n)) return 1;
+  if (name.split(/\s+/).some((w) => w.startsWith(n))) return 2;
+  if (name.includes(n)) return 3;
+  if (norm(a.generique).includes(n) || a.mots.some((m) => norm(m).startsWith(n)) || norm(a.id).includes(n)) return 4;
+  return -1;
 }
 function matchApps(q) {
   const n = norm(q);
   if (!D.apps || n.length < 2) return [];
-  const scored = [];
-  for (const a of D.apps) {
-    const name = norm(a.nom);
-    let s = name.startsWith(n) ? 0 : name.split(/\s+/).some((w) => w.startsWith(n)) ? 1 : name.includes(n) ? 2 : -1;
-    if (s < 0 && (norm(a.generique).includes(n) || a.mots.some((m) => norm(m).startsWith(n)) || norm(a.id).includes(n))) s = 3;
-    if (s >= 0) scored.push([s, a]);
+  return D.apps.map((a) => [scoreApp(a, n), a]).filter((x) => x[0] >= 0)
+    .sort((x, y) => x[0] - y[0] || x[1].nom.localeCompare(y[1].nom)).slice(0, 5).map(([s, a]) => ({ s, a }));
+}
+function specialDirs(q) {
+  const n = norm(q);
+  if (!D.b || n.length < 3) return [];
+  const list = [
+    [['bureau', 'desktop'], D.b.dossier, 'Bureau'],
+    [['telechargements', 'telechargement', 'downloads'], D.b.telechargements, 'Téléchargements'],
+    [['documents', 'docs'], D.b.documents, 'Documents'],
+    [['dossier personnel', 'home', 'maison', 'perso'], D.b.home, 'Dossier personnel'],
+    [['corbeille', 'poubelle'], '#corbeille', 'Corbeille'],
+  ];
+  return list.filter(([keys]) => keys.some((k) => k.startsWith(n) || n.startsWith(k)))
+    .map(([, path, name]) => ({ name, path, dir: true, kind: 'folder', ext: '', special: true }));
+}
+function makeLauncher({ input, box, onAsk, always = false }) {
+  const L = { q: '', target: '', intent: null, items: [], idx: 0, seq: 0, files: null, loading: false };
+  const visible = () => !box.hidden;
+  const hide = () => { box.hidden = true; box.innerHTML = ''; L.items = []; reportSize(); };
+  const search = debounce(async (q, seq) => {
+    try {
+      const r = await api(`/api/fs/search?rapide=1&path=${enc(S.home)}&q=${enc(q)}`);
+      if (seq !== L.seq) return;
+      L.files = r.results.slice(0, 7);
+    } catch { if (seq === L.seq) L.files = []; }
+    L.loading = false;
+    build();
+  }, 220);
+  function update() {
+    const text = input.value.trim();
+    L.q = text; L.seq++; L.idx = 0; L.files = null; L.loading = false;
+    if (text.length < 2 || text.length > 90 || text.includes('\n')) return hide();
+    L.intent = parseIntent(text);
+    L.target = L.intent || text;
+    const words = L.target.split(/\s+/).length;
+    if (D.apps === null) loadApps().then(build);
+    if ((L.intent || (always ? words <= 4 : words <= 2)) && L.target.length >= 2) { L.loading = true; search(L.target, L.seq); }
+    return build();
   }
-  return scored.sort((x, y) => x[0] - y[0] || x[1].nom.localeCompare(y[1].nom)).slice(0, 5).map((x) => x[1]);
-}
-const searchFiles = debounce(async (q, seq) => {
-  try {
-    const r = await api(`/api/fs/search?rapide=1&path=${enc(S.home)}&q=${enc(q)}`);
-    if (seq !== AQ.seq) return;
-    AQ.files = r.results.slice(0, 7);
-  } catch { if (seq === AQ.seq) AQ.files = []; }
-  AQ.loading = false;
-  buildResults();
-}, 220);
-function onAskInput() {
-  const q = $('#askIn').value.trim();
-  AQ.q = q; AQ.seq++; AQ.idx = 0; AQ.files = null;
-  if (!q) { hideResults(); return; }
-  if (D.apps === null) loadApps().then(buildResults);
-  AQ.loading = q.length >= 2;
-  if (AQ.loading) searchFiles(q, AQ.seq);
-  buildResults();
-}
-function buildResults() {
-  const q = AQ.q;
-  if (!q) return hideResults();
-  const items = [{ kind: 'ask' }];
-  matchApps(q).forEach((a) => items.push({ kind: 'app', a }));
-  (AQ.files || []).forEach((e) => items.push({ kind: 'file', e }));
-  AQ.items = items;
-  AQ.idx = Math.min(AQ.idx, items.length - 1);
-  let html = '';
-  let section = '';
-  items.forEach((it, i) => {
-    const sec = it.kind === 'app' ? 'Applications' : it.kind === 'file' ? 'Fichiers et dossiers' : '';
-    if (sec && sec !== section) { html += `<div class="rh">${sec}</div>`; section = sec; }
-    let ico; let t; let sub; let k = '';
-    if (it.kind === 'ask') {
-      ico = '<img src="/favicon.svg" alt="" width="26" height="26">';
-      t = `Demander à l'Archiviste`; sub = `« ${q} »`; k = 'Entrée';
-    } else if (it.kind === 'app') {
-      ico = `<img class="app-ic" src="${appIconUrl(it.a.icone, 32)}" alt="">`;
-      t = it.a.nom; sub = it.a.generique || it.a.description || 'Application';
-    } else {
-      ico = it.e.dir ? `<span style="color:#e09a68">${ic('folder')}</span>` : `<span style="color:${KIND_COLOR[it.e.kind] || '#c9b8a3'}">${ic(KIND_ICON[it.e.kind] || 'file')}</span>`;
-      t = it.e.name; sub = tildify(dirname(it.e.path));
+  function build() {
+    if (!L.q) return hide();
+    const apps = matchApps(L.target);
+    const dirs = specialDirs(L.target);
+    const files = [...dirs, ...(L.files || []).filter((f) => !dirs.some((d) => d.path === f.path))].slice(0, 7);
+    const acts = [...apps.map(({ a }) => ({ kind: 'app', a })), ...files.map((e) => ({ kind: 'file', e }))];
+    const ask = { kind: 'ask' };
+    const oneApp = apps.length && apps[0].s <= 1 && L.target.split(/\s+/).length <= 2;
+    const strong = L.intent ? acts.length > 0 : oneApp;
+    L.items = strong ? [acts[0], ask, ...acts.slice(1)] : [ask, ...acts];
+    L.idx = Math.min(L.idx, L.items.length - 1);
+    if (!always && !acts.length && !(L.intent && L.loading)) return hide();
+    let html = '';
+    let section = '';
+    L.items.forEach((it, i) => {
+      const sec = it.kind === 'app' ? 'Applications' : it.kind === 'file' ? 'Fichiers et dossiers' : '';
+      if (sec && sec !== section && !(i === 0 && strong)) { html += `<div class="rh">${sec}</div>`; section = sec; }
+      let ico; let t; let sub; let k = '';
+      if (it.kind === 'ask') {
+        ico = '<img src="/favicon.svg" alt="" width="26" height="26">';
+        t = 'Demander à l\'Archiviste'; sub = `« ${L.q} »`;
+      } else if (it.kind === 'app') {
+        ico = `<img class="app-ic" src="${appIconUrl(it.a.icone, 32)}" alt="">`;
+        t = it.a.nom; sub = (i === 0 && strong ? 'Ouvrir l\'application · ' : '') + (it.a.generique || it.a.description || 'Application');
+      } else {
+        ico = it.e.dir ? `<span style="color:#e09a68">${ic(it.e.path === '#corbeille' ? 'trash' : it.e.path === D.b?.home ? 'home' : 'folder')}</span>` : `<span style="color:${KIND_COLOR[it.e.kind] || '#c9b8a3'}">${ic(KIND_ICON[it.e.kind] || 'file')}</span>`;
+        t = it.e.name; sub = (i === 0 && strong ? 'Ouvrir · ' : '') + (it.e.special ? 'Dossier' : tildify(dirname(it.e.path)));
+      }
+      if (i === 0) k = 'Entrée';
+      html += `<div class="ri ${i === L.idx ? 'on' : ''}" data-r="${i}"><span class="ico">${ico}</span><span class="t"><b>${esc(t)}</b><small>${esc(sub)}</small></span>${k ? `<span class="k">${k}</span>` : ''}</div>`;
+    });
+    if (L.loading && L.files === null) html += '<div class="wait"><span class="spinner"></span> Recherche dans tes fichiers…</div>';
+    box.innerHTML = html;
+    box.hidden = false;
+    reportSize();
+    return null;
+  }
+  function move(d) {
+    if (!L.items.length) return;
+    L.idx = (L.idx + d + L.items.length) % L.items.length;
+    $$('.ri', box).forEach((el) => el.classList.toggle('on', +el.dataset.r === L.idx));
+    $(`.ri[data-r="${L.idx}"]`, box)?.scrollIntoView({ block: 'nearest' });
+  }
+  function run(it) {
+    const text = input.value.trim();
+    L.q = ''; L.seq++;  // ignore les recherches encore en route
+    hide();
+    if (!it || it.kind === 'ask') return onAsk(text);
+    input.value = ''; input.dispatchEvent(new Event('input'));
+    if (it.kind === 'app') return launchApp(it.a.id, it.a.nom);
+    if (it.e.path === '#corbeille') return openMain({ vue: 'trash' });
+    return openFile(it.e);
+  }
+  function menu(it, x, y) {
+    if (it.kind === 'app') {
+      return showMenu(x, y, [
+        { header: it.a.nom },
+        { label: 'Lancer', icon: 'play', act: () => run(it) },
+        { label: 'Épingler aux raccourcis', icon: 'star', act: () => pinShortcut('app', it.a.id).then(loadShortcuts) },
+      ]);
     }
-    html += `<div class="ri ${i === AQ.idx ? 'on' : ''}" data-r="${i}"><span class="ico">${ico}</span><span class="t"><b>${esc(t)}</b><small>${esc(sub)}</small></span>${k ? `<span class="k">${k}</span>` : ''}</div>`;
-  });
-  if (AQ.loading && AQ.files === null) html += '<div class="wait"><span class="spinner"></span> Recherche dans tes fichiers…</div>';
-  const box = $('#askRes');
-  box.innerHTML = html;
-  box.hidden = false;
-  reportSize();
-}
-function hideResults() { const b = $('#askRes'); b.hidden = true; b.innerHTML = ''; AQ.items = []; reportSize(); }
-function moveResult(d) {
-  if (!AQ.items.length) return;
-  AQ.idx = (AQ.idx + d + AQ.items.length) % AQ.items.length;
-  $$('#askRes .ri').forEach((el) => el.classList.toggle('on', +el.dataset.r === AQ.idx));
-  $(`#askRes .ri[data-r="${AQ.idx}"]`)?.scrollIntoView({ block: 'nearest' });
-}
-function runResult(it) {
-  if (!it) return;
-  const q = AQ.q;
-  const inp = $('#askIn');
-  AQ.q = ''; AQ.seq++;  // ignore les recherches encore en route
-  if (it.kind === 'ask') { inp.value = ''; hideResults(); return sendChat({ text: q }); }
-  inp.value = ''; hideResults();
-  if (it.kind === 'app') return launchApp(it.a.id, it.a.nom);
-  return openFile(it.e);
-}
-function resultMenu(it, x, y) {
-  if (it.kind === 'app') {
-    return showMenu(x, y, [
-      { header: it.a.nom },
-      { label: 'Lancer', icon: 'play', act: () => runResult(it) },
-      { label: 'Épingler aux raccourcis', icon: 'star', act: () => pinShortcut('app', it.a.id).then(loadShortcuts) },
-    ]);
+    if (it.kind === 'file' && !it.e.path.startsWith('#')) {
+      return showMenu(x, y, [
+        { header: it.e.name },
+        { label: 'Ouvrir', icon: 'external', act: () => run(it) },
+        { label: 'Afficher dans Archiviste', icon: 'folder', act: () => openMain(it.e.dir ? { vue: 'files', chemin: it.e.path } : { vue: 'files', chemin: dirname(it.e.path), select: it.e.path }) },
+        { label: 'Épingler aux raccourcis', icon: 'star', act: () => pinEntry(it.e) },
+        { label: 'En discuter', icon: 'chat', act: () => attachToChat([it.e.path]) },
+      ]);
+    }
+    return null;
   }
-  if (it.kind === 'file') {
-    return showMenu(x, y, [
-      { header: it.e.name },
-      { label: 'Ouvrir', icon: 'external', act: () => runResult(it) },
-      { label: 'Afficher dans Archiviste', icon: 'folder', act: () => openMain({ vue: 'files', chemin: dirname(it.e.path), select: it.e.path }) },
-      { label: 'Épingler aux raccourcis', icon: 'star', act: () => pinEntry(it.e) },
-      { label: 'En discuter', icon: 'chat', act: () => attachToChat([it.e.path]) },
-    ]);
-  }
-  return null;
-}
-function bindAsk() {
-  const inp = $('#askIn');
-  inp.addEventListener('input', onAskInput);
-  inp.addEventListener('keydown', (ev) => {
-    if (ev.key === 'ArrowDown') { ev.preventDefault(); moveResult(1); } else if (ev.key === 'ArrowUp') { ev.preventDefault(); moveResult(-1); } else if (ev.key === 'Enter' && !ev.isComposing) {
+  input.addEventListener('input', update);
+  input.addEventListener('keydown', (ev) => {
+    if (visible() && (ev.key === 'ArrowDown' || ev.key === 'ArrowUp')) { ev.preventDefault(); move(ev.key === 'ArrowDown' ? 1 : -1); return; }
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();
-      if (AQ.q) runResult(AQ.items[AQ.idx] || { kind: 'ask' });
-    } else if (ev.key === 'Escape') {
-      ev.preventDefault(); ev.stopPropagation();
-      if (inp.value) { inp.value = ''; hideResults(); } else if (MODE === 'demander') closePopup(); else inp.blur();
+      if (visible() && L.items.length) run(L.items[L.idx]);
+      else onAsk(input.value.trim());
+      return;
+    }
+    if (ev.key === 'Escape') {
+      if (visible()) { ev.preventDefault(); ev.stopPropagation(); hide(); } else if (MODE === 'demander') { ev.preventDefault(); if (input.value) input.value = ''; else closePopup(); }
     }
   });
-  $('#askGo').addEventListener('click', () => { if (AQ.q) runResult({ kind: 'ask' }); else inp.focus(); });
-  const res = $('#askRes');
-  res.addEventListener('mousedown', (ev) => ev.preventDefault());  // garde le focus dans la barre
-  res.addEventListener('mousemove', (ev) => {
+  input.addEventListener('blur', () => setTimeout(() => { if (!box.contains(document.activeElement) && !$('.menu')) hide(); }, 150));
+  box.addEventListener('mousedown', (ev) => ev.preventDefault());  // garde le focus dans la saisie
+  box.addEventListener('mousemove', (ev) => {
     const r = ev.target.closest('.ri');
-    if (r && +r.dataset.r !== AQ.idx) { AQ.idx = +r.dataset.r; $$('#askRes .ri').forEach((el) => el.classList.toggle('on', el === r)); }
+    if (r && +r.dataset.r !== L.idx) { L.idx = +r.dataset.r; $$('.ri', box).forEach((el) => el.classList.toggle('on', el === r)); }
   });
-  res.addEventListener('click', (ev) => { const r = ev.target.closest('.ri'); if (r) runResult(AQ.items[+r.dataset.r]); });
-  res.addEventListener('contextmenu', (ev) => {
-    const r = ev.target.closest('.ri');
+  box.addEventListener('click', (ev) => { const r = ev.target.closest('.ri'); if (r) run(L.items[+r.dataset.r]); });
+  box.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
-    if (r) resultMenu(AQ.items[+r.dataset.r], ev.clientX, ev.clientY);
+    const r = ev.target.closest('.ri');
+    if (r) menu(L.items[+r.dataset.r], ev.clientX, ev.clientY);
   });
-  document.addEventListener('mousedown', (ev) => { if (!ev.target.closest('#ask') && !ev.target.closest('.menu')) hideResults(); });
+  return { hide, update };
 }
 async function loadApps() {
   try { const r = await api('/api/apps'); D.apps = r.apps; D.favs = r.favoris; } catch { D.apps = []; }
@@ -629,16 +660,16 @@ function buildVolet() {
     <section class="conv" id="conv"><h3>${ic('chat')}Discussion<span class="r"><select id="vAgent" title="Agent"></select>
       <button class="lnk" data-v="newConv" title="Nouvelle discussion">${ic('plus')}</button><button class="lnk" data-v="convMain" title="Continuer dans Archiviste">${ic('external')}</button></span></h3>
       <div class="msgs" id="vMsgs"></div>
-      <div class="vcomp"><div class="atts" id="vAtts"></div><div class="row1">
+      <div class="vcomp"><div class="results glass lsugg" id="vSugg" hidden></div><div class="atts" id="vAtts"></div><div class="row1">
         <button class="clip" data-v="attach" title="Joindre des fichiers">${ic('clip')}</button>
-        <textarea id="vIn" rows="1" placeholder="Écris à l'Archiviste…"></textarea>
+        <textarea id="vIn" rows="1" placeholder="Écris à l'Archiviste, ou « ouvre Grimoire »…"></textarea>
         <button class="send" id="vSend" data-v="send" title="Envoyer">${ic('send')}</button></div></div>
     </section>`;
   v.addEventListener('click', onVoletClick);
   v.addEventListener('contextmenu', onVoletContext);
   const inp = $('#vIn');
   inp.addEventListener('input', () => { inp.style.height = 'auto'; inp.style.height = Math.min(inp.scrollHeight, 160) + 'px'; });
-  inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); sendFromComposer(); } });
+  makeLauncher({ input: inp, box: $('#vSugg'), onAsk: () => sendFromComposer() });
   $('#vAgent').addEventListener('change', (ev) => changeAgent(ev.target.value || null));
   $('#voletTab').addEventListener('click', () => setVolet(true));
   bindShortcutDnD();
@@ -908,7 +939,7 @@ function renderAgentSelect() {
   const sel = $('#vAgent');
   if (!sel) return;
   sel.innerHTML = `<option value="">💬 Discussion libre</option>${S.agents.map((a) => `<option value="${esc(a.id)}" ${a.id === D.conv?.agent_id ? 'selected' : ''}>${esc(a.icone)} ${esc(a.nom)}</option>`).join('')}`;
-  $('#vIn').placeholder = D.conv?.agent_id ? `Demande quelque chose à ${agentById(D.conv.agent_id)?.nom || 'l\'agent'}…` : 'Écris à l\'Archiviste…';
+  $('#vIn').placeholder = D.conv?.agent_id ? `Demande quelque chose à ${agentById(D.conv.agent_id)?.nom || 'l\'agent'}…` : 'Écris à l\'Archiviste, ou « ouvre Grimoire »…';
 }
 async function changeAgent(agent_id) {
   if (!D.conv) return;
@@ -1165,10 +1196,12 @@ async function initBureau() {
     return;
   }
   S.home = S.settings.home;
-  renderKeys();
-  bindAsk();
   refreshVStatus();
   if (MODE === 'demander') {
+    const inp = $('#askIn');
+    const askNow = (t) => { if (!t) return; inp.value = ''; sendChat({ text: t }); };
+    makeLauncher({ input: inp, box: $('#askRes'), onAsk: askNow, always: true });
+    $('#askGo').addEventListener('click', () => askNow(inp.value.trim()));
     new ResizeObserver(reportSize).observe($('#ask'));
     setTimeout(() => $('#askIn').focus(), 60);
     loadApps();

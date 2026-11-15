@@ -2297,7 +2297,7 @@ async function renderBureauCard(rapport) {
   try { b = await api('/api/bureau'); } catch (e) { el.innerHTML = `<h2>${ic('panel')} Bureau</h2><p class="muted">${esc(e.message)}</p>`; return; }
   const okIc = (ok) => (ok === true ? '✓' : ok === false ? '✗' : '·');
   el.innerHTML = `<h2>${ic('panel')} Bureau</h2>
-    <p class="muted" style="margin-top:-4px;font-size:13px">Archiviste remplace les icônes du bureau de Mint : tes fichiers du dossier <span class="mono">${esc(tildify(b.dossier))}</span>, une barre « Demande à l'Archiviste… », et un volet à droite avec tes raccourcis et la discussion. Pour épingler une appli, un dossier ou un fichier : clic droit › <b>Épingler aux raccourcis</b>.</p>
+    <p class="muted" style="margin-top:-4px;font-size:13px">Archiviste remplace les icônes du bureau de Mint : tes fichiers du dossier <span class="mono">${esc(tildify(b.dossier))}</span>, et un volet à droite avec tes raccourcis et la discussion (qui ouvre aussi tes applis : « ouvre Grimoire »). Pour épingler une appli, un dossier ou un fichier : clic droit › <b>Épingler aux raccourcis</b>.</p>
     <div class="row wrap" style="gap:10px">
       ${b.actif
     ? `<span class="chip on">${ic('check', 'sm')} Bureau Archiviste actif</span><button class="btn" data-bu="off">Rendre le bureau à Nemo</button>`

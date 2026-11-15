@@ -37,7 +37,7 @@ from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -996,7 +996,23 @@ TOOLS = {
         "properties": {"chemin": _p("Élément à mettre à la corbeille.")},
         "required": ["chemin"],
     },
+    "ouvrir_application": {
+        "label": "Ouvrir une application", "modifie": False,
+        "description": ("Lance une application installée sur le PC (ex : Grimoire, Firefox, Terminal, "
+                        "Calculatrice, LibreOffice). Utilise-le dès qu'on te demande d'ouvrir ou de lancer une appli."),
+        "properties": {"nom": _p("Nom de l'application, tel que l'utilisateur l'a dit (ex : grimoire).")},
+        "required": ["nom"],
+    },
+    "ouvrir": {
+        "label": "Ouvrir un fichier ou un dossier", "modifie": False,
+        "description": ("Ouvre un fichier avec son application (Word et Excel dans Grimoire) ou affiche un dossier. "
+                        "Si tu ne connais pas le chemin exact, cherche d'abord avec chercher_fichiers."),
+        "properties": {"chemin": _p("Fichier ou dossier à ouvrir.")},
+        "required": ["chemin"],
+    },
 }
+# Outils de la discussion libre (sans agent) : ouvrir des applis et des fichiers, chercher. Rien qui modifie.
+FREE_TOOLS = ["ouvrir_application", "ouvrir", "chercher_fichiers"]
 
 
 def tool_schemas(names: list[str]) -> list[dict]:
@@ -1035,6 +1051,8 @@ def describe_action(name: str, args: dict) -> str:
         "chercher_fichiers": f"Chercher « {g('motif')} »",
         "infos_fichier": f"Infos sur « {g('chemin')} »",
         "trouver_doublons": f"Chercher les doublons dans « {g('dossier') or '.'} »",
+        "ouvrir_application": f"Ouvrir l'application « {g('nom')} »",
+        "ouvrir": f"Ouvrir « {g('chemin')} »",
     }.get(name, f"{name}({json.dumps(a, ensure_ascii=False)[:120]})")
 
 
@@ -1138,6 +1156,18 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
         if name == "supprimer":
             r = trash(a.get("chemin"), roots=roots, base=base)
             return {"corbeille": _short(r["path"], base)}, f"Mis à la corbeille : {_short(r['path'], base)}", True
+        if name == "ouvrir_application":
+            app, proches = match_app(str(a.get("nom") or ""))
+            if not app:
+                msg = f"Aucune application installée ne s'appelle « {a.get('nom', '')} »."
+                return ({"erreur": msg, "applications_proches": proches},
+                        msg + (f" Proches : {', '.join(proches)}" if proches else ""), False)
+            launch_app(app)
+            return {"application": app["nom"], "lancee": True}, f"Lancée : {app['nom']}", True
+        if name == "ouvrir":
+            path = safe_path(a.get("chemin"), base=base, roots=roots, must_exist=True)
+            how = open_path(path)
+            return {"ouvert": _short(path, base), "avec": how}, f"Ouvert : {_short(path, base)} ({how})", True
         raise ApiError(f"Outil inconnu : {name}")
     except ApiError as e:
         return {"erreur": str(e)}, str(e), False
@@ -1346,7 +1376,7 @@ def conv_context(conv: dict, agent: dict | None, s: dict) -> dict:
         ws = roots[0]
         agent_roots = roots
     return {"roots": agent_roots, "base": ws, "show_hidden": s["show_hidden"],
-            "allowed": set((agent or {}).get("outils") or [])}
+            "allowed": set((agent or {}).get("outils") or []) if agent else set(FREE_TOOLS)}
 
 
 def build_system(agent: dict | None, s: dict, ctx: dict) -> str:
@@ -1364,6 +1394,15 @@ def build_system(agent: dict | None, s: dict, ctx: dict) -> str:
         if agent.get("confirmer", True):
             parts.append(f"Chaque action qui modifie des fichiers est soumise à la validation de {prenom} ; "
                          "s'il refuse une action, n'insiste pas et propose une autre solution.")
+    elif not agent:
+        parts.append(
+            f"Tu peux ouvrir une application (outil ouvrir_application), ouvrir un fichier ou un dossier (outil "
+            f"ouvrir) et chercher des fichiers (outil chercher_fichiers) sur le PC de {prenom}. Quand il te demande "
+            "d'ouvrir ou de lancer quelque chose, appelle l'outil au lieu de répondre en texte. Pour le reste, "
+            "réponds simplement, sans outil.")
+    parts.append("Règle absolue : n'affirme jamais avoir ouvert, lancé, cherché, créé ou modifié quoi que ce soit "
+                 "sans avoir réellement appelé l'outil correspondant et reçu son résultat. Si tu ne peux pas le faire, "
+                 "dis-le franchement.")
     return "\n\n".join(parts)
 
 
@@ -1514,7 +1553,7 @@ def run_chat(h, body: dict) -> None:
         h.emit({"t": "error", "d": "Message vide."})
         return
 
-    tools = tool_schemas((agent or {}).get("outils") or [])
+    tools = tool_schemas((agent or {}).get("outils") or [] if agent else FREE_TOOLS)
     system = build_system(agent, s, ctx)
     parse_retry = False
     rnd = 0
@@ -2553,18 +2592,105 @@ def apps_index() -> dict:
                         continue
                     full = os.path.join(dirpath, fn)
                     aid = os.path.relpath(full, d).replace(os.sep, "-")
-                    if aid in seen:
+                    e = read_ini_section(full)
+                    if aid in seen:  # même appli plus bas dans la liste (ex. celle du paquet, masquée)
+                        if aid in by_id and e and app_visible(e):
+                            by_id[aid].setdefault("alts", []).append(app_info(aid, full, e))
                         continue
                     seen.add(aid)
-                    e = read_ini_section(full)
                     if e and app_visible(e):
                         by_id[aid] = app_info(aid, full, e)
+        for aid, a in list(by_id.items()):
+            # un lanceur « terminal » qui masque l'appli du paquet (vieux script…) : on affiche et lance l'appli
+            alt = next((x for x in a.get("alts", []) if not x["terminal"]), None) if a["terminal"] else None
+            if alt:
+                rest = [x for x in a["alts"] if x is not alt]
+                by_id[aid] = {**alt, "alts": [{k: v for k, v in a.items() if k != "alts"}] + rest}
         _APPS.update(sig=sig, by_id=by_id, list=sorted(by_id.values(), key=lambda a: a["nom"].casefold()))
         return _APPS
 
 
 def _exec_cmd(a: dict) -> str:
     return os.path.basename((a.get("exec") or "").split(" ", 1)[0].strip('"'))
+
+
+def launch_entry(a: dict) -> dict:
+    """Entrée .desktop à lancer. Un lanceur qui s'ouvre dans un terminal (vieux script, copie modifiée…)
+    et qui masque l'appli installée par son paquet : on lance plutôt l'appli, sans terminal."""
+    if a.get("terminal"):
+        for alt in a.get("alts", []):
+            if not alt["terminal"]:
+                return alt
+    return a
+
+
+def launch_app(a: dict, files: list[str] | None = None) -> None:
+    launch_desktop(launch_entry(a)["fichier"], files)
+
+
+_ART_RE = re.compile(r"^(l['’]\s*appli(cation)?|l['’]\s*app|le\s+logiciel|le\s+programme|la|le|les|l['’]|mon|ma|mes)\s*",
+                     re.I)
+APP_SYNONYMES = {"navigateur": "WebBrowser", "internet": "WebBrowser", "web": "WebBrowser",
+                 "terminal": "TerminalEmulator", "console": "TerminalEmulator",
+                 "fichiers": "FileManager", "explorateur": "FileManager", "gestionnaire de fichiers": "FileManager",
+                 "mail": "Email", "courriel": "Email", "messagerie": "Email"}
+
+
+def _fold(t: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFD", str(t or "").lower())
+    return "".join(c for c in t if unicodedata.category(c) != "Mn").strip()
+
+
+def match_app(query: str) -> tuple[dict | None, list[str]]:
+    """Trouve l'appli la plus proche d'un nom dit par l'utilisateur (« grimoire », « le navigateur »…)."""
+    q = _fold(query).strip(" .!?\"'«»")
+    for _ in range(2):
+        q = _ART_RE.sub("", q).strip()
+    if not q:
+        return None, []
+    apps = apps_index()["list"]
+    scored = []
+    for a in apps:
+        name = _fold(a["nom"])
+        stem = _fold(a["id"][:-8].rsplit(".", 1)[-1])
+        cmd = _fold(_exec_cmd(a))
+        if q in (name, stem, cmd, _fold(a["generique"])):
+            sc = 0
+        elif name.startswith(q) or stem.startswith(q):
+            sc = 1
+        elif any(w.startswith(q) for w in name.split()):
+            sc = 2
+        elif q in name or q in stem:
+            sc = 3
+        elif q in _fold(a["generique"]) or any(_fold(m).startswith(q) for m in a["mots"]):
+            sc = 4
+        else:
+            continue
+        scored.append((sc, bool(a.get("terminal")), len(name), a))
+    if not scored and q in APP_SYNONYMES:
+        cat = APP_SYNONYMES[q]
+        scored = [(5, bool(a.get("terminal")), 0, a) for a in apps if cat in a["categories"]]
+    if not scored:
+        words = [w for w in q.split() if len(w) > 2]
+        proches = [a["nom"] for a in apps if any(w in _fold(a["nom"]) for w in words)][:5]
+        return None, proches
+    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+    return scored[0][3], [x[3]["nom"] for x in scored[1:5]]
+
+
+def open_path(path: str) -> str:
+    """Ouvre un fichier (Grimoire pour Word/Excel) ou un dossier (Archiviste ou Nemo selon le réglage du bureau)."""
+    if os.path.isdir(path):
+        if bureau_state().get("dossiers") != "systeme" and UI_HOOK is not None:
+            UI_HOOK("ouvrir", {"vue": "files", "chemin": path})
+            return "Archiviste"
+    elif ext_of(path) in ("docx", "xlsx", "xlsm", "xls", "ods") and open_in_grimoire(path):
+        return "Grimoire"
+    opener = shutil.which("xdg-open")
+    if not opener or not _launch([opener, path]):
+        raise ApiError("Ouverture impossible : xdg-open est introuvable.")
+    return "application par défaut"
 
 
 def find_app(*names: str) -> str | None:
@@ -3807,7 +3933,7 @@ def r_apps_launch(h, q, b):
         a = apps_index()["by_id"].get(str(b["id"]))
         if not a:
             raise ApiError("Cette application n'est plus installée.", 404)
-        launch_desktop(a["fichier"], files)
+        launch_app(a, files)
         return {"ok": True, "nom": a["nom"]}
     path = os.path.realpath(str(b.get("fichier") or ""))
     if not path.endswith(".desktop") or not os.path.isfile(path):

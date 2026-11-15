@@ -71,8 +71,15 @@ class H(BaseHTTPRequestHandler):
                 out.append({"n": int(n), "dossier": folder, "raison": f"extension {ext}"})
             return self.j({"message": {"role": "assistant", "content": json.dumps({"classement": out})}, "done": True})
         chunks = []
-        if p.get("tools"):
-            names = [t["function"]["name"] for t in p["tools"]]
+        names = [t["function"]["name"] for t in p.get("tools") or []]
+        libre = "ouvrir_application" in names and "creer_dossier" not in names
+        if libre and last["role"] == "user" and last.get("content", "").lower().startswith("ouvre "):
+            nom = last["content"].split(" ", 1)[1]
+            tc = [{"function": {"name": "ouvrir_application", "arguments": {"nom": nom}}}]
+            chunks = [{"message": {"role": "assistant", "content": "", "tool_calls": tc}, "done": False}]
+        elif libre and last["role"] == "tool":
+            chunks = [{"message": {"role": "assistant", "content": "C'est ouvert."}, "done": False}]
+        elif p.get("tools") and not libre:
             if last["role"] == "user":
                 tc = [{"function": {"name": "lister_dossier", "arguments": {}}}]
                 chunks = [{"message": {"role": "assistant", "content": "Je regarde le dossier.", "tool_calls": tc}, "done": False}]

@@ -145,6 +145,14 @@ call("POST", "/api/conversations/" + c["id"], {"modele": "inconnu:1b"})
 ev = stream("/api/chat", {"conv_id": c["id"], "message": "x"})
 check(ev[-1]["t"] == "error" and "ollama pull" in ev[-1]["d"], "modèle absent → conseil ollama pull")
 
+print("— ouvrir une appli depuis la discussion libre")
+c2 = call("POST", "/api/conversations", {})
+ev = stream("/api/chat", {"conv_id": c2["id"], "message": "ouvre appli-inexistante-xyz"})
+res = [e for e in ev if e["t"] == "tool_result"]
+check(res and res[0]["name"] == "ouvrir_application" and not res[0]["ok"] and ev[-1]["t"] == "done",
+      "outil ouvrir_application appelé, appli absente signalée")
+check(any(e["t"] == "content" for e in ev), "le modèle répond après l'outil")
+
 print("— agent avec outils et validation")
 c = call("POST", "/api/conversations", {"agent_id": a["id"]})
 ev = stream("/api/chat", {"conv_id": c["id"], "message": "Range ce dossier"})
