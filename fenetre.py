@@ -32,6 +32,8 @@ try:
     except ValueError:
         gi.require_version("WebKit2", "4.0")
     from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
 except (ImportError, ValueError) as err:
     sys.stderr.write(
         f"Archiviste : il manque le moteur d'affichage ({err}).\n"
@@ -136,6 +138,42 @@ def primary_monitor(at_pointer: bool = False):
             if mon is not None:
                 return mon
     return disp.get_primary_monitor() or disp.get_monitor(0)
+
+
+def icon_lookup(name: str, size: int) -> dict:
+    """Cherche une icône comme Cinnamon (thème actuel, héritages, liens, tailles) : appelé depuis le serveur,
+    exécuté dans la boucle GTK. Renvoie {"path": fichier png/svg} ou {"png": octets}."""
+    done, out = threading.Event(), {}
+
+    def png_of(pb):
+        ok, data = pb.save_to_bufferv("png", [], [])
+        if ok:
+            out["png"] = data
+
+    def work():
+        try:
+            if os.path.isabs(name):
+                if os.path.isfile(name):
+                    png_of(GdkPixbuf.Pixbuf.new_from_file_at_size(name, size, size))
+            else:
+                theme = Gtk.IconTheme.get_default()
+                info = theme.lookup_icon(name, size, Gtk.IconLookupFlags(0))
+                if info is None and name.lower().endswith((".png", ".svg", ".xpm")):
+                    info = theme.lookup_icon(name[:-4], size, Gtk.IconLookupFlags(0))
+                if info is not None:
+                    fn = info.get_filename()
+                    if fn and fn.lower().endswith((".png", ".svg")) and os.access(fn, os.R_OK):
+                        out["path"] = fn
+                    else:
+                        png_of(info.load_icon())
+        except (GLib.Error, TypeError, ValueError):
+            pass
+        done.set()
+        return False
+
+    GLib.idle_add(work)
+    done.wait(3)
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -468,6 +506,7 @@ class Application(Gtk.Application):
         self.base = f"http://127.0.0.1:{srv.server_address[1]}/"
         A.RELAUNCH_HOOK = lambda: GLib.idle_add(self.relaunch)
         A.UI_HOOK = lambda action, data=None: GLib.idle_add(self.on_ui, action, data or {})
+        A.ICON_HOOK = icon_lookup
         cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "archiviste"
         wdm = WebKit2.WebsiteDataManager(base_data_directory=str(A.DATA_DIR / "webkit"),
                                          base_cache_directory=str(cache / "webkit"))

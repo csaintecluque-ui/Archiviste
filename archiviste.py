@@ -37,7 +37,7 @@ from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -1158,7 +1158,12 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
             r = trash(a.get("chemin"), roots=roots, base=base)
             return {"corbeille": _short(r["path"], base)}, f"Mis à la corbeille : {_short(r['path'], base)}", True
         if name == "ouvrir_application":
-            app, proches = match_app(str(a.get("nom") or ""))
+            sc, app, proches = match_app_scored(str(a.get("nom") or ""))
+            folder = match_special_dir(str(a.get("nom") or ""))
+            if folder and (app is None or sc >= 2):  # « téléchargements » est un dossier, pas l'appli Transmission
+                how = open_path(folder)
+                return ({"dossier": _short(folder, base), "ouvert": True, "info": "C'est un dossier : ouvert."},
+                        f"Dossier ouvert : {_short(folder, base)} ({how})", True)
             if not app:
                 msg = f"Aucune application installée ne s'appelle « {a.get('nom', '')} »."
                 return ({"erreur": msg, "applications_proches": proches},
@@ -1166,7 +1171,13 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
             launch_app(app)
             return {"application": app["nom"], "lancee": True}, f"Lancée : {app['nom']}", True
         if name == "ouvrir":
-            path = safe_path(a.get("chemin"), base=base, roots=roots, must_exist=True)
+            try:
+                path = safe_path(a.get("chemin"), base=base, roots=roots, must_exist=True)
+            except ApiError:
+                path = match_special_dir(str(a.get("chemin") or ""))
+                if not path:
+                    raise
+                path = safe_path(path, roots=roots, must_exist=True)
             how = open_path(path)
             return {"ouvert": _short(path, base), "avec": how}, f"Ouvert : {_short(path, base)} ({how})", True
         raise ApiError(f"Outil inconnu : {name}")
@@ -1398,7 +1409,8 @@ def build_system(agent: dict | None, s: dict, ctx: dict) -> str:
     elif not agent:
         parts.append(
             f"Tu peux ouvrir une application (outil ouvrir_application), ouvrir un fichier ou un dossier (outil "
-            f"ouvrir) et chercher des fichiers (outil chercher_fichiers) sur le PC de {prenom}. Quand il te demande "
+            f"ouvrir, par exemple « Téléchargements » ou « Documents ») et chercher des fichiers (outil "
+            f"chercher_fichiers) sur le PC de {prenom}. Un dossier s'ouvre avec ouvrir, jamais avec ouvrir_application. Quand il te demande "
             "d'ouvrir ou de lancer quelque chose, appelle l'outil au lieu de répondre en texte. Pour le reste, "
             "réponds simplement, sans outil.")
     parts.append("Règle absolue : n'affirme jamais avoir ouvert, lancé, cherché, créé ou modifié quoi que ce soit "
@@ -2828,22 +2840,61 @@ def _score_apps(q: str, apps: list[dict]) -> list:
     return scored
 
 
-def match_app(query: str) -> tuple[dict | None, list[str]]:
-    """Trouve l'appli la plus proche d'un nom dit par l'utilisateur, même mal orthographié
-    (« grimoire », « le terminale », « firefoks », « libre office »…)."""
+def _clean_query(query: str) -> str:
     q = _fold(query).strip(" .!?\"'«»")
     for _ in range(3):
         q = _ART_RE.sub("", q).strip()
+    return q
+
+
+def match_app_scored(query: str) -> tuple[float | None, dict | None, list[str]]:
+    q = _clean_query(query)
     if not q:
-        return None, []
+        return None, None, []
     idx = apps_index()
     found = _score_apps(q, idx["list"]) or _score_apps(q, idx["ailleurs"])
     if not found:
         qc = _compact(q)
         near = sorted(idx["list"], key=lambda a: _osa(qc, _compact(_fold(a["nom"]))[:len(qc) + 2]))[:4]
-        return None, [a["nom"] for a in near]
+        return None, None, [a["nom"] for a in near]
     found.sort(key=lambda x: (x[0], x[1], x[2]))
-    return found[0][3], [x[3]["nom"] for x in found[1:5]]
+    return found[0][0], found[0][3], [x[3]["nom"] for x in found[1:5]]
+
+
+def match_app(query: str) -> tuple[dict | None, list[str]]:
+    """Trouve l'appli la plus proche d'un nom dit par l'utilisateur, même mal orthographié
+    (« grimoire », « le terminale », « firefoks », « libre office »…)."""
+    _, app, proches = match_app_scored(query)
+    return app, proches
+
+
+def special_dirs() -> list[tuple[tuple, str]]:
+    return [
+        (("bureau", "desktop"), desktop_dir()),
+        (("telechargements", "telechargement", "downloads"), downloads_dir()),
+        (("documents", "document", "docs"), user_dir("DOCUMENTS", "Documents")),
+        (("images", "image", "photos", "pictures"), user_dir("PICTURES", "Images", "Pictures")),
+        (("musique", "musiques", "music"), user_dir("MUSIC", "Musique", "Music")),
+        (("videos", "video", "films"), user_dir("VIDEOS", "Vidéos", "Videos")),
+        (("dossier personnel", "dossierpersonnel", "maison", "home", "perso"), os.path.realpath(HOME)),
+    ]
+
+
+def match_special_dir(query: str) -> str | None:
+    """« téléchargements », « mes documents », « le dossier telechargement » → le dossier spécial correspondant."""
+    q = re.sub(r"^(?:dossiers?|repertoires?)\s+(?:des?\s+|du\s+)?", "", _clean_query(query)).strip()
+    q = _clean_query(q)
+    qc = _compact(q)
+    if len(qc) < 3:
+        return None
+    for keys, path in special_dirs():
+        if not os.path.isdir(path):
+            continue
+        for k in keys:
+            kc = _compact(k)
+            if qc == kc or (len(qc) >= 4 and _osa(qc, kc) <= _tolerance(len(kc))):
+                return path
+    return None
 
 
 def open_path(path: str) -> str:
@@ -3086,7 +3137,8 @@ def find_icon(name: str, size: int = 48) -> str | None:
     stem = name[:-4] if name.lower().endswith((".png", ".svg", ".xpm")) else name
     want = max(16, min(512, size)) * 2  # net sur écran HiDPI ou avec zoom
     for theme in theme_chain(icon_theme_name()):
-        cands = theme_index(theme).get(stem)
+        # les thèmes façon macOS contiennent beaucoup de liens : on ignore ceux qui sont cassés
+        cands = [c for c in theme_index(theme).get(stem) or [] if os.access(c[1], os.R_OK)]
         if not cands:
             continue
         svg = [p for s, p in cands if s == 10_000]
@@ -3100,6 +3152,33 @@ def find_icon(name: str, size: int = 48) -> str | None:
             if os.path.isfile(p):
                 return p
     return None
+
+
+ICON_HOOK = None  # renseigné par fenetre.py : même recherche d'icône que Cinnamon (Gtk.IconTheme)
+_ICON_CACHE: dict = {}
+
+
+def resolve_icon(name: str, size: int) -> tuple[str | None, bytes | None]:
+    """Fichier d'icône (png/svg) ou image PNG prête à l'emploi pour un nom d'icône d'appli."""
+    name = (name or "").strip()
+    size = max(16, min(512, size))
+    key = (name, size)
+    hit = _ICON_CACHE.get(key)
+    if hit and time.time() - hit[2] < 600:
+        return hit[0], hit[1]
+    path, png = None, None
+    if name and "\x00" not in name:
+        if os.path.isabs(name):
+            path = find_icon(name, size)
+        if not path and ICON_HOOK is not None:
+            r = ICON_HOOK(name, size * 2) or {}
+            path, png = r.get("path"), r.get("png")
+        if not path and not png:
+            path = find_icon(name, size)
+    if len(_ICON_CACHE) > 600:
+        _ICON_CACHE.clear()
+    _ICON_CACHE[key] = (path, png, time.time())
+    return path, png
 
 
 # ── fond d'écran ──
@@ -3457,6 +3536,8 @@ def bureau_public() -> dict:
     st = bureau_state()
     st.pop("raccourcis", None)
     st.update(dossier=desktop_dir(), telechargements=downloads_dir(), documents=user_dir("DOCUMENTS", "Documents"),
+              images=user_dir("PICTURES", "Images", "Pictures"), musique=user_dir("MUSIC", "Musique", "Music"),
+              videos=user_dir("VIDEOS", "Vidéos", "Videos"),
               home=str(HOME), touche_label=accel_label(st.get("touche")), demarrage=AUTOSTART.exists(),
               fenetre=UI_HOOK is not None, cinnamon="CINNAMON" in ":".join(CUR_DESKTOPS).upper())
     return st
@@ -4126,7 +4207,15 @@ def r_icon(h, q, b):
         size = int(q1(q, "s", "48"))
     except ValueError:
         size = 48
-    p = find_icon(q1(q, "n"), size)
+    p, png = resolve_icon(q1(q, "n"), size)
+    if png:
+        h.send_response(200)
+        h.send_header("Content-Type", "image/png")
+        h.send_header("Content-Length", str(len(png)))
+        h.send_header("Cache-Control", "private, max-age=86400")
+        h.end_headers()
+        h.wfile.write(png)
+        return
     if not p:
         raise ApiError("Icône introuvable.", 404)
     h.send_file(p, cache=86400)

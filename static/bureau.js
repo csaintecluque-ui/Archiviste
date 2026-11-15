@@ -430,11 +430,13 @@ function bindDesk() {
     if (!D.sel.has(it.key)) selectOnly(it);
     const paths = selItems().filter((x) => x.type === 'entry' || x.type === 'home').map((x) => x.path);
     if (!paths.length) return ev.preventDefault();
-    ev.dataTransfer.setData('application/x-archiviste-paths', JSON.stringify(paths));
+    DRAG_PATHS = paths;
+    try { ev.dataTransfer.setData('application/x-archiviste-paths', JSON.stringify(paths)); } catch { /* */ }
     ev.dataTransfer.setData('text/uri-list', paths.map(fileUri).join('\r\n'));
     ev.dataTransfer.setData('text/plain', paths.join('\n'));
     ev.dataTransfer.effectAllowed = 'copyMove';
   });
+  icons.addEventListener('dragend', () => { setTimeout(() => { DRAG_PATHS = null; }, 300); });
   const target = (ev) => {
     const el = ev.target.closest('.dicon');
     if (!el) return { el: null, dir: D.b.dossier };
@@ -445,12 +447,12 @@ function bindDesk() {
     return { el: null, dir: D.b.dossier };
   };
   let lastOver = null;
+  desk.addEventListener('dragenter', (ev) => { ev.preventDefault(); ev.dataTransfer.dropEffect = ev.ctrlKey ? 'copy' : 'move'; });
   desk.addEventListener('dragover', (ev) => {
     ev.preventDefault();
     const t = target(ev);
     if (lastOver !== t.el) { lastOver?.classList.remove('drop'); t.el?.classList.add('drop'); lastOver = t.el; }
-    const internal = ev.dataTransfer.types.includes('application/x-archiviste-paths');
-    desk.classList.toggle('drop-on', !t.el && !internal);
+    desk.classList.toggle('drop-on', !t.el && !DRAG_PATHS);
     ev.dataTransfer.dropEffect = ev.ctrlKey ? 'copy' : 'move';
   });
   desk.addEventListener('dragleave', (ev) => { if (ev.target === desk) { desk.classList.remove('drop-on'); lastOver?.classList.remove('drop'); lastOver = null; } });
@@ -459,10 +461,10 @@ function bindDesk() {
     desk.classList.remove('drop-on'); lastOver?.classList.remove('drop'); lastOver = null;
     const t = target(ev);
     const dt = ev.dataTransfer;
-    const internal = dt.getData('application/x-archiviste-paths');
-    const paths = internal ? JSON.parse(internal) : pathsFromUris(dt.getData('text/uri-list'));
+    const paths = dropPaths(dt);
+    DRAG_PATHS = null;
     if (t.trash) return paths.length && trashPaths(paths);
-    if (internal && t.dir === D.b.dossier && paths.every((p) => dirname(p) === D.b.dossier)) return;  // déjà sur le bureau
+    if (t.dir === D.b.dossier && paths.length && paths.every((p) => dirname(p) === D.b.dossier)) return;  // déjà sur le bureau
     if (paths.length) {
       const r = await movePaths(paths, t.dir, ev.ctrlKey);
       const refused = new Set((r?.erreurs || []).map((x) => basename(x.path)));
@@ -474,11 +476,24 @@ function bindDesk() {
   });
 }
 // un fichier lâché ailleurs que sur une zone prévue ne doit pas ouvrir la page du fichier
-document.addEventListener('dragover', (ev) => ev.preventDefault());
+// (WebKitGTK n'accepte un dépôt que si dropEffect est précisé à chaque survol)
+document.addEventListener('dragover', (ev) => { if (!ev.defaultPrevented) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'none'; } });
 document.addEventListener('drop', (ev) => ev.preventDefault());
 function pathsFromUris(list) {
   return String(list || '').split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith('file://'))
     .map((u) => { try { return decodeURIComponent(new URL(u).pathname); } catch { return null; } }).filter(Boolean);
+}
+// Chemins glissés : format interne, liste d'URI (Nemo) ou texte brut (WebKitGTK ne garde pas toujours le format interne)
+let DRAG_PATHS = null;  // glisser-déposer à l'intérieur de la page : on garde les chemins ici, sans dépendre du presse-papiers
+function dropPaths(dt) {
+  if (DRAG_PATHS && DRAG_PATHS.length) return DRAG_PATHS.slice();
+  try { const j = dt.getData('application/x-archiviste-paths'); if (j) return JSON.parse(j); } catch { /* */ }
+  let p = pathsFromUris(dt.getData('text/uri-list'));
+  if (!p.length) {
+    p = String(dt.getData('text/plain') || '').split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith('/') || l.startsWith('file://'))
+      .map((l) => (l.startsWith('file://') ? pathsFromUris(l)[0] : l)).filter(Boolean);
+  }
+  return p;
 }
 
 // ───────────────────────── Lanceur : une seule saisie pour l'IA, les applis et les fichiers ─────────────────────────
@@ -573,17 +588,22 @@ function matchApps(q) {
   if (!res.length && SYNONYMES[n]) res = D.apps.filter((a) => a.categories.includes(SYNONYMES[n])).map((a) => [9, a]);
   return res.sort((x, y) => x[0] - y[0] || x[1].nom.localeCompare(y[1].nom)).slice(0, 5).map(([s, a]) => ({ s, a }));
 }
+// Dossiers spéciaux : « ouvre téléchargements » ouvre le dossier, pas l'appli Transmission (« client de téléchargement »)
 function specialDirs(q) {
-  const n = norm(q);
-  if (!D.b || n.length < 3) return [];
+  const n = norm(q).replace(/^(?:dossiers?|repertoires?)\s+(?:des?\s+|du\s+)?/, '').replace(/^(?:mes|mon|ma|les|le|la)\s+/, '').trim();
+  const nc = n.replace(/[^a-z0-9]/g, '');
+  if (!D.b || nc.length < 3) return [];
   const list = [
     [['bureau', 'desktop'], D.b.dossier, 'Bureau'],
     [['telechargements', 'telechargement', 'downloads'], D.b.telechargements, 'Téléchargements'],
-    [['documents', 'docs'], D.b.documents, 'Documents'],
-    [['dossier personnel', 'home', 'maison', 'perso'], D.b.home, 'Dossier personnel'],
+    [['documents', 'document', 'docs'], D.b.documents, 'Documents'],
+    [['images', 'image', 'photos', 'pictures'], D.b.images, 'Images'],
+    [['musique', 'musiques', 'music'], D.b.musique, 'Musique'],
+    [['videos', 'video', 'films'], D.b.videos, 'Vidéos'],
+    [['dossierpersonnel', 'maison', 'home', 'perso'], D.b.home, 'Dossier personnel'],
     [['corbeille', 'poubelle'], '#corbeille', 'Corbeille'],
   ];
-  return list.filter(([keys]) => keys.some((k) => k.startsWith(n) || n.startsWith(k) || osa(n, k.slice(0, n.length + 1)) <= tolerance(n.length)))
+  return list.filter(([keys, path]) => path && keys.some((k) => k === nc || k.startsWith(nc) || (nc.length >= 4 && osa(nc, k) <= tolerance(k.length))))
     .map(([, path, name]) => ({ name, path, dir: true, kind: 'folder', ext: '', special: true }));
 }
 function makeLauncher({ input, box, onAsk, always = false }) {
@@ -616,11 +636,18 @@ function makeLauncher({ input, box, onAsk, always = false }) {
     if (!L.q) return hide();
     const apps = matchApps(L.target);
     const dirs = specialDirs(L.target);
-    const files = [...dirs, ...(L.files || []).filter((f) => !dirs.some((d) => d.path === f.path))].slice(0, 7);
-    const acts = [...apps.map(({ a }) => ({ kind: 'app', a })), ...files.map((e) => ({ kind: 'file', e }))];
+    const folderHint = /\b(dossiers?|r[ée]pertoires?)\b/i.test(L.q);
+    let found = (L.files || []).filter((f) => !dirs.some((d) => d.path === f.path)).slice(0, 7);
+    if (folderHint) found = [...found.filter((f) => f.dir), ...found.filter((f) => !f.dir)];
+    const appActs = folderHint ? [] : apps.map(({ a }) => ({ kind: 'app', a }));
+    const dirActs = dirs.map((e) => ({ kind: 'file', e }));
+    const fileActs = found.map((e) => ({ kind: 'file', e }));
+    // un dossier connu passe avant une appli qui lui ressemble seulement (Transmission, « Numériseur de documents »…)
+    const dirFirst = dirActs.length && (folderHint || !apps.length || apps[0].s >= 2);
+    const acts = dirFirst ? [...dirActs, ...appActs, ...fileActs] : [...appActs, ...dirActs, ...fileActs];
     const ask = { kind: 'ask' };
     const oneApp = apps.length && apps[0].s <= 1 && L.target.split(/\s+/).length <= 2;
-    const strong = L.intent ? (L.weak ? apps.length > 0 && apps[0].s <= 7 : acts.length > 0) : oneApp;
+    const strong = L.intent ? (L.weak ? (dirFirst || (apps.length > 0 && apps[0].s <= 7)) : acts.length > 0) : oneApp;
     L.items = strong ? [acts[0], ask, ...acts.slice(1)] : [ask, ...acts];
     L.idx = Math.min(L.idx, L.items.length - 1);
     if (!always && !acts.length && !(L.intent && L.loading)) return hide();
@@ -741,12 +768,14 @@ function buildVolet() {
   $('#voletTab').addEventListener('click', () => setVolet(true));
   bindShortcutDnD();
   const conv = $('#conv');
-  conv.addEventListener('dragover', (ev) => { ev.preventDefault(); conv.classList.add('drop-on'); });
+  const convOver = (ev) => { ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy'; conv.classList.add('drop-on'); };
+  conv.addEventListener('dragenter', convOver);
+  conv.addEventListener('dragover', convOver);
   conv.addEventListener('dragleave', (ev) => { if (!conv.contains(ev.relatedTarget)) conv.classList.remove('drop-on'); });
   conv.addEventListener('drop', (ev) => {
     ev.preventDefault(); conv.classList.remove('drop-on');
-    const internal = ev.dataTransfer.getData('application/x-archiviste-paths');
-    const paths = internal ? JSON.parse(internal) : pathsFromUris(ev.dataTransfer.getData('text/uri-list'));
+    const paths = dropPaths(ev.dataTransfer);
+    DRAG_PATHS = null;
     if (paths.length) attachToChat(paths);
   });
 }
@@ -931,12 +960,14 @@ function bindShortcutDnD() {
     const t = ev.target.closest('[data-sc]');
     if (!t) return;
     dragId = t.dataset.sc;
-    ev.dataTransfer.setData('application/x-archiviste-sc', dragId);
+    ev.dataTransfer.setData('text/plain', t.querySelector('.lbl')?.textContent || 'raccourci');
     ev.dataTransfer.effectAllowed = 'move';
   });
   sc.addEventListener('dragend', () => { dragId = null; $$('.drag-over', sc).forEach((x) => x.classList.remove('drag-over')); sc.classList.remove('drop-on'); });
+  sc.addEventListener('dragenter', (ev) => { ev.preventDefault(); ev.dataTransfer.dropEffect = dragId ? 'move' : 'copy'; });
   sc.addEventListener('dragover', (ev) => {
     ev.preventDefault();
+    ev.dataTransfer.dropEffect = dragId ? 'move' : 'copy';
     const t = ev.target.closest('[data-sc]');
     $$('.drag-over', sc).forEach((x) => x.classList.toggle('drag-over', x === t));
     if (t && dragId) t.classList.add('drag-over');
@@ -955,8 +986,9 @@ function bindShortcutDnD() {
       dragId = null;
       return reorderShortcuts(ids);
     }
-    const internal = ev.dataTransfer.getData('application/x-archiviste-paths');
-    const paths = internal ? JSON.parse(internal) : pathsFromUris(ev.dataTransfer.getData('text/uri-list'));
+    const paths = dropPaths(ev.dataTransfer);
+    DRAG_PATHS = null;
+    if (!paths.length) return toast('Rien à épingler : fais plutôt un clic droit sur l\'élément › Épingler aux raccourcis.');
     for (const p of paths.slice(0, 8)) {
       const it = D.items.find((x) => x.path === p);
       const e = it?.e;

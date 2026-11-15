@@ -1,5 +1,10 @@
 # Nouveautés
 
+## 1.4.4
+- **Les dossiers avant les applis** : « ouvre téléchargements », « ouvre mes documents », « ouvre le dossier images » ouvrent le dossier, et non plus Transmission ou le Numériseur de documents. Même règle pour l'IA.
+- **Glisser sur les raccourcis** : glisser une icône du bureau (un lanceur comme Claude, un dossier, un fichier) sur les raccourcis du volet l'épingle enfin ; glisser sur la discussion la joint au message.
+- **Icônes des applis** : Archiviste cherche les icônes exactement comme Cinnamon (thème, héritages, liens), donc celles de Firefox, de Claude, etc. s'affichent.
+
 ## 1.4.3
 - **Le Terminal est trouvé** : les applis marquées pour GNOME (dont le Terminal de Mint) sont maintenant reconnues, comme dans le menu de Cinnamon. Elles réapparaissent aussi dans « + Ajouter ».
 - **Orthographe approchée** : « terminale », « grimio », « firefoks », « libre office », « ouvrr le terminal »… trouvent quand même la bonne appli, dans la discussion comme pour l'IA.
