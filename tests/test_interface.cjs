@@ -213,12 +213,15 @@ async function main() {
     { id: 'r_t1', type: 'app', cible: 'firefox.desktop', nom: '', titre: 'Firefox', icone: 'firefox', ok: true, description: '' },
     { id: 'r_t2', type: 'app', cible: 'org.gnome.Terminal.desktop', nom: '', titre: 'Terminal', icone: 'terminal', ok: true, description: '' },
   ];
+  shortcuts.push({ id: 'r_t3', type: 'dossier', cible: `${HOME}/Documents`, nom: '', titre: 'Documents', icone: '', ok: true, description: '' });
   const windows = { dispo: true, sig: 's1', groupes: [
-    { cle: 'app:firefox.desktop', app: 'firefox.desktop', nom: 'Firefox', icone: 'firefox', n: 2, reduit: false, devant: true, titres: ['Accueil', 'Autre onglet'] },
-    { cle: 'app:vlc.desktop', app: 'vlc.desktop', nom: 'VLC', icone: 'vlc', n: 1, reduit: true, devant: false, titres: ['Film'] },
+    { cle: 'app:firefox.desktop', app: 'firefox.desktop', nom: 'Firefox', icone: 'firefox', n: 2, reduit: false, devant: true, titres: ['Accueil', 'Autre onglet'],
+      fenetres: [{ id: 11, titre: 'Accueil', reduit: false }, { id: 12, titre: 'Autre onglet', reduit: true }] },
+    { cle: 'app:vlc.desktop', app: 'vlc.desktop', nom: 'VLC', icone: 'vlc', n: 1, reduit: true, devant: false, titres: ['Film'], fenetres: [{ id: 21, titre: 'Film', reduit: true }] },
   ] };
   const acts = [];
   const starts = [];
+  const moves = [];
   let open = true;
   await page.route('**/api/raccourcis', (r) => r.fulfill(json(shortcuts)));
   await page.route('**/api/fenetres', (r) => r.fulfill(json(windows)));
@@ -232,26 +235,125 @@ async function main() {
   check(!/\brun\b/.test(await cls(tile('r_t2'))) && await page.locator(`${tile('r_t2')} .run-dot`).count() === 0, 'appli fermée : pas de repère');
   check(/\bmini\b/.test(await cls('#sc [data-run="app:vlc.desktop"]')) && await page.locator('#sc .sep').count() === 1, 'appli ouverte sans raccourci : ajoutée à la colonne, marquée « réduite »');
   await page.click(tile('r_t1'));
+  await page.waitForSelector('.menu', { timeout: 3000 }).catch(() => {});
+  const chooser = await page.locator('.menu').count() ? await page.innerText('.menu') : '';
+  const box = await page.locator('.menu').boundingBox().catch(() => null);
+  const tbox = await page.locator(tile('r_t1')).boundingBox();
+  check(chooser.includes('Accueil') && chooser.includes('Autre onglet') && chooser.includes('Tout réduire') && chooser.includes('Nouvelle fenêtre') && acts.length === 0,
+    'appli avec plusieurs fenêtres : le clic propose de choisir laquelle');
+  check(box && box.x + box.width <= tbox.x, 'le choix s\'ouvre à côté du raccourci, vers le bureau');
+  await page.click('.menu button:has-text("Autre onglet")');
   await sleep(250);
-  check(acts.length === 1 && acts[0].cle === 'app:firefox.desktop' && acts[0].action === 'basculer' && starts.length === 0, 'clic sur une appli ouverte : sa fenêtre est ramenée ou réduite, rien n\'est relancé');
+  check(acts.length === 1 && acts[0].cle === 'app:firefox.desktop' && acts[0].action === 'afficher' && acts[0].fenetre === 12 && starts.length === 0, 'la fenêtre choisie est ramenée devant, rien n\'est relancé');
   await page.click(tile('r_t2'));
   await sleep(250);
   check(starts.length === 1 && starts[0].id === 'org.gnome.Terminal.desktop' && acts.length === 1, 'clic sur une appli fermée : elle est lancée');
   await page.click('#sc [data-run="app:vlc.desktop"]');
   await sleep(250);
-  check(acts.length === 2 && acts[1].cle === 'app:vlc.desktop', 'clic sur une appli sans raccourci : sa fenêtre revient');
-  open = false;
-  await page.click(tile('r_t1'));
-  await sleep(350);
-  check(acts.length === 3 && starts.length === 2 && starts[1].id === 'firefox.desktop', 'appli fermée entre-temps : le clic la relance');
+  check(acts.length === 2 && acts[1].cle === 'app:vlc.desktop' && acts[1].action === 'basculer', 'une seule fenêtre : le clic la ramène ou la réduit directement');
   await page.click(tile('r_t1'), { button: 'right' });
   const menu = await page.innerText('.menu');
   check(menu.includes('Réduire') && menu.includes('Nouvelle fenêtre') && menu.includes('Fermer les 2 fenêtres'), 'clic droit : réduire, nouvelle fenêtre, fermer');
   await page.keyboard.press('Escape');
+
+  // lâcher un fichier sur un raccourci : ouvert avec l'appli, rangé dans le dossier, épinglé ailleurs
+  const dropOn = (sel, paths, type = 'drop') => page.evaluate(([q, list, t]) => {
+    const dt = new DataTransfer();
+    dt.setData('application/x-archiviste-paths', JSON.stringify(list));
+    const el = document.querySelector(q);
+    const r = el.getBoundingClientRect();
+    el.dispatchEvent(new DragEvent(t, { bubbles: true, cancelable: true, dataTransfer: dt, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 }));
+  }, [sel, paths, type]);
+  await page.route('**/api/fs/move', (r) => { moves.push(JSON.parse(r.request().postData())); r.fulfill(json({ ok: [], erreurs: [] })); });
+  const dropped = `${DESK}/Vrai dossier`;
+  await dropOn(tile('r_t1'), [dropped], 'dragover');
+  check(/drag-over/.test(await cls(tile('r_t1'))) && !/drop-on/.test(await cls('#rail')), 'fichier au-dessus d\'une appli : son raccourci s\'allume');
+  await dropOn(tile('r_t1'), [dropped]);
+  await sleep(250);
+  check(starts.length === 2 && starts[1].id === 'firefox.desktop' && starts[1].fichiers[0] === dropped && !starts[1].ramener, 'fichier lâché sur une appli : ouvert avec elle');
+  await dropOn('#sc [data-run="app:vlc.desktop"]', [dropped]);
+  await sleep(250);
+  check(starts.length === 3 && starts[2].id === 'vlc.desktop' && starts[2].fichiers.length === 1, '… y compris sur une appli ouverte qui n\'a pas de raccourci');
+  await dropOn(tile('r_t3'), [dropped]);
+  await sleep(250);
+  check(moves.length === 1 && moves[0].dest_dir === `${HOME}/Documents` && moves[0].paths[0] === dropped && !moves[0].copy, 'fichier lâché sur un dossier : rangé dedans');
+  await page.unroute('**/api/fs/move');
+
+  open = false;
+  windows.groupes[0].n = 1; windows.groupes[0].fenetres.pop(); windows.sig = 's2';
+  await page.evaluate(() => loadWindows());
+  await page.click(tile('r_t1'));
+  await sleep(350);
+  check(acts.length === 3 && starts.length === 4 && starts[3].id === 'firefox.desktop', 'appli fermée entre-temps : le clic la relance');
   for (const u of ['**/api/raccourcis', '**/api/fenetres', '**/api/fenetres/action', '**/api/apps/lancer']) await page.unroute(u);
   await page.evaluate(async () => { D.win = { dispo: false, groupes: [], map: {}, sig: 'x' }; D.sc = []; await loadShortcuts(); await loadWindows(); });
 
   // ── fenêtre principale ──
+  console.log('— volet : à gauche de l\'écran');
+  const boxes = () => page.evaluate(() => {
+    const r = (q) => { const b = document.querySelector(q).getBoundingClientRect(); return { l: Math.round(b.left), r: Math.round(b.right) }; };
+    return { side: r('.side'), rail: r('#rail'), icons: r('#icons'), w: innerWidth };
+  });
+  const right = await boxes();
+  await page.evaluate(() => { D.b.volet_cote = 'gauche'; applyVolet(); });
+  await sleep(350);
+  const left = await boxes();
+  check(left.side.l < 80 && Math.abs(left.rail.l - left.side.l) <= 2 && left.icons.l >= left.side.r && left.icons.r > right.icons.r,
+    `volet à gauche : raccourcis contre le bord, icônes décalées à sa droite (volet ${left.side.l}–${left.side.r}, icônes ${left.icons.l}–${left.icons.r})`);
+  check(right.side.r > right.w - 80 && right.icons.r <= right.side.l, 'à droite : comme avant');
+  await page.evaluate(() => { D.b.volet_cote = 'droite'; applyVolet(); });
+
+  console.log('— volet : même discussion que la fenêtre principale');
+  await post('/api/settings', { think: true });
+  await post('/api/bureau/conv/nouvelle', {});
+  await page.evaluate(() => loadConv().then(renderConv));
+  await ask('Bonjour, fais-moi un tableau');
+  const nMsgs = () => page.evaluate(() => D.conv.messages.length);
+  check(await page.locator('#vMsgs details.seg-think').count() === 1 && (await page.innerText('#vMsgs .acts .stats')).includes('qwen'), 'réflexion du modèle repliée, modèle et vitesse affichés');
+  check(await page.locator('#vMsgs [data-act="regen"]').count() === 1 && await page.locator('#vMsgs [data-act="toXlsx"]').count() === 1
+    && await page.locator('#vMsgs [data-act="toDocx"]').count() === 1, 'boutons Régénérer, Word et Excel (la réponse contient un tableau)');
+  const before = await nMsgs();
+  await page.click('#vMsgs [data-act="regen"]');
+  await sleep(200); await idle(); await sleep(200);
+  check(await nMsgs() === before && await page.locator('#vMsgs .a').count() === 1 && await page.locator('#vMsgs .md table').count() === 1, 'Régénérer : la réponse est refaite, pas ajoutée');
+  await page.reload();
+  await page.waitForSelector('#vIn');
+  await page.waitForFunction(() => D.conv && D.items.length);
+  check(await page.locator('#vMsgs details.seg-think').count() === 1 && await page.locator('#vMsgs [data-act="regen"]').count() === 1, 'identique après rechargement (même code d\'affichage)');
+  await post('/api/settings', { think: false });
+
+  console.log('— bureau : couper, coller');
+  fs.writeFileSync(`${DESK}/à déplacer.txt`, 'x');
+  await page.evaluate(() => loadElements());
+  await page.waitForSelector('#icons .dicon[title$="à déplacer.txt"]');
+  await page.click('#icons .dicon[title$="à déplacer.txt"]');
+  await page.keyboard.press('Control+x');
+  await sleep(300);
+  check(await page.locator('#icons .dicon.cut').count() === 1, 'Ctrl+X sur le bureau : l\'icône est marquée « coupée »');
+  await page.click('#icons .dicon[title$="Vrai dossier"]');
+  await page.keyboard.press('Control+v');
+  await sleep(600);
+  check(fs.existsSync(`${DESK}/Vrai dossier/à déplacer.txt`) && !fs.existsSync(`${DESK}/à déplacer.txt`), 'Ctrl+V sur un dossier choisi : le fichier y est déplacé');
+  check(await page.locator('#icons .dicon.cut').count() === 0 && await page.locator('#icons .dicon[title$="à déplacer.txt"]').count() === 0, 'l\'icône quitte le bureau');
+
+  console.log('— bureau : versions précédentes d\'un fichier');
+  const vfile = `${DESK}/journal.txt`;
+  fs.writeFileSync(vfile, 'premier jet');
+  await post('/api/fs/write', { path: vfile, content: 'deuxième jet' });
+  await post('/api/fs/write', { path: vfile, content: 'troisième jet' });
+  await page.evaluate((p) => showVersions(p, () => { window.__revenu = true; }), vfile);
+  await page.waitForSelector('.ver[data-id]');
+  check(await page.locator('.ver[data-id]').count() === 2 && await page.locator('.ver.cur').count() === 1, 'deux anciennes versions listées, plus la version actuelle');
+  await page.click('.ver[data-id] >> nth=1 >> [data-ver="voir"]');
+  await page.waitForSelector('.modal pre.pv-text', { timeout: 4000 }).catch(() => {});
+  check((await page.innerText('.modal pre.pv-text').catch(() => '')) === 'premier jet', 'aperçu d\'une ancienne version');
+  await page.click('.ver[data-id] >> nth=1 >> [data-ver="remettre"]');
+  await page.click('.modal:last-of-type .btn.primary:has-text("Remettre cette version")');
+  await page.waitForFunction(() => window.__revenu, null, { timeout: 5000 }).catch(() => {});
+  check(fs.readFileSync(vfile, 'utf8') === 'premier jet', 'Remettre : le fichier retrouve son ancien contenu');
+  const again = await page.evaluate((p) => api(`/api/fs/versions?path=${encodeURIComponent(p)}`), vfile);
+  check(again.versions.length === 3, 'l\'état remplacé est devenu une version lui aussi');
+
   console.log('— fenêtre principale');
   const main = watch(await ctx.newPage());
   await main.goto(`${BASE}/#/chat`);
@@ -278,6 +380,67 @@ async function main() {
   await main.press('#fSearch', 'Enter');
   await main.waitForSelector('#fList .search-cut', { timeout: 4000 }).catch(() => {});
   check(await main.locator('#fList .search-cut').count() === 1 && (await main.innerText('#fList')).includes('pas pu tout parcourir'), 'recherche arrêtée par le temps : annoncée');
+  await main.unroute('**/api/fs/search?**');
+  await main.evaluate(async () => { S.index = await api('/api/index'); });
+  await main.fill('#fSearch', '');
+  await main.type('#fSearch', 'journ', { delay: 30 });
+  await main.waitForFunction(() => F.search && F.search.query === 'journ', null, { timeout: 4000 }).catch(() => {});
+  check(await main.evaluate(() => !!(F.search && F.search.index && F.search.results.some((e) => e.name === 'journal.txt'))), 'recherche au fil de la frappe, sans appuyer sur Entrée (index)');
+  // couper / coller au clavier, et glisser = déplacer
+  const dnd = `${HOME}/Documents/dnd`;
+  fs.mkdirSync(`${dnd}/Dest`, { recursive: true });
+  fs.mkdirSync(`${dnd}/Ailleurs`, { recursive: true });
+  fs.writeFileSync(`${dnd}/a.txt`, 'a'); fs.writeFileSync(`${dnd}/b.txt`, 'b'); fs.writeFileSync(`${dnd}/Ailleurs/venu.txt`, 'v');
+  const rowOf = (name) => `#fList .frow:has(.name span:text-is("${name}"))`;
+  const openIn = async (dir) => { await main.evaluate((d) => { $('#fSearch').value = ''; F.search = null; return openDir(d); }, dir); await sleep(350); };
+  await openIn(dnd);
+  await main.click(rowOf('a.txt'));
+  await main.keyboard.press('Control+x');
+  await sleep(300);
+  check(await main.locator(`${rowOf('a.txt')}.cut`).count() === 1 && fs.existsSync(`${dnd}/a.txt`), 'Ctrl+X : le fichier est marqué « coupé », rien ne bouge encore');
+  await openIn(`${dnd}/Dest`);
+  await main.focus('#fList');
+  await main.keyboard.press('Control+v');
+  await sleep(500);
+  check(fs.existsSync(`${dnd}/Dest/a.txt`) && !fs.existsSync(`${dnd}/a.txt`) && await main.locator(rowOf('a.txt')).count() === 1, 'Ctrl+V dans un autre dossier : le fichier y est déplacé et s\'affiche');
+  await openIn(dnd);
+  await main.click(rowOf('b.txt'));
+  await main.keyboard.press('Control+c');
+  await sleep(250);
+  await main.click(rowOf('Dest'), { button: 'right' });
+  await main.click('.menu button:has-text("Coller dans ce dossier")');
+  await sleep(500);
+  check(fs.existsSync(`${dnd}/Dest/b.txt`) && fs.existsSync(`${dnd}/b.txt`), 'Ctrl+C puis « Coller dans ce dossier » : copié, l\'original reste');
+  const dropPaths = (sel, paths, opts = {}) => main.evaluate(([q, list, o]) => {
+    const dt = new DataTransfer();
+    dt.setData('text/uri-list', list.map((p) => `file://${p.split('/').map(encodeURIComponent).join('/')}`).join('\r\n'));
+    const el = document.querySelector(q) || document.querySelector('#fWrap');
+    const r = el.getBoundingClientRect();
+    for (const t of ['dragenter', 'dragover', 'drop']) el.dispatchEvent(new DragEvent(t, { bubbles: true, cancelable: true, dataTransfer: dt, clientX: r.x + 40, clientY: r.y + r.height / 2, ...o }));
+  }, [sel, paths, opts]);
+  const destRow = await main.evaluate(() => { const i = curList().findIndex((e) => e.name === 'Dest'); return `#fList .frow[data-i="${i}"]`; });
+  await dropPaths(destRow, [`${dnd}/Ailleurs/venu.txt`]);
+  await sleep(500);
+  check(fs.existsSync(`${dnd}/Dest/venu.txt`) && !fs.existsSync(`${dnd}/Ailleurs/venu.txt`), 'fichier glissé depuis une autre appli sur un dossier : déplacé, pas copié');
+  await dropPaths('#fList', [`${dnd}/Dest/venu.txt`]);
+  await sleep(500);
+  check(fs.existsSync(`${dnd}/venu.txt`) && !fs.existsSync(`${dnd}/Dest/venu.txt`), 'glissé dans le dossier affiché (hors d\'un sous-dossier) : déplacé ici');
+  await dropPaths(destRow, [`${dnd}/venu.txt`], { ctrlKey: true });
+  await sleep(500);
+  check(fs.existsSync(`${dnd}/Dest/venu.txt`) && fs.existsSync(`${dnd}/venu.txt`), 'avec Ctrl : copié');
+  check(await main.locator('.drop-overlay').count() === 0, 'le bandeau de dépôt disparaît une fois le fichier lâché');
+
+  await main.evaluate(() => go('settings'));
+  await main.waitForSelector('#stIndex [data-ix="refaire"]', { timeout: 5000 }).catch(() => {});
+  check(/fichiers et \d+ dossiers retenus/.test(await main.innerText('#stIndex')) && await main.locator('[data-act="rollback"]').count() === 1, 'Réglages : état de l\'index, bouton « Revenir à la version précédente »');
+  await main.click('[data-act="rollback"]');
+  await main.waitForSelector('.modal [data-r="go"]', { timeout: 5000 }).catch(() => {});
+  check(/Revenir à Archiviste \d/.test(await main.innerText('.modal').catch(() => '')), 'la version précédente est proposée, avec ce qui est gardé');
+  await main.keyboard.press('Escape');
+  await main.evaluate(() => go('chat'));
+  await main.waitForSelector('#cInner .md');
+  check(await main.locator('#cInner [data-act="regen"]').count() === 1 && await main.locator('#cInner [data-act="saveMsg"]').count() === 1 && await main.locator('#cInner .m-bot .who').count() >= 1,
+    'discussion de la fenêtre principale : mêmes boutons, son habillage');
   await main.close();
 
   check(jsErrors.length === 0, `aucune erreur JavaScript${jsErrors.length ? ` (${jsErrors.slice(0, 3).join(' | ')})` : ''}`);

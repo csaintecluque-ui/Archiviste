@@ -8,7 +8,12 @@ rm -rf "$H" && mkdir -p "$H/Téléchargements" "$H/Documents"
 (cd "$H/Téléchargements" && echo facture > facture_edf_mars.pdf && echo img > vacances.jpg && echo "note perso" > note.txt \
   && echo x > setup.deb && printf 'ligne1\nligne2\n' > liste.md && cp vacances.jpg copie_vacances.jpg)
 python3 "$ICI/mock_ollama.py" 11500 & MOCK=$!
-HOME="$H" XDG_DATA_HOME= ARCHIVISTE_PORT=8766 ARCHIVISTE_SANS_MAJ=1 python3 "$RACINE/archiviste.py" & SRV=$!
+rm -f /tmp/archi-install.log
+# mises à jour : faux dépôt de versions (servi par le faux Ollama), faux pkexec et faux installateur
+HOME="$H" XDG_DATA_HOME= XDG_CACHE_HOME= ARCHIVISTE_PORT=8766 ARCHIVISTE_SANS_MAJ=1 no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost \
+  ARCHIVISTE_MAJ_API=http://127.0.0.1:11500/maj/releases ARCHIVISTE_MAJ_DEPOT=http://127.0.0.1:11500/maj/ \
+  ARCHIVISTE_PKEXEC="$ICI/faux_pkexec.sh" ARCHIVISTE_MAJ_HELPER="$ICI/faux_installeur.sh" \
+  python3 "$RACINE/archiviste.py" & SRV=$!
 trap 'kill $MOCK $SRV 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do python3 -c "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8766/', timeout=1)" 2>/dev/null && break; sleep 0.25; done
 python3 "$ICI/test_api.py"

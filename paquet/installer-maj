@@ -11,4 +11,5 @@ esac
 nom="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
 [ "$nom" = "archiviste" ] || { echo "Ce paquet n'est pas Archiviste ($nom)" >&2; exit 3; }
 export DEBIAN_FRONTEND=noninteractive
-exec /usr/bin/apt-get install -y --no-remove -o DPkg::Lock::Timeout=180 "$deb"
+# --allow-downgrades : sert aussi à revenir à la version précédente (Réglages → À propos)
+exec /usr/bin/apt-get install -y --no-remove --allow-downgrades -o DPkg::Lock::Timeout=180 "$deb"

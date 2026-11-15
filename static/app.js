@@ -698,7 +698,13 @@ function buildFiles() {
     runSearch(q);
   };
   $('#fSearch').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); if (e.key === 'Escape') { e.target.value = ''; doSearch(); } });
-  $('#fSearch').addEventListener('input', debounce(() => { if (!$('#fSearch').value.trim()) doSearch(); }, 200));
+  // index prêt : la recherche répond tout de suite, donc elle suit la frappe (Entrée vérifie en plus le disque)
+  $('#fSearch').addEventListener('input', debounce(() => {
+    const q = $('#fSearch').value.trim();
+    if (!q) return doSearch();
+    if (q.length >= 2 && S.index?.pret && !F.hidden) runSearch(q, true);
+    return null;
+  }, 260));
 
   const list = $('#fList');
   list.addEventListener('click', onRowClick);
@@ -712,6 +718,8 @@ function buildFiles() {
       rowMenu(e.clientX, e.clientY);
     } else {
       showMenu(e.clientX, e.clientY, [
+        { label: CLIP.paths.length ? `Coller ici (${CLIP.paths.length} élément${CLIP.paths.length > 1 ? 's' : ''} ${CLIP.mode === 'couper' ? 'coupé' : 'copié'}${CLIP.paths.length > 1 ? 's' : ''})` : 'Coller', icon: 'download', kbd: 'Ctrl+V', disabled: !CLIP.paths.length, act: () => pasteHere() },
+        'sep',
         { label: 'Nouveau dossier', icon: 'folderPlus', act: FILE_ACTS.newFolder },
         { label: 'Nouveau fichier texte', icon: 'filePlus', act: FILE_ACTS.newFile },
         { label: 'Nouveau document Word', icon: 'quill', act: () => newOffice('docx') },
@@ -728,49 +736,101 @@ function buildFiles() {
   const wrap = $('#fWrap');
   let dragDepth = 0;
   const overlay = () => $('.drop-overlay', wrap);
+  // Glisser un fichier dans un dossier le DÉPLACE (Ctrl : copie), d'où qu'il vienne : cette liste, le bureau
+  // Archiviste, Nemo… Il n'est importé (copié) que si son emplacement sur le disque est inconnu ou hors des
+  // dossiers autorisés.
+  let ownDrag = false;  // une ligne de cette liste est en train d'être glissée
+  const own = () => ownDrag;
+  const outside = (dt) => !ownDrag && ['Files', 'application/x-archiviste-paths', 'text/uri-list'].some((t) => dt.types.includes(t));
+  const located = (dt) => dt.types.includes('application/x-archiviste-paths') || dt.types.includes('text/uri-list');
+  const folderRow = (e) => {
+    const r = e.target.closest?.('.frow[data-i]');
+    const it = r && curList()[+r.dataset.i];
+    return it?.dir && !(own() && F.sel.has(it.path)) ? { r, it } : null;
+  };
+  const dropHint = (e) => {
+    const t = folderRow(e);
+    const verb = !located(e.dataTransfer) ? 'Importer' : dragCopy(e) ? 'Copier' : 'Déplacer';
+    const where = t ? `dans « ${t.it.name} »` : `ici — ${tildify(F.path)}`;
+    const o = overlay();
+    if (o) o.innerHTML = `${ic(verb === 'Importer' ? 'upload' : verb === 'Copier' ? 'copy' : 'move')}<b>${verb} ${esc(where)}</b>${verb === 'Déplacer' ? '<span class="muted">Ctrl : copier</span>' : ''}`;
+  };
   wrap.addEventListener('dragenter', (e) => {
-    if (!e.dataTransfer.types.includes('Files')) return;
+    if (!outside(e.dataTransfer)) return;
     e.preventDefault(); dragDepth++;
-    if (!overlay()) wrap.insertAdjacentHTML('beforeend', `<div class="drop-overlay">${ic('upload', 'lg')}<b>Dépose pour importer ici</b><span class="muted">${esc(tildify(F.path))}</span></div>`);
+    if (!overlay()) wrap.insertAdjacentHTML('beforeend', '<div class="drop-overlay"></div>');
+    dropHint(e);
   });
-  wrap.addEventListener('dragleave', (e) => { if (!e.dataTransfer.types.includes('Files')) return; if (--dragDepth <= 0) { dragDepth = 0; overlay()?.remove(); } });
+  wrap.addEventListener('dragleave', (e) => { if (!outside(e.dataTransfer)) return; if (--dragDepth <= 0) { dragDepth = 0; overlay()?.remove(); $$('.frow.drop', list).forEach((x) => x.classList.remove('drop')); } });
   wrap.addEventListener('dragover', (e) => {
-    if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; return; }
-    const r = e.target.closest('.frow[data-i]');
-    if (r && e.dataTransfer.types.includes('application/x-archiviste')) {
-      const it = curList()[+r.dataset.i];
-      if (it?.dir && !F.sel.has(it.path)) { e.preventDefault(); e.dataTransfer.dropEffect = e.ctrlKey ? 'copy' : 'move'; $$('.frow.drop', list).forEach((x) => x !== r && x.classList.remove('drop')); r.classList.add('drop'); }
+    const dt = e.dataTransfer;
+    const t = folderRow(e);
+    $$('.frow.drop', list).forEach((x) => x !== t?.r && x.classList.remove('drop'));
+    if (outside(dt)) {
+      e.preventDefault();
+      dt.dropEffect = !located(dt) || dragCopy(e) ? 'copy' : 'move';
+      t?.r.classList.add('drop');
+      dropHint(e);
+    } else if (own() && t) {
+      e.preventDefault(); dt.dropEffect = dragCopy(e) ? 'copy' : 'move'; t.r.classList.add('drop');
     }
   });
   wrap.addEventListener('drop', async (e) => {
+    const dt = e.dataTransfer;
+    const t = folderRow(e);
     $$('.frow.drop', list).forEach((x) => x.classList.remove('drop'));
-    if (e.dataTransfer.types.includes('Files')) {
-      e.preventDefault(); dragDepth = 0; overlay()?.remove();
-      const items = [...(e.dataTransfer.items || [])];
-      const dirs = items.filter((it) => it.webkitGetAsEntry?.()?.isDirectory).length;
-      if (dirs) toast(`${dirs} dossier(s) ignoré(s) : seuls les fichiers peuvent être importés par glisser-déposer.`, 'err');
-      const files = [...e.dataTransfer.files].filter((f, i) => !items[i]?.webkitGetAsEntry?.()?.isDirectory);
-      uploadFiles(files, F.path);
+    dragDepth = 0; overlay()?.remove();
+    if (own()) {  // une ligne de cette liste, lâchée sur un dossier
+      if (!t || !DRAG_PATHS) return;
+      e.preventDefault();
+      const info = await dropInfo(e);
+      const paths = info.paths.filter((p) => p !== t.it.path);
+      if (paths.length) moveItems(paths, t.it.path, info.copy);
       return;
     }
-    const r = e.target.closest('.frow[data-i]');
-    const data = e.dataTransfer.getData('application/x-archiviste');
-    if (!r || !data) return;
+    if (!outside(dt)) return;
     e.preventDefault();
-    const it = curList()[+r.dataset.i];
-    if (!it?.dir) return;
-    const paths = JSON.parse(data).filter((p) => p !== it.path);
-    if (paths.length) moveItems(paths, it.path, e.ctrlKey);
+    const dest = t ? t.it.path : F.path;
+    const items = [...(dt.items || [])];
+    const isDir = (i) => { try { return !!items[i]?.webkitGetAsEntry?.()?.isDirectory; } catch { return false; } };
+    const files = [...dt.files].map((f, i) => ({ f, dir: isDir(i) }));  // lus tout de suite : après un « await » ils ne sont plus accessibles
+    const { paths, copy } = await dropInfo(e);
+    if (paths.length) {
+      const todo = paths.filter((p) => p !== dest && (copy || dirname(p) !== dest));
+      if (!todo.length) return toast('Déjà dans ce dossier.');
+      let r;
+      try { r = await post('/api/fs/move', { paths: todo, dest_dir: dest, copy }); } catch (err) { return toast(err.message, 'err'); }
+      // refusé parce que hors des dossiers autorisés (clé USB non ajoutée, /tmp…) : on l'importe, l'original reste où il est
+      const refused = r.erreurs.filter((x) => /autoris/i.test(x.erreur));
+      const names = new Set(refused.map((x) => basename(x.path)));
+      const others = r.erreurs.filter((x) => !refused.includes(x));
+      if (others.length) toast(others.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
+      if (r.ok.length) toast(`${r.ok.length} élément(s) ${copy ? 'copié(s)' : 'déplacé(s)'} ${t ? `dans ${t.it.name}` : 'ici'}`, 'ok', t ? { label: 'Y aller', action: () => openDir(dest) } : undefined);
+      const imp = files.filter((x) => !x.dir && names.has(x.f.name)).map((x) => x.f);
+      if (imp.length) { await uploadFiles(imp, dest); toast(`${imp.length} fichier(s) copié(s) : l'original est hors des dossiers autorisés d'Archiviste, il n'a pas été déplacé.`, 'info', { timeout: 8000 }); }
+      else if (refused.length) toast(refused.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
+      return F.search ? runSearch(F.search.query) : loadDir();
+    }
+    // emplacement inconnu (image glissée depuis une page web, pièce jointe…) : importé, comme avant
+    if (!files.length) return toast('Rien à déplacer : ce qui a été glissé n\'est pas un fichier de ton PC.');
+    const dirs = files.filter((x) => x.dir).length;
+    if (dirs) toast(`${dirs} dossier(s) ignoré(s) : seuls les fichiers peuvent être importés par glisser-déposer.`, 'err');
+    return uploadFiles(files.filter((x) => !x.dir).map((x) => x.f), dest);
   });
   list.addEventListener('dragstart', (e) => {
     const r = e.target.closest('.frow[data-i]');
     if (!r) return;
     const it = curList()[+r.dataset.i];
     if (!F.sel.has(it.path)) { F.sel = new Set([it.path]); refreshSelection(); }
+    ownDrag = true;
+    dragBegin([...F.sel]);
     e.dataTransfer.setData('application/x-archiviste', JSON.stringify([...F.sel]));
+    // pour le bureau Archiviste et les autres applis (Nemo) : les mêmes fichiers, par leur adresse
+    try { e.dataTransfer.setData('application/x-archiviste-paths', JSON.stringify([...F.sel])); } catch { /* */ }
+    try { e.dataTransfer.setData('text/uri-list', [...F.sel].map((p) => `file://${p.split('/').map(encodeURIComponent).join('/')}`).join('\r\n')); } catch { /* */ }
     e.dataTransfer.effectAllowed = 'copyMove';
   });
-  list.addEventListener('dragend', () => $$('.frow.drop', list).forEach((x) => x.classList.remove('drop')));
+  list.addEventListener('dragend', () => { ownDrag = false; dragEnd(); $$('.frow.drop', list).forEach((x) => x.classList.remove('drop')); });
   F.built = true;
 }
 
@@ -873,13 +933,16 @@ function selectPath(p) {
   $(`.frow[data-i="${i}"]`)?.scrollIntoView({ block: 'nearest' });
 }
 function clearSearch() { F.search = null; $('#fSearch').value = ''; F.sel.clear(); renderFileList(); renderPreview(); renderSelbar(); }
-async function runSearch(q) {
+let searchSeq = 0;
+async function runSearch(q, typing = false) {
   const content = $('#fSearchContent').checked;
-  $('#fList').innerHTML = `<div class="empty"><span class="spinner"></span><p>Recherche de « ${esc(q)} »${content ? ' (contenu compris)' : ''}…</p></div>`;
+  const seq = ++searchSeq;
+  if (!typing) $('#fList').innerHTML = `<div class="empty"><span class="spinner"></span><p>Recherche de « ${esc(q)} »${content ? ' (contenu compris)' : ''}…</p></div>`;
   try {
-    const r = await api(`/api/fs/search?path=${enc(F.path)}&q=${enc(q)}${content ? '&content=1' : ''}`);
+    const r = await api(`/api/fs/search?path=${enc(F.path)}&q=${enc(q)}${content ? '&content=1' : ''}${typing ? '&frais=0' : ''}`);
+    if (seq !== searchSeq) return;  // une recherche plus récente est partie entre-temps
     F.search = r; F.sel.clear();
-  } catch (e) { toast(e.message, 'err'); F.search = null; }
+  } catch (e) { if (seq !== searchSeq) return; toast(e.message, 'err'); F.search = null; }
   renderFileList(); renderPreview(); renderSelbar();
 }
 
@@ -898,6 +961,7 @@ function renderCrumbs() {
 // Une recherche arrêtée avant la fin le dit, au lieu de laisser croire qu'il n'y a rien d'autre.
 function searchCutText(r) {
   if (!r || !r.incomplet) return '';
+  if (r.incomplet === 'contenu') return `Le texte de ${r.a_lire} fichier(s) n'est pas encore indexé : d'autres documents peuvent contenir ce mot (l'index se complète tout seul).`;
   if (r.incomplet === 'temps') return `Recherche arrêtée au bout de ${String(r.delai).replace('.', ',')} s : tout n'a pas été parcouru. Ouvre un sous-dossier plus précis et relance.`;
   return 'Seuls les premiers résultats sont affichés : précise le mot cherché.';
 }
@@ -930,6 +994,7 @@ function refreshSelection() {
     const e = list[+r.dataset.i];
     const on = F.sel.has(e.path);
     r.classList.toggle('sel', on);
+    r.classList.toggle('cut', clipCut(e.path));
     r.classList.toggle('focus', +r.dataset.i === F.focus);
     const c = $('input', r); if (c) c.checked = on;
   });
@@ -965,6 +1030,9 @@ function onFileKey(e) {
   else if (e.key === 'Enter' && sel.length === 1) { e.preventDefault(); openEntry(sel[0]); }
   else if (e.key === 'Backspace') { e.preventDefault(); FILE_ACTS.up(); }
   else if (e.key === 'a' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); F.sel = new Set(list.map((x) => x.path)); refreshSelection(); }
+  else if ((e.ctrlKey || e.metaKey) && 'xXcC'.includes(e.key) && e.key.length === 1 && sel.length && !String(getSelection()).trim()) {
+    e.preventDefault(); clipSet(sel.map((x) => x.path), e.key.toLowerCase() === 'x' ? 'couper' : 'copier');
+  } else if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); pasteHere(); }
   else if (e.key === 'Escape') { F.sel.clear(); refreshSelection(); }
   else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
     e.preventDefault();
@@ -989,6 +1057,13 @@ function openEntry(e) {
   if (isEditable(e) && (e.size || 0) < 2e6) return openEditor(e.path);
   openWithSystem(e.path);
 }
+// Coller dans le dossier affiché (ou dans un dossier précis, depuis son menu)
+async function pasteHere(dest = F.path) {
+  const r = await clipPaste(dest, dest === F.path ? 'ici' : null);
+  if (!r) return;
+  if (dest === F.path && r.ok.length) F.sel = new Set(r.ok.map((x) => x.vers));
+  F.search ? runSearch(F.search.query) : loadDir();
+}
 function rowMenu(x, y) {
   const sel = selectedEntries();
   if (!sel.length) return;
@@ -1000,7 +1075,12 @@ function rowMenu(x, y) {
     items.push({ label: 'Afficher dans le gestionnaire de fichiers', icon: 'folder', act: () => openWithSystem(one.path, true) });
     if (grimOk(one) && !GRIM_FIRST.has(one.ext)) items.push({ label: 'Ouvrir dans Grimoire', icon: 'quill', act: () => openInGrimoire(one.path) });
     items.push({ label: 'Renommer', icon: 'pencil', kbd: 'F2', act: () => renameItem(one) });
+    if (!one.dir) items.push({ label: 'Versions précédentes…', icon: 'undo', act: () => showVersions(one.path, () => (F.search ? runSearch(F.search.query) : loadDir())) });
   }
+  items.push('sep');
+  items.push({ label: 'Couper', icon: 'move', kbd: 'Ctrl+X', act: () => clipSet(sel.map((x) => x.path), 'couper') });
+  items.push({ label: 'Copier', icon: 'copy', kbd: 'Ctrl+C', act: () => clipSet(sel.map((x) => x.path), 'copier') });
+  if (one?.dir && CLIP.paths.length) items.push({ label: `Coller dans ce dossier (${CLIP.paths.length})`, icon: 'download', act: () => pasteHere(one.path) });
   items.push({ label: 'Déplacer vers…', icon: 'move', act: () => moveDialog(sel.map((x) => x.path), false) });
   items.push({ label: 'Copier vers…', icon: 'copy', act: () => moveDialog(sel.map((x) => x.path), true) });
   items.push({ label: 'Copier le chemin', icon: 'copy', act: () => copyText(sel.map((x) => x.path).join('\n')) });
@@ -1057,7 +1137,8 @@ async function renderPreview() {
         Double-clic : ouvrir · clic droit : actions<br>
         <span class="kbd">Suppr</span> corbeille · <span class="kbd">F2</span> renommer · <span class="kbd">⌫</span> dossier parent<br>
         <span class="kbd">Ctrl</span> / <span class="kbd">Maj</span> + clic : sélection multiple<br>
-        Glisse des éléments sur un dossier pour les y déplacer (<span class="kbd">Ctrl</span> pour copier), ou des fichiers depuis ton bureau pour les importer.
+        <span class="kbd">Ctrl</span>+<span class="kbd">X</span> couper · <span class="kbd">Ctrl</span>+<span class="kbd">C</span> copier · <span class="kbd">Ctrl</span>+<span class="kbd">V</span> coller ici<br>
+        Glisse un fichier sur un dossier pour l'y déplacer (<span class="kbd">Ctrl</span> pour le copier) — depuis cette liste, le bureau ou Nemo.
       </div>`;
     return;
   }
@@ -1179,12 +1260,83 @@ async function trashItems(paths) {
     if (r.ok.length) {
       const ids = r.ok.map((x) => x.corbeille);
       toast(`${r.ok.length} élément(s) mis à la corbeille`, 'ok', {
-        label: 'Annuler', action: async () => { await post('/api/trash/restore', { ids }); toast('Restauré', 'ok'); loadDir(); },
+        label: 'Annuler', action: async () => { reportRestore(await post('/api/trash/restore', { ids })); loadDir(); },
       });
     }
   } catch (e) { toast(e.message, 'err'); }
   F.sel.clear();
   F.search ? runSearch(F.search.query) : loadDir();
+}
+// ── Couper / copier / coller des fichiers (commun au bureau et à la fenêtre principale) ──
+// Le presse-papiers est tenu par le serveur : ce qui est coupé sur le bureau se colle dans la fenêtre principale,
+// et inversement. Sous l'appli, ce qui a été coupé ou copié dans Nemo se colle aussi ici.
+const CLIP = { paths: [], mode: 'copier', source: null };
+let clipListener = null;  // la page dit comment montrer ce qui est « coupé »
+function clipApply(c) { Object.assign(CLIP, { paths: [], mode: 'copier', source: null }, c || {}); clipListener?.(); }
+async function clipLoad() { try { clipApply(await api('/api/presse-papiers')); } catch { /* */ } }
+const clipCut = (path) => CLIP.mode === 'couper' && CLIP.source === 'archiviste' && CLIP.paths.includes(path);
+async function clipSet(paths, mode) {
+  if (!paths.length) return;
+  try {
+    clipApply(await post('/api/presse-papiers', { paths, mode }));
+    const n = paths.length > 1;
+    const what = n ? `${paths.length} éléments` : `« ${basename(paths[0])} »`;
+    toast(mode === 'couper' ? `${what} ${n ? 'coupés' : 'coupé'} — Ctrl+V là où tu veux ${n ? 'les' : 'le'} déplacer`
+      : `${what} ${n ? 'copiés' : 'copié'} — Ctrl+V là où tu veux ${n ? 'les' : 'le'} coller`, 'info', { timeout: 3500 });
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function clipPaste(dest, label) {
+  let r;
+  try { r = await post('/api/presse-papiers/coller', { dest }); } catch (e) { toast(e.message, e.message.startsWith('Rien à coller') ? 'info' : 'err'); return null; }
+  if (r.erreurs.length) toast(r.erreurs.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
+  if (r.ok.length) toast(`${r.ok.length} élément(s) ${r.mode === 'couper' ? 'déplacé(s)' : 'copié(s)'} ${label || `dans ${basename(dest)}`}`, 'ok');
+  else if (r.deja && !r.erreurs.length) toast('Déjà dans ce dossier.');
+  await clipLoad();
+  return r;
+}
+// Chemins d'une liste d'adresses file:// (ce que donnent Nemo et les autres applis quand on glisse un fichier)
+function pathsFromUris(list) {
+  return String(list || '').split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith('file://'))
+    .map((u) => { try { return decodeURIComponent(new URL(u).pathname); } catch { return null; } }).filter(Boolean);
+}
+// Glisser-déposer de fichiers. Sous WebKitGTK, la page qui reçoit ne peut lire ni les formats maison ni les
+// adresses file:// : les chemins sont donc gardés ici pour un dépôt dans la même page (DRAG_PATHS), et notés
+// auprès du serveur pour un dépôt dans l'autre fenêtre ; pour un fichier venu d'une autre appli (Nemo), c'est
+// la fenêtre GTK qui les note. dropInfo() les retrouve dans cet ordre.
+let DRAG_PATHS = null;
+function dragBegin(paths) { DRAG_PATHS = paths.slice(); post('/api/glisse', { paths }).catch(() => {}); }
+function dragEnd() { setTimeout(() => { DRAG_PATHS = null; }, 400); }
+// Touche Ctrl pendant un glisser (Ctrl = copier, sinon déplacer). WebKitGTK en donne un état périmé dans ses
+// événements de glisser : après un premier Ctrl, tous les dépôts suivants se croyaient « avec Ctrl » et copiaient.
+// La fenêtre GTK lit donc le clavier elle-même : elle prévient la page (archivisteCtrl) pour l'affichage, et
+// note l'état au moment du dépôt, que dropInfo() relit. Hors de l'appli (navigateur), on garde l'événement.
+let DRAG_CTRL = null;
+window.archivisteCtrl = (on) => { DRAG_CTRL = !!on; };
+const dragCopy = (ev) => (DRAG_CTRL === null ? ev.ctrlKey : DRAG_CTRL);
+// À appeler au tout début d'un « drop » : { paths, copy }
+async function dropInfo(ev) {
+  const dt = ev.dataTransfer;
+  const local = DRAG_PATHS && DRAG_PATHS.length ? DRAG_PATHS.slice() : draggedPaths(dt);
+  const located = [...dt.types].some((t) => t === 'text/uri-list' || t === 'application/x-archiviste-paths');
+  const key = dragCopy(ev);
+  let g = null;
+  try { g = await api('/api/glisse'); } catch { /* */ }
+  return { paths: local.length ? local : located ? (g?.paths || []) : [], copy: typeof g?.ctrl === 'boolean' ? g.ctrl : key };
+}
+function draggedPaths(dt) {
+  try { const j = dt.getData('application/x-archiviste-paths'); if (j) return JSON.parse(j); } catch { /* */ }
+  let p = pathsFromUris(dt.getData('text/uri-list'));
+  if (!p.length) {
+    p = String(dt.getData('text/plain') || '').split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith('/') || l.startsWith('file://'))
+      .map((l) => (l.startsWith('file://') ? pathsFromUris(l)[0] : l)).filter(Boolean);
+  }
+  return p;
+}
+
+// Restauration depuis la corbeille : ce qui a pu revenir revient, le reste est expliqué.
+function reportRestore(r) {
+  if (r.ok.length) toast(`${r.ok.length} élément(s) restauré(s)`, 'ok');
+  if (r.erreurs.length) toast(`${r.erreurs.length} élément(s) non restauré(s) : ${r.erreurs[0].erreur}`, 'err');
 }
 async function uploadFiles(fileList, dir) {
   const files = [...fileList];
@@ -1216,6 +1368,54 @@ function agentPicker(btn, folder, ev) {
   if (btn) menuAt(btn, items); else showMenu(ev?.clientX || 200, ev?.clientY || 200, items);
 }
 
+// ── Versions précédentes ──
+// Archiviste garde une copie d'un fichier chaque fois qu'il le modifie (éditeur, agents, import qui remplace).
+// Cette fenêtre les liste, permet de les lire et d'en remettre une ; l'état remplacé est gardé lui aussi.
+async function showVersions(path, onRestored) {
+  let v;
+  try { v = await api(`/api/fs/versions?path=${enc(path)}`); } catch (e) { return toast(e.message, 'err'); }
+  const m = openModal({
+    title: `Versions précédentes — ${v.nom}`, cls: 'wide',
+    body: v.versions.length
+      ? `<p class="muted" style="margin:0 0 8px;font-size:13px">Archiviste garde une copie de ce fichier chaque fois qu'il le modifie. Remettre une version ne fait rien perdre : l'état actuel devient lui-même une version.</p>
+         <div class="ver-list" data-l></div><div data-pv></div>`
+      : `<div class="empty" style="padding:26px 10px">${ic('undo')}<p>Aucune ancienne version de ce fichier.</p><p class="faint">Archiviste en garde une chaque fois qu'il le modifie : éditeur, agents, import qui remplace un fichier.</p></div>`,
+    footer: '<button class="btn" data-close>Fermer</button>',
+  });
+  const list = $('[data-l]', m.el);
+  if (!list) return null;
+  const when = (d) => new Date(d).toLocaleString('fr-FR', { dateStyle: 'long', timeStyle: 'medium' });  // à la seconde : deux versions peuvent se suivre de près
+  list.innerHTML = (v.actuelle ? `<div class="ver cur"><span class="grow"><b>Version actuelle</b><small>${when(v.actuelle.date)} · ${fmtSize(v.actuelle.taille)}</small></span></div>` : '')
+    + v.versions.map((x, i) => `<div class="ver" data-id="${esc(x.id)}"><span class="grow"><b>${when(x.date)}</b><small>${fmtSize(x.taille)}${i === 0 ? ' · la plus récente' : ''}</small></span>
+      <button class="btn sm" data-ver="voir">${ic('eye', 'sm')} Voir</button><button class="btn sm primary" data-ver="remettre">${ic('undo', 'sm')} Remettre</button></div>`).join('');
+  list.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('[data-ver]');
+    if (!b) return;
+    const row = b.closest('.ver');
+    const id = row.dataset.id;
+    if (b.dataset.ver === 'voir') {
+      const pv = $('[data-pv]', m.el);
+      pv.innerHTML = '<div class="row muted" style="margin-top:10px"><span class="spinner"></span> Lecture…</div>';
+      $$('.ver.on', list).forEach((x) => x.classList.remove('on'));
+      row.classList.add('on');
+      try {
+        const t = await api(`/api/fs/versions/texte?id=${enc(id)}`);
+        pv.innerHTML = t.content ? '<pre class="pv-text" style="max-height:300px;margin-top:10px"></pre>' : `<p class="muted" style="margin-top:10px">${t.content === '' ? 'Fichier vide.' : esc(t.format || 'Pas d\'aperçu pour ce type de fichier.')}</p>`;
+        if (t.content) $('pre', pv).textContent = t.content + (t.tronque ? '\n…' : '');
+      } catch (e) { pv.innerHTML = `<p class="muted" style="margin-top:10px">${esc(e.message)}</p>`; }
+      return;
+    }
+    if (!(await ask(`Remettre la version du ${$('b', row).textContent} à la place de « ${v.nom} » ?\nL'état actuel est gardé : tu pourras y revenir de la même façon.`, { ok: 'Remettre cette version' }))) return;
+    try {
+      await post('/api/fs/versions/restaurer', { id });
+      toast(`« ${v.nom} » est revenu à sa version du ${$('b', row).textContent}`, 'ok');
+      m.close(true);
+      onRestored?.();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  return m;
+}
+
 // ── Éditeur ──
 async function openEditor(path) {
   let r;
@@ -1245,7 +1445,7 @@ async function openEditor(path) {
         <div class="row"><button class="btn sm primary" data-e="replace">${ic('check', 'sm')} Remplacer</button><button class="btn sm" data-e="append">Insérer à la suite</button><button class="btn sm" data-e="aicopy">${ic('copy', 'sm')} Copier</button><span class="grow"></span><button class="btn ghost sm" data-e="aiclose">Ignorer</button></div>
       </div>`,
     footer: `<span class="muted" style="font-size:12px"><span class="kbd">Ctrl</span>+<span class="kbd">S</span> pour enregistrer — l'ancienne version est gardée dans les données d'Archiviste.</span><span class="grow"></span>
-      <button class="btn" data-close>Fermer</button><button class="btn primary" data-e="save">${ic('save', 'sm')} Enregistrer</button>`,
+      <button class="btn ghost" data-e="versions" title="Revenir à un état d'avant">${ic('undo', 'sm')} Versions</button><button class="btn" data-close>Fermer</button><button class="btn primary" data-e="save">${ic('save', 'sm')} Enregistrer</button>`,
     beforeClose: async () => !dirty || ask('Des modifications ne sont pas enregistrées. Fermer quand même ?', { ok: 'Fermer sans enregistrer', danger: true }),
     onClose: () => aiCtrl?.abort(),
   });
@@ -1260,10 +1460,25 @@ async function openEditor(path) {
   });
   q('wrap').addEventListener('change', (e) => ta.classList.toggle('wrap', e.target.checked));
   const save = async () => {
-    try { await post('/api/fs/write', { path, content: ta.value }); dirty = false; status('✓ enregistré'); if (F.path === dirname(path)) loadDir(); }
-    catch (e) { toast(e.message, 'err'); }
+    try {
+      const w = await post('/api/fs/write', { path, content: ta.value, encoding: r.encoding });
+      dirty = false; status('✓ enregistré');
+      if (w.encodage !== r.encoding) {  // un caractère que l'ancien encodage ne sait pas écrire (€, œ, émoji…)
+        toast(`Ce fichier était en ${r.encoding} : il est maintenant enregistré en ${w.encodage.toUpperCase()}, car le texte contient des caractères que l'ancien encodage ne connaît pas.`, 'info', { timeout: 9000 });
+        r.encoding = w.encodage;
+      }
+      if (F.path === dirname(path)) loadDir();
+    } catch (e) { toast(e.message, 'err'); }
   };
   q('save').onclick = save;
+  q('versions').onclick = async () => {
+    if (dirty && !(await ask('Des modifications ne sont pas enregistrées. Les enregistrer avant de regarder les versions ?', { ok: 'Enregistrer' }))) return;
+    if (dirty) await save();
+    showVersions(path, async () => {  // version restaurée : l'éditeur montre le texte revenu
+      try { const again = await api(`/api/fs/read?path=${enc(path)}`); ta.value = again.content; r.encoding = again.encoding; dirty = false; status('✓ version restaurée'); } catch { /* */ }
+      if (F.path === dirname(path)) loadDir();
+    });
+  };
   if (q('todocx')) q('todocx').onclick = async () => {
     try {
       const r = await post('/api/office/new', { path: path.replace(/\.[^./]+$/, '') + '.docx', kind: 'docx', content: ta.value, open: true, unique: true });
@@ -1599,7 +1814,7 @@ function buildChat() {
     const b = e.target.closest('[data-act]');
     if (!b || !v.contains(b)) return;
     const fn = CHAT_ACTS[b.dataset.act];
-    if (fn) { e.preventDefault(); fn(b, e); }
+    if (fn) { e.preventDefault(); fn(b, e); } else if (chatAction(b, { conv: () => C.conv, send: sendMessage })) e.preventDefault();
   });
   const inp = $('#cInput');
   const grow = () => { inp.style.height = 'auto'; inp.style.height = Math.min(inp.scrollHeight, 240) + 'px'; };
@@ -1660,25 +1875,8 @@ const CHAT_ACTS = {
     const s = SUGGESTIONS[+b.dataset.i];
     s.run();
   },
-  // messages
-  copyMsg: (b) => copyText(msgText(+b.dataset.m)),
-  saveMsg: (b) => saveTextToFile(msgText(+b.dataset.m), `Archiviste ${stamp()}.md`),
-  toDocx: (b) => sendToOffice(msgText(+b.dataset.m), 'docx', C.conv?.titre),
-  toXlsx: (b) => sendToOffice(msgText(+b.dataset.m), 'xlsx', C.conv?.titre),
-  regen: () => sendMessage({ regenerate: true }),
-  retry: () => sendMessage({ regenerate: true }),
+  // messages : copier, enregistrer, Word, Excel, régénérer, réessayer, validations → chatAction (commun au volet)
   asPrompt: (b) => editPrompt(null, { contenu: msgText(+b.dataset.m), categorie: 'Divers' }),
-  cfYes: (b) => { const seg = b.closest('.seg'); $$('button', seg).forEach((x) => x.classList.toggle('on', x === b)); },
-  cfNo: (b) => { const seg = b.closest('.seg'); $$('button', seg).forEach((x) => x.classList.toggle('on', x === b)); },
-  cfAll: (b) => { $$('.confirm-item', b.closest('.confirm-card')).forEach((it) => { $('.yes', it).classList.add('on'); $('.no', it).classList.remove('on'); }); CHAT_ACTS.cfSend(b); },
-  cfNone: (b) => { $$('.confirm-item', b.closest('.confirm-card')).forEach((it) => { $('.no', it).classList.add('on'); $('.yes', it).classList.remove('on'); }); CHAT_ACTS.cfSend(b); },
-  cfSend: (b) => {
-    const card = b.closest('.confirm-card');
-    const decisions = {};
-    $$('.confirm-item', card).forEach((it) => { decisions[it.dataset.id] = $('.yes', it).classList.contains('on'); });
-    $$('button', card).forEach((x) => { x.disabled = true; });
-    sendMessage({ decisions });
-  },
 };
 function guessKind(p) {
   const ext = (p.split('.').pop() || '').toLowerCase();
@@ -1812,6 +2010,144 @@ function confirmHtml(pending) {
     <div class="row wrap"><button class="btn primary sm" data-act="cfSend">${ic('check', 'sm')} Valider</button><button class="btn sm" data-act="cfAll">Tout autoriser</button><button class="btn ghost sm" data-act="cfNone">Tout refuser</button>
     <span class="muted" style="font-size:12px">Les suppressions vont à la corbeille ; un fichier modifié garde une copie de son ancienne version.</span></div></div>`;
 }
+// ── Discussion : un seul code pour la fenêtre principale, le volet du bureau et « Demander » ──
+// La « peau » (skin) dit comment habiller une question et une réponse, et quels boutons proposer. Tout le reste
+// — réflexion, texte mis en forme, étapes d'un agent, erreurs, validations, réponse en direct — est commun :
+// une correction faite ici vaut partout.
+function thinkHtml(text) {
+  return `<details class="seg-think"><summary>${ic('info', 'sm')} Réflexion (${text.length} caractères)</summary><div class="tx">${esc(text)}</div></details>`;
+}
+function msgActsHtml(m, i, last, skin) {
+  const btn = (act, icon, title) => `<button class="icon-btn sm" data-act="${act}" data-m="${i}" title="${title}">${ic(icon, 'sm')}</button>`;
+  const grim = hasGrimoire();
+  return `<div class="row acts">${btn('copyMsg', 'copy', 'Copier')}${skin.save ? btn('saveMsg', 'save', 'Enregistrer dans un fichier') : ''}`
+    + (skin.office ? btn('toDocx', 'quill', grim ? 'Envoyer vers Grimoire (document Word)' : 'Enregistrer en document Word') : '')
+    + (skin.office && hasMdTable(m.content) ? btn('toXlsx', 'sheet', grim ? 'Envoyer les tableaux vers un classeur Grimoire' : 'Enregistrer les tableaux en classeur Excel') : '')
+    + (last ? btn('regen', 'refresh', 'Régénérer la réponse') : '')
+    + `<span class="stats">${m.interrompu ? 'interrompu · ' : ''}${m.vitesse ? `${m.vitesse} tok/s · ` : ''}${esc(m.model || '')}</span></div>`;
+}
+function chatHtml(conv, skin, from = 0) {
+  const msgs = conv?.messages || [];
+  const a = agentById(conv?.agent_id);
+  const parts = [];
+  let turn = null;
+  const flush = () => { if (turn) { parts.push(skin.bot(a, turn.join(''))); turn = null; } };
+  msgs.forEach((m, i) => {
+    if (i < from) return;
+    if (m.role === 'user') { flush(); parts.push(skin.user(m, i)); return; }
+    if (!turn) turn = [];
+    if (m.role === 'tool') { turn.push(stepHtml({ ...m, name: m.tool_name, id: m.call_id })); return; }
+    if (m.role === 'error') { turn.push(errorHtml(m.content, i === msgs.length - 1 && m.reessayer !== false && !conv.pending)); return; }
+    if (m.thinking) turn.push(thinkHtml(m.thinking));
+    if (m.content) turn.push(`<div class="md">${md(m.content)}</div>${msgActsHtml(m, i, i === msgs.length - 1 && !conv.pending, skin)}`);
+  });
+  if (conv?.pending?.length) {
+    if (!turn) turn = [];
+    for (const call of conv.pending) if (!call.needs) turn.push(stepHtml(call));
+    for (const call of conv.pending) if (call.needs) turn.push(stepHtml({ ...call, waiting: true }));
+    turn.push(confirmHtml(conv.pending.filter((x) => x.needs)));
+  }
+  flush();
+  return parts.join('');
+}
+// Réponse en cours d'écriture : réflexion, texte, appels d'outils, validations, erreurs, au fil du flux.
+function chatLiveTurn(container, skin, { agent, model, scroll, onChange }) {
+  container.insertAdjacentHTML('beforeend', skin.bot(agent, `<div class="row muted typing"><span class="spinner"></span><span style="font-size:12.5px">${esc(model)} réfléchit…</span></div>`));
+  const el = container.lastElementChild;
+  const body = $('.body', el);
+  let seg = null;
+  let raf = 0;
+  const untype = () => $('.typing', body)?.remove();
+  const newSeg = () => {
+    untype();
+    const d = document.createElement('div');
+    d.className = 'col';
+    d.style.gap = '6px';
+    d.innerHTML = '<details class="seg-think hidden" open><summary>Réflexion…</summary><div class="tx"></div></details><div class="md"></div><div class="stats"></div>';
+    body.append(d);
+    seg = { el: d, think: '', content: '' };
+    return seg;
+  };
+  const paint = () => { raf = 0; if (seg) { $('.md', seg.el).innerHTML = md(seg.content); scroll(); } };
+  const add = (html, force) => { untype(); body.insertAdjacentHTML('beforeend', html); scroll(force); };
+  return {
+    on(ev) {
+      switch (ev.t) {
+        case 'thinking': {
+          if (!seg) newSeg();
+          seg.think += ev.d;
+          const d = $('.seg-think', seg.el); d.classList.remove('hidden');
+          const tx = $('.tx', d); tx.textContent = seg.think; tx.scrollTop = tx.scrollHeight;
+          scroll(); break;
+        }
+        case 'content':
+          if (!seg) newSeg();
+          seg.content += ev.d;
+          if (!raf) raf = requestAnimationFrame(paint);
+          break;
+        case 'message_end':
+          if (seg) {
+            paint();
+            const d = $('.seg-think', seg.el); d.open = false; $('summary', d).textContent = `Réflexion (${seg.think.length} caractères)`;
+            if (ev.vitesse) $('.stats', seg.el).textContent = `${ev.vitesse} tok/s`;
+          }
+          seg = null; break;
+        case 'tool_call':
+          add(stepHtml({ id: ev.id, name: ev.name, description: ev.description, pending: !ev.needs_confirm, waiting: ev.needs_confirm })); break;
+        case 'tool_result': {
+          const sel = `.step[data-step="${CSS.escape(ev.id)}"]`;
+          const old = $(sel, body) || $$(sel, container).pop();
+          const html = stepHtml({ id: ev.id, name: ev.name, description: old ? $('.desc', old).textContent : '', ok: ev.ok, refuse: ev.refuse, summary: ev.summary });
+          if (old) old.outerHTML = html; else body.insertAdjacentHTML('beforeend', html);
+          scroll(); break;
+        }
+        case 'confirm': add(confirmHtml(ev.pending), true); break;
+        case 'notice': body.insertAdjacentHTML('beforeend', `<div class="notice">${esc(ev.d)}</div>`); break;
+        case 'error': add(errorHtml(ev.d, false), true); break;
+        default: break;
+      }
+      onChange?.();
+    },
+    error(msg) { untype(); body.insertAdjacentHTML('beforeend', errorHtml(msg, false)); onChange?.(); },
+    el,
+  };
+}
+// Boutons d'une discussion (copier, enregistrer, Word, Excel, régénérer, réessayer, validations d'un agent).
+// ctx : { conv() → la discussion affichée, send(options) → envoie au modèle }. Vrai si le bouton a été traité.
+function chatAction(b, ctx) {
+  const conv = ctx.conv();
+  const text = () => conv?.messages?.[+b.dataset.m]?.content || '';
+  const card = b.closest('.confirm-card');
+  const pick = (yes) => $$('.confirm-item', card).forEach((it) => { $('.yes', it).classList.toggle('on', yes); $('.no', it).classList.toggle('on', !yes); });
+  const decide = () => {
+    const decisions = {};
+    $$('.confirm-item', card).forEach((it) => { decisions[it.dataset.id] = $('.yes', it).classList.contains('on'); });
+    $$('button', card).forEach((x) => { x.disabled = true; });
+    ctx.send({ decisions });
+  };
+  switch (b.dataset.act) {
+    case 'copyMsg': copyText(text()); return true;
+    case 'saveMsg': saveTextToFile(text(), `Archiviste ${stamp()}.md`); return true;
+    case 'toDocx': sendToOffice(text(), 'docx', conv?.titre); return true;
+    case 'toXlsx': sendToOffice(text(), 'xlsx', conv?.titre); return true;
+    case 'regen': case 'retry': ctx.send({ regenerate: true }); return true;
+    case 'cfYes': case 'cfNo': $$('button', b.closest('.seg')).forEach((x) => x.classList.toggle('on', x === b)); return true;
+    case 'cfAll': pick(true); decide(); return true;
+    case 'cfNone': pick(false); decide(); return true;
+    case 'cfSend': decide(); return true;
+    default: return false;
+  }
+}
+// Habillage de la fenêtre principale : bulles larges, avatar, nom de l'agent, tous les boutons.
+const MAIN_SKIN = {
+  save: true,
+  office: true,
+  user: (m, i) => `<div class="m-user">
+        ${m.attachments?.length ? `<div class="atts">${m.attachments.map((x) => `<span class="att" title="${esc(x.path)}">${x.kind === 'image' ? `<img src="${rawUrl(x.path)}" alt="">` : x.kind === 'folder' ? ic('folder', 'sm') : ic('file', 'sm')}<span>${esc(x.name)}</span></span>`).join('')}</div>` : ''}
+        ${m.content ? `<div class="bubble">${esc(m.content)}</div>` : ''}
+        <div class="acts"><button class="icon-btn sm" data-act="copyMsg" data-m="${i}" title="Copier">${ic('copy', 'sm')}</button><button class="icon-btn sm" data-act="asPrompt" data-m="${i}" title="Enregistrer comme prompt">${ic('prompt', 'sm')}</button></div></div>`,
+  bot: (a, inner) => `<div class="m-bot">${avatarHtml(a)}<div class="body"><div class="who">${a ? esc(a.nom) : 'Archiviste'}</div>${inner}</div></div>`,
+};
 function renderMessages() {
   const inner = $('#cInner');
   const msgs = C.conv?.messages || [];
@@ -1827,113 +2163,14 @@ function renderMessages() {
     </div>`;
     return;
   }
-  const parts = [];
-  let turn = null;
-  const lastBot = (() => { for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === 'user') return i; return -1; })();
-  const flush = () => { if (turn) { parts.push(`<div class="m-bot">${avatarHtml(a)}<div class="body"><div class="who">${a ? esc(a.nom) : 'Archiviste'}</div>${turn.join('')}</div></div>`); turn = null; } };
-  msgs.forEach((m, i) => {
-    if (m.role === 'user') {
-      flush();
-      parts.push(`<div class="m-user">
-        ${m.attachments?.length ? `<div class="atts">${m.attachments.map((x) => `<span class="att" title="${esc(x.path)}">${x.kind === 'image' ? `<img src="${rawUrl(x.path)}" alt="">` : x.kind === 'folder' ? ic('folder', 'sm') : ic('file', 'sm')}<span>${esc(x.name)}</span></span>`).join('')}</div>` : ''}
-        ${m.content ? `<div class="bubble">${esc(m.content)}</div>` : ''}
-        <div class="acts"><button class="icon-btn sm" data-act="copyMsg" data-m="${i}" title="Copier">${ic('copy', 'sm')}</button><button class="icon-btn sm" data-act="asPrompt" data-m="${i}" title="Enregistrer comme prompt">${ic('prompt', 'sm')}</button></div></div>`);
-      return;
-    }
-    if (!turn) turn = [];
-    if (m.role === 'tool') { turn.push(stepHtml({ ...m, name: m.tool_name, id: m.call_id })); return; }
-    if (m.role === 'error') { turn.push(errorHtml(m.content, i === msgs.length - 1 && m.reessayer !== false && !C.conv?.pending)); return; }
-    // assistant
-    if (m.thinking) turn.push(`<details class="seg-think"><summary>${ic('info', 'sm')} Réflexion (${m.thinking.length} caractères)</summary><div class="tx">${esc(m.thinking)}</div></details>`);
-    if (m.content) {
-      const isLast = i > lastBot && !msgs.slice(i + 1).some((x) => x.role === 'assistant' && x.content);
-      turn.push(`<div class="md">${md(m.content)}</div>
-        <div class="row acts"><button class="icon-btn sm" data-act="copyMsg" data-m="${i}" title="Copier">${ic('copy', 'sm')}</button><button class="icon-btn sm" data-act="saveMsg" data-m="${i}" title="Enregistrer dans un fichier">${ic('save', 'sm')}</button><button class="icon-btn sm" data-act="toDocx" data-m="${i}" title="${hasGrimoire() ? 'Envoyer vers Grimoire (document Word)' : 'Enregistrer en document Word'}">${ic('quill', 'sm')}</button>${hasMdTable(m.content) ? `<button class="icon-btn sm" data-act="toXlsx" data-m="${i}" title="${hasGrimoire() ? 'Envoyer les tableaux vers un classeur Grimoire' : 'Enregistrer les tableaux en classeur Excel'}">${ic('sheet', 'sm')}</button>` : ''}${isLast && i === msgs.length - 1 ? `<button class="icon-btn sm" data-act="regen" title="Régénérer la réponse">${ic('refresh', 'sm')}</button>` : ''}
-        <span class="stats">${m.interrompu ? 'interrompu · ' : ''}${m.vitesse ? `${m.vitesse} tok/s · ` : ''}${esc(m.model || '')}</span></div>`);
-    }
-  });
-  if (C.conv?.pending?.length) {
-    if (!turn) turn = [];
-    for (const call of C.conv.pending) if (!call.needs) turn.push(stepHtml(call));
-    for (const call of C.conv.pending) if (call.needs) turn.push(stepHtml({ ...call, waiting: true }));
-    turn.push(confirmHtml(C.conv.pending.filter((x) => x.needs)));
-  }
-  flush();
-  inner.innerHTML = parts.join('');
+  inner.innerHTML = chatHtml(C.conv, MAIN_SKIN);
   scrollChat(true);
 }
 function scrollChat(force) { const m = $('#cMsgs'); if (force || C.stick) m.scrollTop = m.scrollHeight; }
 
 function createLiveTurn() {
-  const inner = $('#cInner');
   const a = agentById(cur().agent_id);
-  const el = document.createElement('div');
-  el.className = 'm-bot';
-  el.innerHTML = `${avatarHtml(a)}<div class="body"><div class="who">${a ? esc(a.nom) : 'Archiviste'}</div><div class="row muted typing"><span class="spinner"></span><span style="font-size:12.5px">${esc(cur().modele || a?.modele || S.settings.model)} réfléchit…</span></div></div>`;
-  inner.append(el);
-  const body = $('.body', el);
-  let seg = null;
-  let raf = 0;
-  const untype = () => $('.typing', body)?.remove();
-  const newSeg = () => {
-    untype();
-    const s = document.createElement('div');
-    s.className = 'col';
-    s.style.gap = '6px';
-    s.innerHTML = '<details class="seg-think hidden" open><summary>Réflexion…</summary><div class="tx"></div></details><div class="md"></div><div class="stats"></div>';
-    body.append(s);
-    seg = { el: s, think: '', content: '' };
-    return seg;
-  };
-  const paint = () => { raf = 0; if (seg) { $('.md', seg.el).innerHTML = md(seg.content); scrollChat(); } };
-  return {
-    on(ev) {
-      switch (ev.t) {
-        case 'thinking': {
-          if (!seg) newSeg();
-          seg.think += ev.d;
-          const d = $('.seg-think', seg.el); d.classList.remove('hidden');
-          const tx = $('.tx', d); tx.textContent = seg.think; tx.scrollTop = tx.scrollHeight;
-          scrollChat(); break;
-        }
-        case 'content':
-          if (!seg) newSeg();
-          seg.content += ev.d;
-          if (!raf) raf = requestAnimationFrame(paint);
-          break;
-        case 'message_end':
-          if (seg) {
-            paint();
-            const d = $('.seg-think', seg.el); d.open = false; $('summary', d).textContent = `Réflexion (${seg.think.length} caractères)`;
-            if (ev.vitesse) $('.stats', seg.el).textContent = `${ev.vitesse} tok/s`;
-          }
-          seg = null; break;
-        case 'tool_call':
-          untype();
-          body.insertAdjacentHTML('beforeend', stepHtml({ id: ev.id, name: ev.name, description: ev.description, pending: !ev.needs_confirm, waiting: ev.needs_confirm }));
-          scrollChat(); break;
-        case 'tool_result': {
-          const old = $(`.step[data-step="${CSS.escape(ev.id)}"]`, body) || $$(`.step[data-step="${CSS.escape(ev.id)}"]`, inner).pop();
-          const html = stepHtml({ id: ev.id, name: ev.name, description: old ? $('.desc', old).textContent : '', ok: ev.ok, refuse: ev.refuse, summary: ev.summary });
-          if (old) old.outerHTML = html; else body.insertAdjacentHTML('beforeend', html);
-          scrollChat(); break;
-        }
-        case 'confirm':
-          untype();
-          body.insertAdjacentHTML('beforeend', confirmHtml(ev.pending));
-          scrollChat(true); break;
-        case 'notice':
-          body.insertAdjacentHTML('beforeend', `<div class="notice">${esc(ev.d)}</div>`); break;
-        case 'error':
-          untype();
-          body.insertAdjacentHTML('beforeend', errorHtml(ev.d, false));
-          scrollChat(true); break;
-        default: break;
-      }
-    },
-    error(msg) { untype(); body.insertAdjacentHTML('beforeend', errorHtml(msg, false)); },
-    el,
-  };
+  return chatLiveTurn($('#cInner'), MAIN_SKIN, { agent: a, model: cur().modele || a?.modele || S.settings.model, scroll: scrollChat });
 }
 function setBusy(on) {
   C.busy = on;
@@ -2256,7 +2493,7 @@ function bindTrash() {
     if (act === 'one') { b.checked ? TR.sel.add(b.dataset.id) : TR.sel.delete(b.dataset.id); return renderTrash(); }
     if (act === 'all') { TR.sel = b.checked ? new Set(TR.items.map((x) => x.id)) : new Set(); return renderTrash(); }
     if (act === 'restore') {
-      try { const r = await post('/api/trash/restore', { ids: [...TR.sel] }); toast(`${r.length} élément(s) restauré(s)`, 'ok'); } catch (err) { toast(err.message, 'err'); }
+      try { reportRestore(await post('/api/trash/restore', { ids: [...TR.sel] })); } catch (err) { toast(err.message, 'err'); }
       TR.sel.clear(); renderTrash();
     }
     if (act === 'purge' || act === 'empty') {
@@ -2301,6 +2538,7 @@ function renderSettings() {
         <div class="roots-list" id="stRoots"></div>
         <div class="pathbox" style="margin-top:8px"><input type="text" id="stNewRoot" placeholder="/media/${esc((S.home || '').split('/').pop() || 'moi')}/Disque"><button class="btn" data-act="pickRoot">${ic('folder', 'sm')} Parcourir…</button><button class="btn" data-act="addRoot">${ic('plus', 'sm')} Ajouter</button></div>
         <label class="switch" style="margin-top:12px"><input type="checkbox" data-f="show_hidden" ${s.show_hidden ? 'checked' : ''}><i></i>Afficher les fichiers cachés par défaut</label></div>
+      <div class="card" id="stIndex"><h2>${ic('search')} Recherche instantanée</h2><p class="muted" style="margin:0;font-size:13px"><span class="spinner"></span> Chargement…</p></div>
       <div class="card" id="stBureau"><h2>${ic('panel')} Bureau</h2><p class="muted" style="margin:0;font-size:13px"><span class="spinner"></span> Chargement…</p></div>
       <div class="card"><h2>${ic('save')} Sauvegarde</h2>
         <p class="muted" style="margin-top:-4px;font-size:13px">Exporte tes agents et tes prompts dans un fichier JSON (pour les garder ou les copier sur un autre PC).</p>
@@ -2314,12 +2552,48 @@ function renderSettings() {
           <dt>Lecture des PDF</dt><dd style="margin:0">${S.status?.pdftotext ? '✓ pdftotext disponible' : '✗ installe poppler-utils : <code>sudo apt install poppler-utils</code>'}</dd>
         </dl>
         <div class="row wrap" style="margin-top:12px"><button class="btn sm" data-act="checkUpdate">${ic('refresh', 'sm')} Vérifier maintenant</button>
+          <button class="btn sm" data-act="rollback" title="Si une mise à jour se passe mal : réinstalle la version d'avant, sans toucher à tes données">${ic('undo', 'sm')} Revenir à la version précédente…</button>
           <label class="switch"><input type="checkbox" data-f="maj_auto" ${s.maj_auto !== false ? 'checked' : ''}><i></i>Vérifier automatiquement (au démarrage puis toutes les 6 heures)</label></div></div>
     </div>`;
   renderRoots();
+  renderIndexCard();
   renderBureauCard();
   $('[data-f="temperature"]', v).addEventListener('input', (e) => { $('[data-tv]', v).textContent = e.target.value; });
   $('#stImport').addEventListener('change', importBackup);
+}
+// Index de recherche : Archiviste retient la liste de tes fichiers (et le texte des documents) pour répondre
+// tout de suite. Tout reste sur le PC, dans ses données.
+async function renderIndexCard() {
+  const el = $('#stIndex');
+  if (!el) return;
+  let x;
+  try { x = await api('/api/index'); } catch (e) { x = { absent: true, etat: e.message }; }
+  S.index = x;
+  const nb = (n) => (n || 0).toLocaleString('fr-FR');
+  const state = x.absent ? 'désactivé : la recherche parcourt le disque à chaque fois'
+    : !x.pret ? `première lecture de tes dossiers en cours (${nb(x.fichiers)} fichiers vus)…`
+      : `${nb(x.fichiers)} fichiers et ${nb(x.dossiers)} dossiers retenus${x.passage ? ` · vérifié ${fmtDate(x.passage)}` : ''}`;
+  const texts = x.absent ? '' : !x.plein_texte ? 'non disponible sur ce PC (SQLite sans recherche plein texte)'
+    : !x.contenu ? 'désactivé' : `${nb(x.textes)} documents lus${x.a_lire ? ` · ${nb(x.a_lire)} fichiers encore à examiner` : ''}`;
+  el.innerHTML = `<h2>${ic('search')} Recherche instantanée</h2>
+    <p class="muted" style="margin-top:-4px;font-size:13px">Archiviste retient la liste de tes fichiers dans les dossiers autorisés, et la tient à jour en arrière-plan : la recherche répond tout de suite, sur tout le dossier. Rien ne quitte ton PC.</p>
+    <dl class="muted" style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:0;font-size:13px">
+      <dt>Noms</dt><dd style="margin:0">${esc(state)}</dd>
+      ${texts ? `<dt>Contenu</dt><dd style="margin:0">${esc(texts)}</dd>` : ''}
+    </dl>
+    <div class="row wrap" style="margin-top:12px">
+      <label class="switch"><input type="checkbox" data-ix="contenu" ${S.settings.index_contenu !== false ? 'checked' : ''} ${x.absent || !x.plein_texte ? 'disabled' : ''}><i></i>Lire aussi le texte des documents (PDF, Word, Excel, notes) pour chercher dedans</label>
+      <span class="grow"></span><button class="btn sm" data-ix="refaire" ${x.absent ? 'disabled' : ''}>${ic('refresh', 'sm')} Reconstruire l'index</button></div>`;
+  el.onchange = async (e) => {
+    if (e.target.dataset.ix !== 'contenu') return;
+    try { S.settings = { ...S.settings, ...(await post('/api/settings', { index_contenu: e.target.checked })) }; toast(e.target.checked ? 'Le texte des documents va être lu en arrière-plan' : 'Le texte des documents n\'est plus lu', 'ok'); } catch (err) { toast(err.message, 'err'); }
+    setTimeout(renderIndexCard, 600);
+  };
+  el.onclick = async (e) => {
+    if (e.target.closest('[data-ix]')?.dataset.ix !== 'refaire') return;
+    try { await post('/api/index/reconstruire'); toast('Index en cours de reconstruction : la recherche reste utilisable pendant ce temps', 'ok'); } catch (err) { toast(err.message, 'err'); }
+    setTimeout(renderIndexCard, 800);
+  };
 }
 async function renderBureauCard(rapport) {
   const el = $('#stBureau');
@@ -2339,6 +2613,8 @@ async function renderBureauCard(rapport) {
     <div class="settings-grid" style="margin-top:12px">
       <label class="field"><span>Un dossier du bureau s'ouvre dans</span><select data-bf="dossiers">${[['archiviste', 'Archiviste'], ['systeme', 'Le gestionnaire de fichiers (Nemo)']].map(([k, l]) => `<option value="${k}" ${b.dossiers === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
       <label class="field"><span>Nouvelle discussion dans le volet</span><select data-bf="conv_heures">${[[1, 'Après 1 heure sans échange'], [4, 'Après 4 heures sans échange (conseillé)'], [12, 'Après 12 heures sans échange'], [24, 'Après 24 heures sans échange'], [0, 'Jamais : toujours la même discussion']].map(([k, l]) => `<option value="${k}" ${+b.conv_heures === k ? 'selected' : ''}>${l}</option>`).join('')}</select><small>Un vieux sujet ne pollue pas la question suivante. L'ancienne discussion reste dans l'onglet Discussion.</small></label>
+      <label class="field"><span>Position du volet</span><select data-bf="volet_cote">${[['droite', 'À droite de l\'écran'], ['gauche', 'À gauche de l\'écran']].map(([k, l]) => `<option value="${k}" ${(b.volet_cote || 'droite') === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      ${(b.ecrans || []).length > 1 ? `<label class="field"><span>Écran du bureau Archiviste</span><select data-bf="ecran"><option value="principal" ${b.ecran === null || b.ecran === undefined ? 'selected' : ''}>L'écran principal</option>${b.ecrans.map((e) => `<option value="${e.index}" ${b.ecran === e.index ? 'selected' : ''}>Écran ${e.index + 1} — ${esc(e.nom)} (${e.largeur} × ${e.hauteur})${e.principal ? ', principal' : ''}</option>`).join('')}</select><small>Les icônes et le volet s'affichent sur cet écran.</small></label>` : ''}
       <label class="field"><span>Fond d'écran</span><select data-bf="fond">${[['auto', 'Celui de Cinnamon (conseillé)'], ['archiviste', 'Dessiné par Archiviste (si le fond reste noir)']].map(([k, l]) => `<option value="${k}" ${b.fond === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     </div>
     <dl class="muted" style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:12px 0 0;font-size:13px">
@@ -2378,6 +2654,7 @@ function updLine() {
   if (!i) return '—';
   if (i.relancer) return `version ${esc(i.installee)} installée : relance Archiviste`;
   if (i.disponible) return `<b>version ${esc(i.derniere.version)} disponible</b>`;
+  if (i.ignoree) return `version ${esc(i.derniere.version)} mise de côté (tu en es revenu) — « Vérifier maintenant » permet d'y retourner`;
   if (i.erreur) return esc(i.erreur);
   return i.verifie ? `à jour (vérifié ${fmtDate(i.verifie)})` : 'pas encore vérifié';
 }
@@ -2419,9 +2696,18 @@ function bindSettings() {
       const i = await refreshUpdate(true);
       b.disabled = false;
       const line = $('[data-maj]', v); if (line) line.innerHTML = updLine();
+      if (i?.ignoree) {  // la version dont on est revenu : proposée seulement si on le demande
+        if (await ask(`La version ${i.derniere.version} est celle que tu as quittée en revenant à la précédente.\nL'installer quand même ?`, { ok: 'Oui, l\'installer' })) {
+          try { S.settings = { ...S.settings, ...(await post('/api/settings', { maj_ignoree: '' })) }; } catch (err) { return toast(err.message, 'err'); }
+          await refreshUpdate(true);
+          showUpdateModal();
+        }
+        return;
+      }
       if (i?.disponible || i?.relancer) showUpdateModal();
       else toast(i?.erreur || `Archiviste est à jour (${i?.actuelle || ''}).`, i?.erreur ? 'err' : 'ok');
     }
+    if (act === 'rollback') showRollbackModal();
     if (act === 'export') {
       const data = await api('/api/export');
       saveTextToFile(JSON.stringify(data, null, 2), `archiviste-agents-prompts-${stamp()}.json`);
@@ -2543,6 +2829,41 @@ function showUpdateModal() {
   });
 }
 
+// Revenir à la version précédente : réinstalle le paquet d'avant (gardé sur le PC, sinon repris sur GitHub).
+async function showRollbackModal() {
+  let p;
+  try { p = await api('/api/update/precedente'); } catch (e) { return toast(e.message, 'err'); }
+  if (!p.trouvee) return toast('Aucune version précédente n\'a été trouvée.', 'info', { timeout: 6000 });
+  const m = openModal({
+    title: `Revenir à Archiviste ${p.version}`,
+    body: `<p style="margin:0">Tu as la version <b>${esc(p.actuelle)}</b>. Archiviste va réinstaller la version <b>${esc(p.version)}</b> (${p.source === 'pc' ? 'paquet gardé sur ce PC' : 'téléchargée depuis GitHub, empreinte vérifiée'}).</p>
+      <p class="muted" style="font-size:12.5px;margin:10px 0 0">Tes fichiers, réglages, agents, prompts et discussions ne sont pas touchés. Ton mot de passe est demandé par une fenêtre de Mint. La version ${esc(p.actuelle)} ne te sera plus proposée d'office ensuite.</p>`,
+    footer: `<button class="btn" data-close>Annuler</button><button class="btn primary" data-r="go">${ic('undo', 'sm')} Revenir à la ${esc(p.version)}</button>`,
+  });
+  m.el.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-r]');
+    if (!b) return;
+    if (b.dataset.r === 'relaunch') return relaunchApp();
+    b.disabled = true;
+    b.innerHTML = '<span class="spinner"></span> Installation…';
+    let r;
+    try { r = await post('/api/update/revenir'); } catch (err) { toast(err.message, 'err'); b.disabled = false; b.innerHTML = `${ic('undo', 'sm')} Réessayer`; return; }
+    if (r.installe) {
+      await refreshUpdate();
+      m.mb.innerHTML = `<div class="banner">${ic('check')}<div><b>Archiviste ${esc(r.version)} est réinstallé.</b><br>Relance l'appli pour l'utiliser.${r.maj_auto === false ? '<br>La vérification automatique des mises à jour est coupée (cette ancienne version ne sait pas mettre une version de côté) : « Vérifier maintenant » reste disponible dans Réglages → À propos.' : ''}</div></div>`;
+      m.mf.innerHTML = `<button class="btn" data-close>Plus tard</button><button class="btn primary" data-r="relaunch">${ic('refresh', 'sm')} Relancer maintenant</button>`;
+    } else if (r.installe === false) {
+      m.mb.innerHTML = `<div class="banner danger">${ic('alert')}<div><b>${esc(r.erreur)}</b></div></div>${r.sortie ? `<details style="margin-top:10px"><summary class="muted" style="cursor:pointer;font-size:12.5px">Détails techniques</summary><pre class="pv-text" style="max-height:220px;white-space:pre-wrap">${esc(r.sortie)}</pre></details>` : ''}
+        <p class="muted" style="font-size:12.5px;margin:10px 0 0">Autre solution, dans un terminal : <code>sudo apt install --allow-downgrades ${esc(r.fichier)}</code></p>`;
+      m.mf.innerHTML = '<button class="btn" data-close>Fermer</button>';
+    } else {
+      m.mb.innerHTML = `<div class="banner">${ic('info')}<div>Paquet prêt : <code>${esc(r.fichier)}</code><br>Dans un terminal : <code>sudo apt install --allow-downgrades ${esc(r.fichier)}</code></div></div>`;
+      m.mf.innerHTML = '<button class="btn" data-close>Fermer</button>';
+    }
+  });
+  return m;
+}
+
 // ═════════════════════════════════════════════════════════════
 //  Démarrage
 // ═════════════════════════════════════════════════════════════
@@ -2563,6 +2884,11 @@ async function init() {
   bindAgents(); bindPrompts(); bindTrash(); bindSettings();
   refreshStatus();
   setInterval(() => { if (!document.hidden) refreshStatus(); }, 30000);
+  clipListener = refreshSelection;
+  clipLoad();
+  window.addEventListener('focus', clipLoad);  // ce qui a été coupé dans l'autre fenêtre (bureau ↔ fenêtre principale)
+  api('/api/index').then((x) => { S.index = x; }).catch(() => {});
+  setInterval(() => api('/api/index').then((x) => { S.index = x; }).catch(() => {}), 60000);
   refreshUpdate();
   setTimeout(refreshUpdate, 25000);
   setTimeout(refreshUpdate, 60000);

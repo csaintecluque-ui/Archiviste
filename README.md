@@ -43,8 +43,10 @@ Relancer Archiviste ramène la fenêtre existante au premier plan (une seule fen
 | Clic droit sur un élément | Ouvrir avec…, Résumer avec l'IA, En discuter, **Épingler aux raccourcis**, Renommer, Corbeille… |
 | Clic droit sur le fond | nouveau dossier / document Word / classeur / fichier texte, ranger le bureau avec l'IA, trier les icônes, masquer le volet, fond d'écran |
 | Beaucoup d'icônes | la grille s'arrête au bord du volet ; une flèche apparaît et la molette fait défiler les icônes qui restent |
-| Clavier | <kbd>Entrée</kbd> ouvrir · <kbd>F2</kbd> renommer · <kbd>Suppr</kbd> corbeille (confirmation pour un dossier ou plusieurs éléments) · <kbd>Ctrl</kbd>+<kbd>A</kbd> · flèches · taper du texte → discussion du volet |
-| Glisser-déposer | sur un dossier : déplacer (<kbd>Ctrl</kbd> : copier) · sur la corbeille · sur les raccourcis : épingler · sur la discussion : joindre · depuis Nemo : vers le bureau |
+| Clavier | <kbd>Entrée</kbd> ouvrir · <kbd>F2</kbd> renommer · <kbd>Suppr</kbd> corbeille (confirmation pour un dossier ou plusieurs éléments) · <kbd>Ctrl</kbd>+<kbd>X</kbd> couper · <kbd>Ctrl</kbd>+<kbd>C</kbd> copier · <kbd>Ctrl</kbd>+<kbd>V</kbd> coller (sur le bureau, ou dans le dossier sélectionné) · <kbd>Ctrl</kbd>+<kbd>A</kbd> · flèches · taper du texte → discussion du volet |
+| Glisser-déposer | sur un dossier : **déplacer** (<kbd>Ctrl</kbd> : copier) · sur la corbeille · sur le raccourci d'une appli : ouvrir avec elle · sur un raccourci de dossier : y ranger · ailleurs dans la colonne des raccourcis : épingler · sur la discussion : joindre · depuis Nemo ou la fenêtre principale : déplacer vers le bureau ou un de ses dossiers |
+
+Couper / copier / coller marche entre le bureau et la fenêtre principale, et un fichier coupé ou copié dans Nemo se colle dans Archiviste. (L'inverse — couper dans Archiviste, coller dans Nemo — n'est pas possible : glisse le fichier, ou colle-le depuis Archiviste.)
 
 La discussion du volet : « ouvre Grimoire », « lance Firefox », « ouvre mes téléchargements » ouvrent tout de suite (sans l'IA), même avec une faute de frappe (« ouvrr le terminale ») ; pendant que tu tapes, elle propose tes applis et tes fichiers (flèches puis <kbd>Entrée</kbd>, clic droit pour épingler) ; tout le reste part à l'Archiviste, qui peut lui aussi ouvrir des applis et des fichiers.
 
@@ -54,13 +56,25 @@ La colonne des raccourcis sert aussi de **dock** : un repère sur le raccourci i
 
 Les raccourcis sont en colonne sur le bord droit du volet, pour laisser toute la hauteur à la discussion ; s'il y en a beaucoup, la colonne défile. Clic pour ouvrir, glisser pour réordonner, clic droit pour renommer, monter, descendre ou retirer, crayon en bas de la colonne pour en retirer plusieurs, « + » pour ajouter une application (toutes celles du menu, tes favoris en premier), un dossier ou un fichier.
 
+Quand une appli a plusieurs fenêtres, le clic sur son raccourci propose de choisir laquelle ramener. Le volet peut se tenir **à gauche** de l'écran (clic droit sur le bureau → « Mettre le volet à gauche », ou **Réglages → Bureau → Position du volet**) ; avec deux écrans, **Réglages → Bureau → Écran du bureau Archiviste** choisit celui qui porte les icônes et le volet.
+
+Le bureau n'a plus besoin de guetter le disque : la fenêtre est prévenue quand le dossier Bureau, les téléchargements, la corbeille ou les clés USB changent, et les icônes suivent dans le quart de seconde.
+
 Pour revenir au bureau de Mint : **Réglages → Bureau → Rendre le bureau à Nemo**, ou dans un terminal `archiviste --sans-bureau`. Tes raccourcis sont gardés.
 
 Commandes : `archiviste` (fenêtre), `archiviste --bureau`, `archiviste --demander`, `archiviste --sans-bureau`.
 
+## Recherche, versions précédentes
+
+**Recherche instantanée.** Archiviste tient à jour, en arrière-plan, un index de tes dossiers autorisés (`~/.local/share/archiviste/index.sqlite`) : noms des fichiers, et texte des documents (PDF, Word, Excel, notes) si l'option est cochée dans **Réglages → Recherche instantanée**. La recherche de l'onglet Fichiers répond pendant que tu tapes, sur tout le dossier affiché, sans tenir compte des accents ni des majuscules ; coche « contenu » pour chercher dans le texte. <kbd>Entrée</kbd> vérifie en plus le disque avant de répondre. Les fichiers cachés ne sont pas indexés (la recherche les parcourt directement quand ils sont affichés). Rien ne quitte le PC ; « Reconstruire l'index » le refait de zéro.
+
+**Versions précédentes.** Chaque fois qu'Archiviste modifie un fichier (éditeur, agent, import qui remplace), il en garde l'état d'avant. Clic droit sur le fichier → **Versions précédentes…** (ou le bouton « Versions » de l'éditeur) : liste datée, aperçu, « Remettre ». Remettre une version garde aussi l'état remplacé. Les 300 dernières versions sont conservées (2 Go au plus). Un fichier modifié par une autre appli n'a pas de version : Archiviste ne garde que ce qu'il modifie lui-même.
+
 ## Mises à jour
 
 Archiviste vérifie les nouvelles versions sur ce dépôt au démarrage puis toutes les 6 heures. Quand il y en a une, une pastille apparaît en bas à gauche : un clic, il télécharge le paquet, **vérifie son empreinte** et l'installe (ton mot de passe est demandé par la fenêtre de Mint ; il attend si une autre installation est en cours). Il propose ensuite de redémarrer. En cas d'échec, il affiche la raison, et « Avec l'installateur de Mint » reste possible. Réglages → À propos : « Vérifier maintenant », ou désactiver la vérification automatique.
+
+**Revenir en arrière.** Si une mise à jour se passe mal : **Réglages → À propos → Revenir à la version précédente…** réinstalle la version d'avant (le paquet est gardé sur le PC, sinon repris sur ce dépôt, empreinte vérifiée). Tes réglages, agents, prompts et discussions ne sont pas touchés. La version quittée n'est plus proposée d'office ; « Vérifier maintenant » permet d'y retourner quand tu veux.
 
 Pour publier une nouvelle version : change `VERSION` dans `archiviste.py`, ajoute une section dans `NOUVEAUTES.md`, puis pousse sur `main`. GitHub lance les tests, construit le `.deb` et publie la release `vX.Y.Z` avec ces notes ; les Archiviste installés la proposent ensuite d'eux-mêmes. Sur une pull request, le `.deb` est construit pour essai (onglet Actions → Artifacts) sans être publié.
 
@@ -98,6 +112,8 @@ Pour que l'IA tourne sur ta RTX 3060 (et pas sur le processeur), installe le pil
 | L'application | `/opt/archiviste/` (installée par le paquet .deb) |
 | Tes réglages, agents, prompts, discussions, journal des tris | `~/.local/share/archiviste/` (simples fichiers JSON) |
 | Anciennes versions des fichiers modifiés | `~/.local/share/archiviste/versions/` |
+| Index de recherche (noms et texte de tes fichiers ; se reconstruit tout seul) | `~/.local/share/archiviste/index.sqlite` |
+| Paquets des dernières versions, pour pouvoir revenir en arrière | `~/.cache/archiviste/mises-a-jour/` |
 
 Sauvegarde / transfert de tes agents et prompts : **Réglages → Sauvegarde → Exporter**.
 
@@ -109,6 +125,9 @@ Sauvegarde / transfert de tes agents et prompts : **Réglages → Sauvegarde →
 | « Modèle absent » | `ollama pull qwen3.5:4b` |
 | Réponses très lentes | Vérifie `nvidia-smi` pendant une réponse : si la carte ne travaille pas, installe le pilote NVIDIA. |
 | « Recherche arrêtée… » ou « recherche incomplète » | Le dossier est trop volumineux pour être parcouru dans le temps imparti (12 s, 2,5 s depuis le volet) : ouvre un sous-dossier plus précis dans l'onglet Fichiers et relance. |
+| Un fichier récent n'apparaît pas dans la recherche | Appuie sur <kbd>Entrée</kbd> (la recherche vérifie alors le disque), ou **Réglages → Recherche instantanée → Reconstruire l'index**. Pour s'en passer : `ARCHIVISTE_SANS_INDEX=1 archiviste`. |
+| Glisser un fichier le copie au lieu de le déplacer | Corrigé en 1.5.0 (la touche <kbd>Ctrl</kbd> restait « enfoncée » pour Archiviste après un premier usage). Sans touche : déplacer ; <kbd>Ctrl</kbd> : copier. |
+| Une mise à jour pose problème | **Réglages → À propos → Revenir à la version précédente…** |
 | Un agent n'utilise pas ses outils | Petit modèle : reformule plus directement (« liste le dossier puis range les PDF dans Factures »), baisse sa température, ou choisis un modèle plus gros pour cet agent. |
 | Fenêtre blanche ou vide | Lance `archiviste` dans un terminal pour voir le message ; avec le pilote NVIDIA, essaie `WEBKIT_DISABLE_COMPOSITING_MODE=1 archiviste`. |
 | Bureau : le fond reste noir | Réglages → Bureau → Fond d'écran : « Dessiné par Archiviste ». |
@@ -124,6 +143,9 @@ Sauvegarde / transfert de tes agents et prompts : **Réglages → Sauvegarde →
 ## Pour bidouiller
 
 - `archiviste.py` — le serveur (Python, bibliothèque standard uniquement) : fichiers, corbeille, Ollama, agents et leurs outils (`TOOLS`), tri.
+- `indexeur.py` — l'index de recherche (SQLite + FTS5) : passage complet toutes les heures, passage léger toutes les 3 minutes (un `stat` par dossier), relecture immédiate des dossiers modifiés par Archiviste ou signalés par la fenêtre ; côté serveur : `fs_search()` et `_index_search()`.
+- Glisser-déposer et presse-papiers sous WebKitGTK : la page qui reçoit un fichier ne peut lire ni son emplacement ni l'état réel de la touche Ctrl. `fenetre.py` les relève donc lui-même (`on_drag_data`, `on_drag_motion`, `on_drag_drop`, `file_clipboard`) et les note auprès du serveur (`/api/glisse`, `/api/presse-papiers`) ; côté page : `dropInfo()`, `clipSet()`, `clipPaste()` dans `static/app.js`.
+- La discussion (fenêtre principale, volet, « Demander ») est rendue par un seul code : `chatHtml()`, `chatLiveTurn()`, `chatAction()` dans `static/app.js`, habillés par `MAIN_SKIN` et `VOLET_SKIN`.
 - `fenetre.py` — la fenêtre d'application (GTK 3 + WebKitGTK) qui embarque le serveur, et le suivi des fenêtres ouvertes (`SuiviFenetres`, libwnck) pour les repères du volet ; côté serveur : `window_groups()` et `window_app()` dans `archiviste.py`.
 - Documents Office : `make_docx()` (Markdown → Word) et `make_xlsx()` (tableaux Markdown → Excel) dans `archiviste.py`, vérifiés à l'ouverture dans Grimoire.
 - `construire-deb.sh` — construit `dist/archiviste_<version>_all.deb` (GitHub le fait tout seul à chaque version).

@@ -39,7 +39,7 @@ from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.4.6"
+VERSION = "1.5.0"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -53,6 +53,7 @@ MAX_ROUNDS = 12
 UPDATE_REPO = os.environ.get("ARCHIVISTE_REPO", "csaintecluque-ui/Archiviste")
 RELAUNCH_HOOK = None  # renseigné par fenetre.py : relance l'appli après une mise à jour
 MAX_VERSIONS = 300
+MAX_VERSIONS_BYTES = 2 * 1024 ** 3
 
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
         "août", "septembre", "octobre", "novembre", "décembre"]
@@ -62,6 +63,18 @@ JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"
 # ════════════════════════════════════════════════════════════════════
 #  Erreurs
 # ════════════════════════════════════════════════════════════════════
+PUSH_HOOK = None  # renseigné par fenetre.py : prévient le bureau qu'un état a changé, sans attendre son sondage
+
+
+def push(kind: str) -> None:
+    hook = PUSH_HOOK
+    if hook is not None:
+        try:
+            hook(kind)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class ApiError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -111,6 +124,8 @@ class Store:
         with self.lock:
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
             os.replace(tmp, path)
+        if name == "bureau.json" or name.startswith("conversations/"):
+            push("etat")  # raccourcis, réglages du bureau, discussion du volet : le bureau se met à jour tout de suite
 
     def update(self, name: str, default, fn):
         """Lecture, modification puis écriture d'un seul tenant : aucune autre requête ne s'intercale."""
@@ -187,6 +202,8 @@ DEFAULT_SETTINGS = {
     "show_hidden": False,
     "theme": "auto",
     "maj_auto": True,
+    "index_contenu": True,   # la recherche instantanée lit aussi le texte des documents (PDF, Word, notes…)
+    "maj_ignoree": "",       # version qu'on a quittée en revenant à la précédente : elle n'est plus proposée d'office
 }
 
 
@@ -226,6 +243,8 @@ def _save_settings(body: dict) -> dict:
     s["think"] = to_bool(s["think"])
     s["show_hidden"] = to_bool(s["show_hidden"])
     s["maj_auto"] = to_bool(s.get("maj_auto"), True)
+    s["index_contenu"] = to_bool(s.get("index_contenu"), True)
+    s["maj_ignoree"] = str(s.get("maj_ignoree") or "")[:20]
     s["prenom"] = str(s["prenom"]).strip()[:40] or "Cyril"
     roots = []
     for r in s.get("roots") or []:
@@ -321,6 +340,20 @@ def check_name(name: str) -> str:
     if len(name.encode("utf-8")) > 255:
         raise ApiError("Nom trop long.")
     return name
+
+
+def changed(*paths: str) -> None:
+    """À appeler après avoir créé, modifié, déplacé ou supprimé un élément : l'index de recherche relit
+    tout de suite son dossier (sinon il ne le verrait qu'à son prochain passage)."""
+    idx = INDEX
+    if idx is not None:
+        try:
+            idx.touch(*{os.path.dirname(p) for p in paths if p})
+        except Exception:  # noqa: BLE001 — l'index ne doit jamais faire échouer une opération sur les fichiers
+            pass
+
+
+INDEX = None  # index de recherche (indexeur.py), mis en route par prepare()
 
 
 def unique_path(path: str) -> str:
@@ -548,38 +581,142 @@ def fs_list(path: str, show_hidden: bool) -> dict:
 
 
 def backup_version(path: str) -> str | None:
+    """Copie de l'état actuel d'un fichier, avant de le modifier. Gardées : les 300 dernières, 2 Go au plus."""
     if not os.path.isfile(path):
         return None
     vdir = DATA_DIR / "versions"
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     dest = vdir / f"{stamp}__{os.path.basename(path)}"
+    k = 1
+    while dest.exists():  # deux modifications dans la même seconde : aucune ne remplace l'autre
+        k += 1
+        dest = vdir / f"{stamp}-{k}__{os.path.basename(path)}"
     shutil.copy2(path, dest)
     (vdir / f"{dest.name}.origine").write_text(path, "utf-8")
     olds = sorted(p for p in vdir.iterdir() if not p.name.endswith(".origine"))
-    for p in olds[:-MAX_VERSIONS]:
+    drop = olds[:-MAX_VERSIONS] if len(olds) > MAX_VERSIONS else []
+    keep = olds[len(drop):]
+    total = 0
+    for i in range(len(keep) - 1, -1, -1):  # des plus récentes aux plus anciennes, jusqu'à la limite de place
+        try:
+            total += keep[i].stat().st_size
+        except OSError:
+            continue
+        if total > MAX_VERSIONS_BYTES and i < len(keep) - 1:
+            drop += keep[:i + 1]
+            break
+    for p in drop:
         p.unlink(missing_ok=True)
         (vdir / f"{p.name}.origine").unlink(missing_ok=True)
     return str(dest)
 
 
-def fs_write(path: str, content: str, roots=None, base=None, mode: str = "remplacer") -> dict:
+VERSION_RE = re.compile(r"^(\d{8})-(\d{6})(?:-(\d+))?__(.+)$")
+
+
+def _version_file(vid: str) -> tuple[Path, str]:
+    """Fichier d'une ancienne version et chemin du fichier d'origine (vérifié dans les dossiers autorisés)."""
+    if "/" in vid or not VERSION_RE.match(vid or ""):
+        raise ApiError("Version invalide.", 404)
+    f = DATA_DIR / "versions" / vid
+    try:
+        orig = (DATA_DIR / "versions" / f"{vid}.origine").read_text("utf-8").strip()
+    except OSError:
+        raise ApiError("Cette version n'existe plus.", 404)
+    if not f.is_file():
+        raise ApiError("Cette version n'existe plus.", 404)
+    return f, safe_path(orig)
+
+
+def list_versions(path: str) -> dict:
+    """Anciennes versions d'un fichier, de la plus récente à la plus ancienne."""
+    real = safe_path(path)
+    vdir = DATA_DIR / "versions"
+    out = []
+    for o in vdir.glob("*.origine"):
+        vid = o.name[:-len(".origine")]
+        m = VERSION_RE.match(vid)
+        f = vdir / vid
+        try:
+            if not m or o.read_text("utf-8").strip() != real or not f.is_file():
+                continue
+            d = dt.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            out.append({"id": vid, "date": d.isoformat(timespec="seconds"), "taille": f.stat().st_size,
+                        "rang": int(m.group(3) or 1)})
+        except (OSError, ValueError):
+            continue
+    out.sort(key=lambda v: (v["date"], v["rang"]), reverse=True)
+    cur = None
+    if os.path.isfile(real):
+        st = os.stat(real)
+        cur = {"taille": st.st_size, "date": dt.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")}
+    return {"path": real, "nom": os.path.basename(real), "actuelle": cur, "versions": out}
+
+
+def restore_version(vid: str) -> dict:
+    """Remet une ancienne version à la place du fichier. L'état actuel est d'abord gardé : rien n'est perdu."""
+    f, dest = _version_file(vid)
+    if os.path.isdir(dest):
+        raise ApiError("Un dossier porte maintenant ce nom.")
+    saved = backup_version(dest) if os.path.isfile(dest) else None
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".archiviste-tmp"
+    shutil.copy2(f, tmp)
+    os.replace(tmp, dest)
+    changed(dest)
+    return {"path": dest, "version": vid, "sauvegarde": bool(saved)}
+
+
+def file_encoding(path: str) -> str:
+    """« utf-8 », ou « latin-1 » pour un vieux fichier texte (Windows, anciens logiciels) qui n'est pas en UTF-8."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(2_000_000)
+    except OSError:
+        return "utf-8"
+    for cut in (0, 1, 2, 3):  # la lecture a pu couper un caractère en deux
+        try:
+            raw[:len(raw) - cut].decode("utf-8")
+            return "utf-8"
+        except UnicodeDecodeError:
+            continue
+    return "latin-1"
+
+
+def fs_write(path: str, content: str, roots=None, base=None, mode: str = "remplacer",
+             encoding: str | None = None) -> dict:
+    """Écrit un fichier texte. Un fichier existant garde son encodage (latin-1 reste latin-1) tant que le
+    texte le permet ; sinon il passe en UTF-8, et « encodage » le dit."""
     real = safe_path(path, base=base, roots=roots)
     if os.path.isdir(real):
         raise ApiError("Impossible d'écrire : c'est un dossier.")
     existed = os.path.exists(real)
     os.makedirs(os.path.dirname(real), exist_ok=True)
+    wanted = str(encoding or (file_encoding(real) if existed else "utf-8")).lower()
+    enc = "utf-8"
+    if wanted in ("latin-1", "latin1", "iso-8859-1"):
+        try:
+            content.encode("latin-1")
+            enc = "latin-1"
+        except UnicodeEncodeError:
+            enc = "utf-8"  # un caractère absent du latin-1 (€, œ, émoji…) : on ne peut plus le garder
     version = backup_version(real) if existed else None
-    if mode == "ajouter" and existed:
-        with open(real, "a", encoding="utf-8") as f:
+    if mode == "ajouter" and existed and enc == file_encoding(real):
+        with open(real, "a", encoding=enc) as f:
             f.write(content)
     else:
+        if mode == "ajouter" and existed:  # changement d'encodage : on réécrit tout pour ne pas mélanger les deux
+            with open(real, encoding=file_encoding(real), errors="replace") as f:
+                content = f.read() + content
         tmp = real + ".archiviste-tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding=enc) as f:
             f.write(content)
         if existed:
             shutil.copymode(real, tmp)
         os.replace(tmp, real)
-    return {"path": real, "cree": not existed, "ancienne_version": version, "taille": os.path.getsize(real)}
+    changed(real)
+    return {"path": real, "cree": not existed, "ancienne_version": version, "taille": os.path.getsize(real),
+            "encodage": enc}
 
 
 def fs_mkdir(path: str, roots=None, base=None) -> dict:
@@ -589,6 +726,7 @@ def fs_mkdir(path: str, roots=None, base=None) -> dict:
             return {"path": real, "existait": True}
         raise ApiError("Un fichier porte déjà ce nom.")
     os.makedirs(real)
+    changed(real, os.path.join(real, "x"))
     return {"path": real, "existait": False}
 
 
@@ -606,9 +744,9 @@ def fs_move(src: str, dest: str, roots=None, base=None, copy: bool = False) -> d
     link = os.path.islink(s)
     if not link and os.path.isdir(s) and within(os.path.realpath(target), s):
         raise ApiError("Impossible de mettre un dossier dans lui-même.")
-    if lexical_path(target) == s:
+    if lexical_path(target) == s and not copy:
         return {"de": s, "vers": s, "inchange": True}
-    target = unique_path(target)
+    target = unique_path(target)  # copié dans son propre dossier : un double, « nom (2) »
     if copy:
         if link:
             os.symlink(link_target(s), target)
@@ -618,6 +756,7 @@ def fs_move(src: str, dest: str, roots=None, base=None, copy: bool = False) -> d
             shutil.copy2(s, target)
     else:
         move_entry(s, target)
+    changed(s, target, os.path.join(target, "x"))
     return {"de": s, "vers": target}
 
 
@@ -631,6 +770,7 @@ def fs_rename(path: str, new_name: str, roots=None, base=None) -> dict:
     if os.path.lexists(target) and target != s:
         raise ApiError(f"« {new_name} » existe déjà ici.")
     os.rename(s, target)
+    changed(s, os.path.join(target, "x"))
     return {"de": s, "vers": target}
 
 
@@ -664,6 +804,7 @@ def trash(path: str, roots=None, base=None) -> dict:
     except Exception:
         (info / f"{cand}.trashinfo").unlink(missing_ok=True)
         raise
+    changed(real)
     return {"path": real, "corbeille": cand}
 
 
@@ -715,6 +856,7 @@ def trash_restore(tid: str) -> dict:
     dest = unique_path(dest)
     shutil.move(str(f), dest)
     i.unlink(missing_ok=True)
+    changed(dest, os.path.join(dest, "x"))
     return {"restaure": dest}
 
 
@@ -748,15 +890,66 @@ def walk_files(base: str, show_hidden: bool, max_items: int = 20000, deadline: f
             count += 1
 
 
+def index_text_ok(name: str, size: int) -> bool:
+    """Documents dont l'index retient le texte : notes et textes, PDF, Word, LibreOffice, Excel, PowerPoint."""
+    ext = ext_of(name)
+    if ext == "pdf":
+        return size < 40_000_000
+    if ext in ("docx", "docm", "dotx", "odt", "ods", "odp", "ott", "xlsx", "xlsm", "pptx"):
+        return size < 25_000_000
+    return ext in TEXT_EXTS and size < 2_000_000
+
+
+def start_index() -> None:
+    """Met en route l'index de recherche (indexeur.py). Sans lui, la recherche reparcourt le disque comme avant."""
+    global INDEX
+    if INDEX is not None or os.environ.get("ARCHIVISTE_SANS_INDEX"):
+        return
+    try:
+        import indexeur
+        INDEX = indexeur.Indexeur(DATA_DIR / "index.sqlite", allowed_roots, SKIP_DIRS, extract_text, _fold,
+                                  index_text_ok, lambda: bool(get_settings().get("index_contenu", True)))
+        INDEX.start()
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        INDEX = None
+
+
+def _index_search(idx, real: str, q: str, in_content: bool, limit: int, fresh: bool) -> dict:
+    """Recherche par l'index : immédiate, sur tout le dossier. « fresh » : on vérifie d'abord (1,5 s au plus)
+    que rien n'a bougé dans ce dossier, pour trouver aussi ce qui vient d'être créé ailleurs que dans Archiviste."""
+    # bloquant pour une vraie recherche ; pour la saisie du volet (réponse immédiate), simple demande de
+    # vérification en arrière-plan, au plus toutes les 20 secondes : la frappe suivante en profite
+    a_jour = idx.refresh(real, max_age=0) if fresh else idx.refresh(real, timeout=0, max_age=20)
+    r = idx.search(real, q, contenu=in_content, limit=limit)
+    results = []
+    for path, extrait in [(p, None) for p, _ in r["noms"]] + r["textes"]:
+        try:
+            e = entry_info(path)  # tailles et dates relues sur le disque ; un élément disparu est écarté
+        except OSError:
+            continue
+        if extrait:
+            e["extrait"] = extrait
+        results.append(e)
+    cut = "limite" if r["coupe"] else ("contenu" if in_content and r["a_lire"] else None)
+    return {"base": real, "query": q, "results": results, "tronque": r["coupe"], "incomplet": cut,
+            "delai": 0, "index": True, "a_lire": r["a_lire"], "verifie": a_jour}
+
+
 def fs_search(base: str, query: str, in_content: bool, roots=None, show_hidden=False, limit=300,
-              delay: float = 12) -> dict:
-    """Cherche par nom (et dans le contenu si demandé), en un seul parcours. Si la recherche s'arrête avant
-    d'avoir tout vu, « incomplet » dit pourquoi : « temps » (délai dépassé) ou « limite » (trop de résultats)."""
+              delay: float = 12, fresh: bool = True) -> dict:
+    """Cherche par nom (et dans le contenu si demandé). Par l'index de recherche quand il est prêt (réponse
+    immédiate) ; sinon en parcourant le disque, en un seul passage. Si la recherche n'a pas tout vu,
+    « incomplet » dit pourquoi : « temps » (délai dépassé), « limite » (trop de résultats) ou « contenu »
+    (l'index n'a pas encore lu tous les documents)."""
     real = safe_path(base, roots=roots, must_exist=True)
     q = (query or "").strip()
     if not q:
         raise ApiError("Que faut-il chercher ?")
     wildcard = any(c in q for c in "*?[")
+    idx = INDEX
+    if idx is not None and not show_hidden and "[" not in q and idx.covers(real):
+        return _index_search(idx, real, q, in_content and not wildcard, limit, fresh)
     ql = q.casefold()
     match = (lambda n: fnmatch(n.casefold(), ql)) if wildcard else (lambda n: ql in n.casefold())
     results, cut, deadline = [], None, time.time() + delay
@@ -1186,10 +1379,12 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
                       **({"extrait": e["extrait"]} if e.get("extrait") else {})} for e in r["results"]]
             res = {"motif": r["query"], "nombre": len(items), "resultats": items}
             if r["incomplet"]:
-                res["incomplet"] = ("Recherche arrêtée avant la fin (dossier trop volumineux) : d'autres fichiers "
-                                    "peuvent correspondre. Cherche dans un sous-dossier plus précis."
-                                    if r["incomplet"] == "temps" else
-                                    "Seuls les premiers résultats sont listés : précise le motif.")
+                res["incomplet"] = {
+                    "temps": "Recherche arrêtée avant la fin (dossier trop volumineux) : d'autres fichiers "
+                             "peuvent correspondre. Cherche dans un sous-dossier plus précis.",
+                    "contenu": "Le texte de certains documents n'est pas encore indexé : d'autres fichiers peuvent "
+                               "contenir ce mot.",
+                }.get(r["incomplet"], "Seuls les premiers résultats sont listés : précise le motif.")
             return res, f"{len(items)} résultat(s)" + (" — recherche incomplète" if r["incomplet"] else ""), True
         if name == "infos_fichier":
             path = safe_path(a.get("chemin"), base=base, roots=roots, must_exist=True)
@@ -2039,6 +2234,7 @@ def sort_apply(body: dict) -> dict:
             target = unique_path(os.path.join(dest_dir, os.path.basename(src)))
             shutil.move(src, target)
             moves.append({"de": src, "vers": target})
+            changed(src, target, dest_dir)
         except (ApiError, OSError) as e:
             errors.append({"fichier": mv.get("path"), "erreur": str(e)})
     jid = None
@@ -2070,6 +2266,7 @@ def sort_undo(jid: str) -> dict:
                 raise ApiError("le fichier n'est plus là")
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.move(src, unique_path(dst))
+            changed(src, dst)
             ok += 1
         except (ApiError, OSError) as e:
             errors.append({"fichier": mv["vers"], "erreur": str(e)})
@@ -2460,6 +2657,7 @@ def create_office(path: str, kind: str, content: str = "", roots=None, base=None
     os.makedirs(os.path.dirname(real), exist_ok=True)
     with open(real, "wb") as f:
         f.write(data)
+    changed(real)
     return {"path": real, "kind": kind, "tableaux": len(markdown_tables(content)) if kind == "xlsx" else None}
 
 
@@ -2488,29 +2686,42 @@ def installed_version() -> str:
 def update_info() -> dict:
     lt = UPDATE_STATE["latest"]
     inst = installed_version()
+    newer = bool(lt and lt.get("deb") and parse_version(lt["version"]) > parse_version(max(VERSION, inst, key=parse_version)))
+    ignored = newer and parse_version(lt["version"]) == parse_version(get_settings().get("maj_ignoree") or "0")
     return {
         "actuelle": VERSION, "installee": inst,
-        "relancer": parse_version(inst) > parse_version(VERSION),
-        "disponible": bool(lt and lt.get("deb") and parse_version(lt["version"]) > parse_version(max(VERSION, inst, key=parse_version))),
+        "relancer": parse_version(inst) != parse_version(VERSION),  # plus récente (mise à jour) ou plus ancienne (retour)
+        "disponible": newer and not ignored,
+        "ignoree": ignored,  # c'est la version qu'on a quittée en revenant en arrière : plus proposée d'office
         "derniere": lt, "erreur": UPDATE_STATE["error"], "verifie": UPDATE_STATE["checked"],
         "depot": UPDATE_REPO, "relance_possible": RELAUNCH_HOOK is not None,
         "paquet": str(APP_DIR) == "/opt/archiviste",
     }
 
 
+def releases_api() -> str:
+    return (os.environ.get("ARCHIVISTE_MAJ_API") or f"https://api.github.com/repos/{UPDATE_REPO}/releases").rstrip("/")
+
+
+def _releases_get(path: str):
+    req = urllib.request.Request(releases_api() + path, headers={"Accept": "application/vnd.github+json",
+                                                                 "User-Agent": f"Archiviste/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _release_info(data: dict) -> dict:
+    asset = next((a for a in data.get("assets") or [] if DEB_NAME_RE.match(a.get("name", ""))), None)
+    return {"version": str(data.get("tag_name", "")).lstrip("vV"), "notes": (data.get("body") or "")[:6000],
+            "page": data.get("html_url"), "date": data.get("published_at"),
+            "deb": asset and asset.get("browser_download_url"), "nom": asset and asset.get("name"),
+            "taille": asset and asset.get("size"), "digest": asset and asset.get("digest")}
+
+
 def check_update() -> dict:
-    url = os.environ.get("ARCHIVISTE_MAJ_API") or f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
-                                               "User-Agent": f"Archiviste/{VERSION}"})
     latest, err = None, None
     try:
-        with urllib.request.urlopen(req, timeout=12) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        asset = next((a for a in data.get("assets") or [] if DEB_NAME_RE.match(a.get("name", ""))), None)
-        latest = {"version": str(data.get("tag_name", "")).lstrip("vV"), "notes": (data.get("body") or "")[:6000],
-                  "page": data.get("html_url"), "date": data.get("published_at"),
-                  "deb": asset and asset.get("browser_download_url"), "nom": asset and asset.get("name"),
-                  "taille": asset and asset.get("size"), "digest": asset and asset.get("digest")}
+        latest = _release_info(_releases_get("/latest"))
     except urllib.error.HTTPError as e:
         err = "Aucune version publiée pour l'instant." if e.code == 404 else f"GitHub a répondu {e.code}."
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
@@ -2524,18 +2735,25 @@ UPDATE_HELPER = os.environ.get("ARCHIVISTE_MAJ_HELPER") or "/usr/lib/archiviste/
 _install_lock = threading.Lock()
 
 
-def fetch_update() -> tuple[Path, dict]:
-    """Télécharge le paquet de la dernière version (ou reprend celui déjà téléchargé s'il est intact)."""
-    info = update_info() if UPDATE_STATE["latest"] else check_update()
-    lt = UPDATE_STATE["latest"]
-    if not info["disponible"]:
-        raise ApiError("Aucune mise à jour disponible.")
-    name = os.path.basename(lt["nom"] or "")
-    allowed = ("https://github.com/",) + ((os.environ["ARCHIVISTE_MAJ_DEPOT"],) if os.environ.get("ARCHIVISTE_MAJ_DEPOT") else ())
-    if not DEB_NAME_RE.match(name) or not str(lt["deb"]).startswith(allowed):
-        raise ApiError("Fichier de mise à jour inattendu : téléchargement annulé.")
+def updates_dir() -> Path:
     folder = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "archiviste" / "mises-a-jour"
     folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _deb_version(name: str) -> str | None:
+    m = re.match(r"^archiviste_([0-9][\w.+~-]*)_all\.deb$", name)
+    return m.group(1) if m else None
+
+
+def download_deb(lt: dict) -> Path:
+    """Télécharge le paquet d'une version (ou reprend celui déjà sur le PC s'il est intact) et vérifie son
+    empreinte. Les deux versions précédentes sont gardées, pour pouvoir y revenir."""
+    name = os.path.basename(lt.get("nom") or "")
+    allowed = ("https://github.com/",) + ((os.environ["ARCHIVISTE_MAJ_DEPOT"],) if os.environ.get("ARCHIVISTE_MAJ_DEPOT") else ())
+    if not DEB_NAME_RE.match(name) or not str(lt.get("deb")).startswith(allowed):
+        raise ApiError("Fichier de mise à jour inattendu : téléchargement annulé.")
+    folder = updates_dir()
     dest, tmp = folder / name, folder / (name + ".part")
     digest = str(lt.get("digest") or "")
     if dest.is_file() and digest.startswith("sha256:"):
@@ -2544,7 +2762,7 @@ def fetch_update() -> tuple[Path, dict]:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
         if h.hexdigest() == digest[7:].lower():
-            return dest, lt
+            return dest
     sha = hashlib.sha256()
     req = urllib.request.Request(lt["deb"], headers={"User-Agent": f"Archiviste/{VERSION}"})
     try:
@@ -2568,10 +2786,69 @@ def fetch_update() -> tuple[Path, dict]:
         tmp.unlink(missing_ok=True)
         raise ApiError("Le fichier téléchargé est abîmé (empreinte différente) : rien n'a été installé.")
     os.replace(tmp, dest)
-    for old in folder.glob("archiviste_*_all.deb"):
+    debs = sorted((p for p in folder.glob("archiviste_*_all.deb") if _deb_version(p.name)),
+                  key=lambda p: parse_version(_deb_version(p.name)), reverse=True)
+    for old in debs[3:]:
         if old != dest:
             old.unlink(missing_ok=True)
-    return dest, lt
+    return dest
+
+
+def fetch_update() -> tuple[Path, dict]:
+    """Télécharge le paquet de la dernière version."""
+    info = update_info() if UPDATE_STATE["latest"] else check_update()
+    lt = UPDATE_STATE["latest"]
+    if not (info["disponible"] or info["ignoree"]):
+        raise ApiError("Aucune mise à jour disponible.")
+    return download_deb(lt), lt
+
+
+def previous_release() -> dict | None:
+    """Version précédente vers laquelle on peut revenir : un paquet gardé sur le PC, sinon la dernière
+    version publiée plus ancienne que celle-ci."""
+    cur = parse_version(installed_version())
+    local = [(parse_version(v), v, p) for p in updates_dir().glob("archiviste_*_all.deb")
+             if (v := _deb_version(p.name)) and parse_version(v) < cur]
+    if local:
+        _, v, p = max(local)
+        return {"version": v, "fichier": str(p), "source": "pc"}
+    try:
+        rels = _releases_get("?per_page=20")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        raise ApiError("Pas de connexion à GitHub, et aucune version précédente gardée sur ce PC.")
+    older = [r for r in (_release_info(x) for x in rels if isinstance(x, dict) and not x.get("draft"))
+             if r["deb"] and parse_version(r["version"]) < cur]
+    if not older:
+        return None
+    best = max(older, key=lambda r: parse_version(r["version"]))
+    return {**best, "source": "github"}
+
+
+def rollback_update() -> dict:
+    """Revient à la version précédente d'Archiviste (réglages, agents, prompts et discussions sont gardés).
+    La version quittée n'est plus proposée d'office ensuite."""
+    if not _install_lock.acquire(blocking=False):
+        raise ApiError("Une installation est déjà en cours.")
+    try:
+        prev = previous_release()
+        if not prev:
+            raise ApiError("Aucune version précédente n'a été trouvée.")
+        dest = Path(prev["fichier"]) if prev["source"] == "pc" else download_deb(prev)
+        left = installed_version()
+        res = run_installer(dest)
+        if res is None:
+            opener = shutil.which("xdg-open")
+            return {"fichier": str(dest), "ouvert": bool(opener) and _launch([opener, str(dest)]), "version": prev["version"]}
+        if res["installe"]:
+            patch = {"maj_ignoree": left}
+            if parse_version(prev["version"]) < (1, 5, 0):
+                patch["maj_auto"] = False  # ces versions ne savent pas ignorer une version : on coupe la vérification
+            save_settings(patch)
+        res.update(fichier=str(dest), version=prev["version"], quittee=left, relancer=update_info()["relancer"],
+                   maj_auto=get_settings()["maj_auto"])
+        return res
+    finally:
+        _install_lock.release()
 
 
 def _apt_tail(out: str, n: int = 25) -> str:
@@ -2615,7 +2892,7 @@ def run_installer(deb: Path) -> dict | None:
             cmd = [pk, UPDATE_HELPER, copy]
         else:
             cmd = [pk, "/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", apt, "install", "-y", "--no-remove",
-                   "-o", "DPkg::Lock::Timeout=180", copy]
+                   "--allow-downgrades", "-o", "DPkg::Lock::Timeout=180", copy]
         try:
             r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1500)
         except subprocess.TimeoutExpired:
@@ -2638,6 +2915,8 @@ def download_update(mode: str = "auto") -> dict:
         if mode != "installateur":
             res = run_installer(dest)
             if res is not None:
+                if res["installe"] and get_settings().get("maj_ignoree"):
+                    save_settings({"maj_ignoree": ""})  # on a choisi d'y retourner : elle n'est plus mise de côté
                 res.update(fichier=str(dest), version=lt["version"], relancer=update_info()["relancer"])
                 return res
         opener = shutil.which("xdg-open")
@@ -2686,7 +2965,10 @@ BUREAU_DEFAUT = {
     "volet_largeur": None,     # largeur du volet en pixels (None : largeur d'origine)
     "conv_heures": 4,          # après tant d'heures sans échange, le volet repart sur une nouvelle discussion (0 : jamais)
     "conv_precedente": None,   # discussion du volet d'avant, pour « Reprendre la précédente »
+    "volet_cote": "droite",    # bord de l'écran où se tient le volet : droite | gauche
+    "ecran": None,             # écran qui porte le bureau Archiviste (None : l'écran principal)
 }
+MONITORS_HOOK = None  # renseigné par fenetre.py : liste des écrans branchés
 CONV_HEURES = (0, 1, 4, 12, 24)
 VOLET_MIN, VOLET_MAX = 440, 900
 
@@ -3357,10 +3639,11 @@ def window_groups(internal: bool = False) -> dict:
                 cls = w.get("cls") or w.get("inst") or "Fenêtre"
                 key, nom, icone, app = "win:" + cls.casefold(), cls, (w.get("inst") or cls).lower(), None
         g = groups.setdefault(key, {"cle": key, "app": app, "nom": nom, "icone": icone, "n": 0, "reduit": True,
-                                    "devant": False, "titres": [], "xids": []})
+                                    "devant": False, "titres": [], "xids": [], "fenetres": []})
         g["n"] += 1
         g["titres"].append(str(w.get("titre") or "")[:90])
         g["xids"].append(w["xid"])
+        g["fenetres"].append({"id": w["xid"], "titre": str(w.get("titre") or "")[:90], "reduit": bool(w.get("reduit"))})
         if not w.get("reduit"):
             g["reduit"] = False
     top = next((w for w in wins if not w.get("reduit")), None)
@@ -3374,8 +3657,9 @@ def window_groups(internal: bool = False) -> dict:
     return {"dispo": True, "groupes": out, "sig": sig}
 
 
-def window_action(cle: str, action: str) -> dict:
-    """basculer : ramène l'appli devant, ou la réduit si elle y est déjà (comme un dock) ; afficher, reduire, fermer."""
+def window_action(cle: str, action: str, fenetre=None) -> dict:
+    """basculer : ramène l'appli devant, ou la réduit si elle y est déjà (comme un dock) ; afficher, reduire,
+    fermer. Avec « fenetre » : seulement cette fenêtre de l'appli."""
     if WINDOWS_HOOK is None:
         return {"ok": False, "ouverte": False, "dispo": False}
     if action not in ("basculer", "afficher", "reduire", "fermer"):
@@ -3383,9 +3667,17 @@ def window_action(cle: str, action: str) -> dict:
     g = next((g for g in window_groups(internal=True)["groupes"] if g["cle"] == cle), None)
     if g is None:
         return {"ok": False, "ouverte": False, "dispo": True}
+    xids = g["xids"]
+    if fenetre is not None:
+        try:
+            xids = [x for x in xids if x == int(fenetre)]
+        except (TypeError, ValueError):
+            xids = []
+        if not xids:
+            return {"ok": False, "ouverte": False, "dispo": True}
     if action == "basculer":
         action = "reduire" if g["devant"] and not g["reduit"] else "afficher"
-    WINDOWS_HOOK.act(g["xids"], action)
+    WINDOWS_HOOK.act(xids, action)
     return {"ok": True, "ouverte": True, "dispo": True, "action": action, "nom": g["nom"]}
 
 
@@ -3505,6 +3797,44 @@ def find_icon(name: str, size: int = 48) -> str | None:
     return None
 
 
+_ICON_PATHS = {"sig": None, "paths": set(), "desk": (0.0, set())}
+
+
+def icon_path_allowed(path: str) -> bool:
+    """Une icône donnée par son chemin complet n'est servie que si elle est dans un dossier autorisé, ou si
+    c'est bien l'icône d'une appli installée ou d'un lanceur du bureau : /api/icone ne sert pas à lire
+    n'importe quelle image du disque."""
+    real = os.path.realpath(path)
+    if any(within(real, r) for r in allowed_roots()):
+        return True
+    idx = apps_index()
+    if _ICON_PATHS["sig"] != idx["sig"]:
+        paths = set()
+        for a in idx["list"] + idx["ailleurs"]:
+            for x in [a] + a.get("alts", []):
+                if os.path.isabs(x.get("icone") or ""):
+                    paths.add(os.path.realpath(x["icone"]))
+        _ICON_PATHS.update(sig=idx["sig"], paths=paths)
+    if real in _ICON_PATHS["paths"]:
+        return True
+    t, desk = _ICON_PATHS["desk"]
+    if real not in desk and time.time() - t > 1.5:  # lanceurs posés sur le bureau, ou épinglés par leur fichier
+        desk = set()
+        files = []
+        try:
+            files += [de.path for de in os.scandir(desktop_dir()) if de.name.endswith(".desktop")]
+        except OSError:
+            pass
+        files += [sc.get("cible", "") for sc in store.read("bureau.json", dict).get("raccourcis") or []
+                  if sc.get("type") == "app" and os.path.isabs(sc.get("cible", ""))]
+        for f in files:
+            ic = (read_ini_section(f) or {}).get("Icon", "")
+            if os.path.isabs(ic):
+                desk.add(os.path.realpath(ic))
+        _ICON_PATHS["desk"] = (time.time(), desk)
+    return real in desk
+
+
 ICON_HOOK = None  # renseigné par fenetre.py : même recherche d'icône que Cinnamon (Gtk.IconTheme)
 _ICON_CACHE: dict = {}
 
@@ -3520,6 +3850,8 @@ def resolve_icon(name: str, size: int) -> tuple[str | None, bytes | None]:
     path, png = None, None
     if name and "\x00" not in name:
         if os.path.isabs(name):
+            if not icon_path_allowed(name):
+                raise ApiError("Icône hors des dossiers autorisés.", 403)
             path = find_icon(name, size)
         if not path and ICON_HOOK is not None:
             r = ICON_HOOK(name, size * 2) or {}
@@ -3890,7 +4222,7 @@ def bureau_public() -> dict:
               videos=user_dir("VIDEOS", "Vidéos", "Videos"),
               home=str(HOME), touche_label=accel_label(st.get("touche")), demarrage=AUTOSTART.exists(),
               fenetre=UI_HOOK is not None, cinnamon="CINNAMON" in ":".join(CUR_DESKTOPS).upper(),
-              fenetres=WINDOWS_HOOK is not None)
+              fenetres=WINDOWS_HOOK is not None, ecrans=MONITORS_HOOK() if MONITORS_HOOK is not None else [])
     return st
 
 
@@ -4124,6 +4456,18 @@ def r_update_install(h, q, b):
     return download_update(str(b.get("mode") or "auto"))
 
 
+@route("GET", "/api/update/precedente")
+def r_update_previous(h, q, b):
+    p = previous_release()
+    return {"trouvee": bool(p), **({k: p.get(k) for k in ("version", "source", "date", "taille")} if p else {}),
+            "actuelle": installed_version()}
+
+
+@route("POST", "/api/update/revenir")
+def r_update_rollback(h, q, b):
+    return rollback_update()
+
+
 @route("POST", "/api/app/relaunch")
 def r_relaunch(h, q, b):
     if RELAUNCH_HOOK is None:
@@ -4184,7 +4528,29 @@ def r_write(h, q, b):
         raise ApiError(f"« {os.path.basename(path)} » existe déjà.")
     if b.get("create_only"):
         check_name(os.path.basename(path))
-    return fs_write(path, str(b.get("content", "")))
+    return fs_write(path, str(b.get("content", "")), encoding=b.get("encoding") or None)
+
+
+@route("GET", "/api/fs/versions")
+def r_versions(h, q, b):
+    return list_versions(q1(q, "path"))
+
+
+@route("GET", "/api/fs/versions/texte")
+def r_version_text(h, q, b):
+    f, orig = _version_file(q1(q, "id"))
+    import tempfile
+    # même lecture que pour un fichier ordinaire (PDF, Word…) : on lui rend son vrai nom le temps de la lire
+    with tempfile.TemporaryDirectory(prefix="archiviste-") as tmp:
+        link = os.path.join(tmp, os.path.basename(orig))
+        os.symlink(f, link)
+        txt, note = extract_text(link, 60000)
+    return {"id": q1(q, "id"), "content": txt, "format": note, "tronque": bool(txt and len(txt) >= 60000)}
+
+
+@route("POST", "/api/fs/versions/restaurer")
+def r_version_restore(h, q, b):
+    return restore_version(str(b.get("id") or ""))
 
 
 @route("POST", "/api/fs/mkdir")
@@ -4216,6 +4582,127 @@ def r_move(h, q, b):
     return {"ok": done, "erreurs": errors}
 
 
+# ── Couper / copier / coller : un presse-papiers de fichiers commun au bureau et à la fenêtre principale ──
+CLIP = {"paths": [], "mode": "copier"}
+CLIP_HOOK = None  # renseigné par fenetre.py : lit les fichiers copiés ou coupés ailleurs (Nemo…)
+_clip_lock = threading.Lock()
+
+
+def clip_clear() -> None:
+    """Le presse-papiers du système a changé (autre chose a été copié ailleurs) : le nôtre n'a plus cours."""
+    with _clip_lock:
+        had = bool(CLIP["paths"])
+        CLIP.update(paths=[], mode="copier")
+    if had:
+        push("presse")
+
+
+def clip_state() -> dict:
+    with _clip_lock:
+        paths = [p for p in CLIP["paths"] if os.path.lexists(p)]
+        mode = CLIP["mode"]
+    if paths:
+        return {"paths": paths, "mode": mode, "source": "archiviste"}
+    hook = CLIP_HOOK
+    if hook is not None:  # rien de coupé dans Archiviste : ce qui a été copié ou coupé dans le gestionnaire de fichiers
+        try:
+            ext = hook() or {}
+        except Exception:  # noqa: BLE001
+            ext = {}
+        roots = allowed_roots()
+        paths = []
+        for p in ext.get("paths") or []:
+            try:
+                paths.append(safe_path(p, roots=roots, must_exist=True, nofollow=True))
+            except (ApiError, OSError):
+                pass
+        if paths:
+            return {"paths": paths[:500], "mode": ext.get("mode") or "copier", "source": "systeme"}
+    return {"paths": [], "mode": "copier", "source": None}
+
+
+# Fichiers en train d'être glissés. Sous WebKitGTK, la page qui reçoit un fichier ne peut pas lire son
+# emplacement (les adresses file:// lui sont cachées) : c'est la page de départ, ou la fenêtre GTK pour un
+# fichier venu d'une autre appli (Nemo), qui le note ici ; la page d'arrivée le relit au moment du dépôt.
+#
+# Touche Ctrl : WebKitGTK donne à la page un état périmé pendant un glisser (une fois Ctrl utilisé, tous les
+# dépôts suivants se croient « avec Ctrl » et copient au lieu de déplacer). La fenêtre GTK lit donc le clavier
+# elle-même au moment du dépôt et le note ici ; la page s'y fie plutôt qu'à son propre événement.
+DRAG = {"paths": [], "t": 0.0, "ctrl": None, "tc": 0.0}
+
+
+def drag_set(paths) -> None:
+    DRAG.update(paths=[str(p) for p in (paths or []) if isinstance(p, str)][:500], t=time.time())
+
+
+def drag_key(ctrl: bool) -> None:
+    DRAG.update(ctrl=bool(ctrl), tc=time.time())
+
+
+@route("POST", "/api/glisse")
+def r_drag_set(h, q, b):
+    drag_set(b.get("paths") or [])
+    return {"ok": True}
+
+
+@route("GET", "/api/glisse")
+def r_drag_get(h, q, b):
+    now = time.time()
+    return {"paths": list(DRAG["paths"]) if now - DRAG["t"] < 180 else [],
+            "ctrl": DRAG["ctrl"] if now - DRAG["tc"] < 5 else None}  # None : pas d'info (hors de l'appli)
+
+
+@route("GET", "/api/presse-papiers")
+def r_clip_get(h, q, b):
+    return clip_state()
+
+
+@route("POST", "/api/presse-papiers")
+def r_clip_set(h, q, b):
+    mode = "couper" if b.get("mode") == "couper" else "copier"
+    roots = allowed_roots()
+    paths = []
+    for p in (b.get("paths") or [])[:500]:
+        sp = safe_path(p, roots=roots, must_exist=True, nofollow=True)
+        if mode == "couper" and is_root(sp, roots):
+            raise ApiError("On ne déplace pas un dossier racine autorisé.")
+        paths.append(sp)
+    with _clip_lock:
+        CLIP.update(paths=paths, mode=mode)
+    push("presse")
+    return {"paths": paths, "mode": mode, "source": "archiviste" if paths else None}
+
+
+@route("POST", "/api/presse-papiers/coller")
+def r_clip_paste(h, q, b):
+    dest = safe_path(b.get("dest"), must_exist=True)
+    if not os.path.isdir(dest):
+        raise ApiError("La destination doit être un dossier.")
+    st = clip_state()
+    if not st["paths"]:
+        raise ApiError("Rien à coller : coupe ou copie d'abord un fichier (Ctrl+X, Ctrl+C).")
+    cut = st["mode"] == "couper"
+    done, errors, same = [], [], 0
+    for p in st["paths"]:
+        try:
+            r = fs_move(p, dest, copy=not cut)
+            same += bool(r.get("inchange"))
+            if not r.get("inchange"):
+                done.append(r)
+        except (ApiError, OSError) as e:
+            errors.append({"path": p, "erreur": str(e)})
+    if cut and (done or same):  # coupé-collé : c'est fait, le presse-papiers est vidé (un copié reste collable ailleurs)
+        with _clip_lock:
+            CLIP.update(paths=[], mode="copier")
+        if st["source"] == "systeme" and CLIP_HOOK is not None:
+            try:
+                CLIP_HOOK(clear=True)
+            except Exception:  # noqa: BLE001
+                pass
+        push("presse")
+    return {"ok": done, "erreurs": errors, "mode": st["mode"], "deja": same}
+
+
 @route("POST", "/api/fs/trash")
 def r_trash(h, q, b):
     done, errors = [], []
@@ -4231,8 +4718,24 @@ def r_trash(h, q, b):
 def r_search(h, q, b):
     s = get_settings()
     if q1(q, "rapide") == "1":  # barre de recherche du bureau : peu de résultats, tout de suite
-        return fs_search(q1(q, "path"), q1(q, "q"), False, show_hidden=s["show_hidden"], limit=24, delay=2.5)
-    return fs_search(q1(q, "path"), q1(q, "q"), q1(q, "content") == "1", show_hidden=s["show_hidden"])
+        return fs_search(q1(q, "path"), q1(q, "q"), False, show_hidden=s["show_hidden"], limit=24, delay=2.5,
+                         fresh=False)
+    # frais=0 : recherche au fil de la frappe (réponse immédiate, sans la vérification du disque)
+    return fs_search(q1(q, "path"), q1(q, "q"), q1(q, "content") == "1", show_hidden=s["show_hidden"],
+                     fresh=q1(q, "frais") != "0")
+
+
+@route("GET", "/api/index")
+def r_index(h, q, b):
+    return INDEX.status() if INDEX is not None else {"pret": False, "etat": "désactivé", "absent": True}
+
+
+@route("POST", "/api/index/reconstruire")
+def r_index_rebuild(h, q, b):
+    if INDEX is None:
+        raise ApiError("L'index de recherche n'est pas disponible.")
+    INDEX.rebuild()
+    return INDEX.status()
 
 
 @route("GET", "/api/fs/duplicates")
@@ -4266,6 +4769,7 @@ def r_upload(h, q, b):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+    changed(target)
     return entry_info(target)
 
 
@@ -4277,7 +4781,13 @@ def r_trash_list(h, q, b):
 
 @route("POST", "/api/trash/restore")
 def r_trash_restore(h, q, b):
-    return [trash_restore(t) for t in b.get("ids") or []]
+    done, errors = [], []
+    for t in b.get("ids") or []:
+        try:
+            done.append(trash_restore(str(t)))
+        except (ApiError, OSError) as e:
+            errors.append({"id": t, "erreur": str(e)})
+    return {"ok": done, "erreurs": errors}
 
 
 @route("POST", "/api/trash/purge")
@@ -4472,6 +4982,13 @@ def r_bureau_reglages(h, q, b):
         except (TypeError, ValueError):
             w = 0
         patch["volet_largeur"] = max(VOLET_MIN, min(VOLET_MAX, w)) if w > 0 else None
+    if b.get("volet_cote") in ("droite", "gauche"):
+        patch["volet_cote"] = b["volet_cote"]
+    if "ecran" in b:
+        try:
+            patch["ecran"] = None if b["ecran"] in (None, "", "principal") else max(0, int(b["ecran"]))
+        except (TypeError, ValueError):
+            pass
     if "conv_heures" in b:
         try:
             hours = int(b["conv_heures"])
@@ -4482,6 +4999,8 @@ def r_bureau_reglages(h, q, b):
     bureau_patch(**patch)
     if "fond" in patch and UI_HOOK:
         UI_HOOK("fond", {"fond": patch["fond"]})
+    if "ecran" in patch and UI_HOOK:
+        UI_HOOK("ecran", {})
     return bureau_public()
 
 
@@ -4608,7 +5127,7 @@ def r_windows(h, q, b):
 
 @route("POST", "/api/fenetres/action")
 def r_windows_action(h, q, b):
-    return window_action(str(b.get("cle") or ""), str(b.get("action") or "basculer"))
+    return window_action(str(b.get("cle") or ""), str(b.get("action") or "basculer"), b.get("fenetre"))
 
 
 # ── Applications installées et raccourcis ──
@@ -4959,6 +5478,7 @@ def prepare() -> None:
     get_agents()
     if not os.environ.get("ARCHIVISTE_SANS_MAJ"):
         threading.Thread(target=_update_loop, name="mises-a-jour", daemon=True).start()
+    start_index()
     if bureau_state().get("actif"):  # prépare les icônes des applis pour un bureau qui s'affiche vite
         threading.Thread(target=lambda: (apps_index(), find_icon("folder")), name="icones", daemon=True).start()
 

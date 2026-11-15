@@ -13,6 +13,7 @@ const D = {
   conv: null, busy: false, ctrl: null, atts: [], editSc: false, ownFond: Q.get('fond') === '1', fondKey: '',
   cv: undefined, resizing: false, autoNew: false,
   fv: undefined, win: { dispo: false, groupes: [], map: {}, sig: '' }, scDrag: false, winDirty: false,
+  push: false, lastPoll: 0,
 };
 const IS_WRITING = () => { const a = document.activeElement; return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable); };
 const appIconUrl = (name, size = 64) => `/api/icone?t=${enc(TOKEN)}&n=${enc(name)}&s=${size}`;
@@ -121,7 +122,7 @@ async function loadElements() {
 function renderIcons() {
   $('#icons').innerHTML = D.items.map((it, i) => {
     const drag = it.type === 'entry' || it.type === 'home';
-    return `<div class="dicon ${D.sel.has(it.key) ? 'sel' : ''}" data-i="${i}" role="option" ${drag ? 'draggable="true"' : ''} title="${esc(it.path ? tildify(it.path) : it.label)}">
+    return `<div class="dicon ${D.sel.has(it.key) ? 'sel' : ''} ${it.type === 'entry' && clipCut(it.path) ? 'cut' : ''}" data-i="${i}" role="option" ${drag ? 'draggable="true"' : ''} title="${esc(it.path ? tildify(it.path) : it.label)}">
       <div class="pic">${itemPic(it)}</div><div class="lbl">${esc(it.label)}</div></div>`;
   }).join('');
   iconFades();
@@ -138,13 +139,35 @@ function iconFades() {
   $('#icPrev').hidden = !left;
   $('#icNext').hidden = !right;
 }
-function refreshSel() { $$('#icons .dicon').forEach((el) => el.classList.toggle('sel', D.sel.has(D.items[+el.dataset.i].key))); }
+function refreshSel() {
+  $$('#icons .dicon').forEach((el) => {
+    const it = D.items[+el.dataset.i];
+    el.classList.toggle('sel', D.sel.has(it.key));
+    el.classList.toggle('cut', it.type === 'entry' && clipCut(it.path));  // coupé : en attente d'être collé ailleurs
+  });
+}
+// Coller sur le bureau, ou dans un dossier du bureau
+async function pasteTo(dest = D.b.dossier) {
+  const r = await clipPaste(dest, dest === D.b.dossier ? 'sur le bureau' : null);
+  if (r?.ok.length && dest === D.b.dossier) D.sel = new Set(r.ok.map((x) => x.vers));
+  if (r) loadElements();
+}
 const selItems = () => D.items.filter((x) => D.sel.has(x.key));
 const selEntries = () => selItems().filter((x) => x.type === 'entry');
 function selectOnly(it) { D.sel = new Set(it ? [it.key] : []); D.anchor = it ? D.items.indexOf(it) : null; refreshSel(); }
 
+// Sous la fenêtre GTK, le bureau est prévenu dès qu'un dossier, un réglage ou la discussion change
+// (archivisteChange) : il n'a plus besoin de guetter toutes les 2,5 secondes, un contrôle par demi-minute suffit.
+window.archivistePousse = () => { D.push = true; };
+window.archivisteChange = (kind) => {
+  D.push = true;
+  if (kind === 'telechargements') return loadTodo();
+  if (kind === 'presse') return clipLoad();
+  return poll();
+};
 async function poll() {
   if (document.hidden) return;
+  D.lastPoll = Date.now();
   let r;
   try { r = await api('/api/bureau/sig'); } catch { return; }
   if (r.sig !== D.sig) { await loadElements(); loadTodo(); }
@@ -178,7 +201,9 @@ async function launchApp(id, nom, fichiers, fresh = false) {
   try {
     // déjà ouverte : sa fenêtre revient devant au lieu d'en lancer une autre (sauf « Nouvelle fenêtre »)
     const r = await post('/api/apps/lancer', { id, fichiers, ramener: !fresh && !fichiers?.length });
-    toast(r.ramenee ? `${nom || r.nom} est déjà ouvert : je le ramène devant` : `Lancement de ${nom || r.nom || 'l\'application'}…`);
+    toast(r.ramenee ? `${nom || r.nom} est déjà ouvert : je le ramène devant`
+      : fichiers?.length ? `Ouverture de ${fichiers.length > 1 ? `${fichiers.length} éléments` : `« ${basename(fichiers[0])} »`} avec ${nom || r.nom}…`
+        : `Lancement de ${nom || r.nom || 'l\'application'}…`);
     if (MODE === 'demander') closePopup();
     else setTimeout(loadWindows, 1200);
   } catch (e) { toast(e.message, 'err'); }
@@ -238,7 +263,7 @@ async function trashPaths(paths) {
     if (r.erreurs.length) toast(r.erreurs.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
     if (r.ok.length) {
       const ids = r.ok.map((x) => x.corbeille);
-      toast(`${r.ok.length} élément(s) mis à la corbeille`, 'ok', { label: 'Annuler', action: async () => { await post('/api/trash/restore', { ids }); loadElements(); } });
+      toast(`${r.ok.length} élément(s) mis à la corbeille`, 'ok', { label: 'Annuler', action: async () => { reportRestore(await post('/api/trash/restore', { ids })); loadElements(); } });
     }
   } catch (e) { toast(e.message, 'err'); }
   loadElements();
@@ -311,12 +336,18 @@ function itemMenu(x, y) {
       m.push('sep');
       m.push({ label: 'Épingler aux raccourcis', icon: 'star', act: () => pinEntry(e) });
     }
+    m.push({ label: 'Couper', icon: 'move', kbd: 'Ctrl+X', act: () => clipSet([e.path], 'couper') });
+    m.push({ label: 'Copier', icon: 'copy', kbd: 'Ctrl+C', act: () => clipSet([e.path], 'copier') });
+    if (e.dir && CLIP.paths.length) m.push({ label: `Coller dans ce dossier (${CLIP.paths.length})`, icon: 'download', kbd: 'Ctrl+V', act: () => pasteTo(e.path) });
     m.push({ label: 'Renommer', icon: 'pencil', kbd: 'F2', act: () => renameEntry(e) });
+    if (!e.dir && !e.lanceur) m.push({ label: 'Versions précédentes…', icon: 'undo', act: () => showVersions(e.path, loadElements) });
     m.push({ label: 'Afficher dans Archiviste', icon: 'folder', act: () => openMain({ vue: 'files', chemin: dirname(e.path), select: e.path }) });
     m.push({ label: 'Copier le chemin', icon: 'copy', act: () => copyText(e.path) });
   } else if (paths.length) {
     m.push({ label: `Ouvrir les ${paths.length} éléments`, icon: 'external', act: () => ents.forEach((it) => openFile(it.e)) });
     m.push({ label: 'En discuter (joindre)', icon: 'chat', act: () => attachToChat(paths) });
+    m.push({ label: 'Couper', icon: 'move', kbd: 'Ctrl+X', act: () => clipSet(paths, 'couper') });
+    m.push({ label: 'Copier', icon: 'copy', kbd: 'Ctrl+C', act: () => clipSet(paths, 'copier') });
     m.push({ label: 'Copier les chemins', icon: 'copy', act: () => copyText(paths.join('\n')) });
   }
   if (paths.length) {
@@ -329,6 +360,8 @@ function deskMenu(x, y) {
   const tri = D.b.tri || 'nom';
   const ck = (t) => (tri === t ? 'check' : 'vide');
   showMenu(x, y, [
+    { label: CLIP.paths.length ? `Coller sur le bureau (${CLIP.paths.length} élément${CLIP.paths.length > 1 ? 's' : ''} ${CLIP.mode === 'couper' ? 'coupé' : 'copié'}${CLIP.paths.length > 1 ? 's' : ''})` : 'Coller', icon: 'download', kbd: 'Ctrl+V', disabled: !CLIP.paths.length, act: () => pasteTo() },
+    'sep',
     { label: 'Nouveau dossier', icon: 'folderPlus', act: newFolder },
     { label: hasGrimoire() ? 'Nouveau document Word (Grimoire)' : 'Nouveau document Word', icon: 'doc', act: () => newOffice('docx', D.b.dossier).then(loadElements) },
     { label: hasGrimoire() ? 'Nouveau classeur Excel (Grimoire)' : 'Nouveau classeur Excel', icon: 'sheet', act: () => newOffice('xlsx', D.b.dossier).then(loadElements) },
@@ -342,6 +375,11 @@ function deskMenu(x, y) {
     'sep',
     { label: 'Ouvrir Archiviste', icon: 'external', act: () => openMain({}) },
     { label: D.b.volet ? 'Masquer le volet' : 'Afficher le volet', icon: 'panel', act: () => setVolet(!D.b.volet) },
+    { label: D.b.volet_cote === 'gauche' ? 'Mettre le volet à droite' : 'Mettre le volet à gauche', icon: 'move', act: () => {
+      D.b.volet_cote = D.b.volet_cote === 'gauche' ? 'droite' : 'gauche';
+      applyVolet();
+      post('/api/bureau/reglages', { volet_cote: D.b.volet_cote }).catch(() => {});
+    } },
     { label: 'Ouvrir le Bureau dans le gestionnaire de fichiers', icon: 'folder', act: () => openWithSystem(D.b.dossier) },
     'sep',
     { label: 'Changer le fond d\'écran…', icon: 'image', act: () => post('/api/systeme/reglages', { module: 'backgrounds' }).catch((e) => toast(e.message, 'err')) },
@@ -432,6 +470,11 @@ function bindDesk() {
     if (k === 'Delete' && selEntries().length) { ev.preventDefault(); trashPaths(selEntries().map((x) => x.path)); return; }
     if (k === 'Escape') { D.sel.clear(); refreshSel(); return; }
     if (ev.ctrlKey && (k === 'a' || k === 'A')) { ev.preventDefault(); D.sel = new Set(D.items.map((x) => x.key)); refreshSel(); return; }
+    if (ev.ctrlKey && 'xXcC'.includes(k) && k.length === 1) {  // couper / copier les icônes choisies (un texte sélectionné garde son Ctrl+C)
+      if (!selEntries().length || String(getSelection()).trim()) return;
+      ev.preventDefault(); clipSet(selEntries().map((x) => x.path), k.toLowerCase() === 'x' ? 'couper' : 'copier'); return;
+    }
+    if (ev.ctrlKey && (k === 'v' || k === 'V')) { ev.preventDefault(); pasteTo(one?.type === 'entry' && one.e.dir ? one.path : undefined); return; }
     if (k.startsWith('Arrow')) {
       ev.preventDefault();
       const rows = Math.max(1, Math.floor(($('#icons').clientHeight + 4) / 118));
@@ -470,30 +513,31 @@ function bindDesk() {
     if (!D.sel.has(it.key)) selectOnly(it);
     const paths = selItems().filter((x) => x.type === 'entry' || x.type === 'home').map((x) => x.path);
     if (!paths.length) return ev.preventDefault();
-    DRAG_PATHS = paths;
+    dragBegin(paths);
     try { ev.dataTransfer.setData('application/x-archiviste-paths', JSON.stringify(paths)); } catch { /* */ }
     ev.dataTransfer.setData('text/uri-list', paths.map(fileUri).join('\r\n'));
     ev.dataTransfer.setData('text/plain', paths.join('\n'));
     ev.dataTransfer.effectAllowed = 'copyMove';
   });
-  icons.addEventListener('dragend', () => { setTimeout(() => { DRAG_PATHS = null; }, 300); });
+  icons.addEventListener('dragend', dragEnd);
   const target = (ev) => {
     const el = ev.target.closest('.dicon');
     if (!el) return { el: null, dir: D.b.dossier };
     const it = D.items[+el.dataset.i];
     if (it.type === 'trash') return { el, trash: true };
     if (it.type === 'home') return { el, dir: it.path };
-    if (it.type === 'entry' && it.e.dir && !D.sel.has(it.key)) return { el, dir: it.path };
+    // un dossier choisi n'est écarté que s'il fait partie de ce qu'on glisse (pas pour un fichier venu d'ailleurs)
+    if (it.type === 'entry' && it.e.dir && !(DRAG_PATHS && D.sel.has(it.key))) return { el, dir: it.path };
     return { el: null, dir: D.b.dossier };
   };
   let lastOver = null;
-  desk.addEventListener('dragenter', (ev) => { ev.preventDefault(); ev.dataTransfer.dropEffect = ev.ctrlKey ? 'copy' : 'move'; });
+  desk.addEventListener('dragenter', (ev) => { ev.preventDefault(); ev.dataTransfer.dropEffect = dragCopy(ev) ? 'copy' : 'move'; });
   desk.addEventListener('dragover', (ev) => {
     ev.preventDefault();
     const t = target(ev);
     if (lastOver !== t.el) { lastOver?.classList.remove('drop'); t.el?.classList.add('drop'); lastOver = t.el; }
     desk.classList.toggle('drop-on', !t.el && !DRAG_PATHS);
-    ev.dataTransfer.dropEffect = ev.ctrlKey ? 'copy' : 'move';
+    ev.dataTransfer.dropEffect = dragCopy(ev) ? 'copy' : 'move';
   });
   desk.addEventListener('dragleave', (ev) => { if (ev.target === desk) { desk.classList.remove('drop-on'); lastOver?.classList.remove('drop'); lastOver = null; } });
   desk.addEventListener('drop', async (ev) => {
@@ -501,40 +545,25 @@ function bindDesk() {
     desk.classList.remove('drop-on'); lastOver?.classList.remove('drop'); lastOver = null;
     const t = target(ev);
     const dt = ev.dataTransfer;
-    const paths = dropPaths(dt);
+    const dropped = [...dt.files];  // lus tout de suite : après un « await », ils ne sont plus accessibles
+    const { paths, copy } = await dropInfo(ev);
     DRAG_PATHS = null;
     if (t.trash) return paths.length && trashPaths(paths);
     if (t.dir === D.b.dossier && paths.length && paths.every((p) => dirname(p) === D.b.dossier)) return;  // déjà sur le bureau
-    if (paths.length) {
-      const r = await movePaths(paths, t.dir, ev.ctrlKey);
+    if (paths.length) {  // glissé dans un dossier ou sur le bureau : déplacé (Ctrl : copié)
+      const r = await movePaths(paths, t.dir, copy);
       const refused = new Set((r?.erreurs || []).map((x) => basename(x.path)));
-      const files = [...dt.files].filter((f) => refused.has(f.name));
+      const files = dropped.filter((f) => refused.has(f.name));
       if (files.length) { await uploadFiles(files, t.dir); loadElements(); }
       return;
     }
-    if (dt.files.length) { await uploadFiles(dt.files, t.dir); loadElements(); }
+    if (dropped.length) { await uploadFiles(dropped, t.dir); loadElements(); }
   });
 }
 // un fichier lâché ailleurs que sur une zone prévue ne doit pas ouvrir la page du fichier
 // (WebKitGTK n'accepte un dépôt que si dropEffect est précisé à chaque survol)
 document.addEventListener('dragover', (ev) => { if (!ev.defaultPrevented) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'none'; } });
 document.addEventListener('drop', (ev) => ev.preventDefault());
-function pathsFromUris(list) {
-  return String(list || '').split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith('file://'))
-    .map((u) => { try { return decodeURIComponent(new URL(u).pathname); } catch { return null; } }).filter(Boolean);
-}
-// Chemins glissés : format interne, liste d'URI (Nemo) ou texte brut (WebKitGTK ne garde pas toujours le format interne)
-let DRAG_PATHS = null;  // glisser-déposer à l'intérieur de la page : on garde les chemins ici, sans dépendre du presse-papiers
-function dropPaths(dt) {
-  if (DRAG_PATHS && DRAG_PATHS.length) return DRAG_PATHS.slice();
-  try { const j = dt.getData('application/x-archiviste-paths'); if (j) return JSON.parse(j); } catch { /* */ }
-  let p = pathsFromUris(dt.getData('text/uri-list'));
-  if (!p.length) {
-    p = String(dt.getData('text/plain') || '').split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith('/') || l.startsWith('file://'))
-      .map((l) => (l.startsWith('file://') ? pathsFromUris(l)[0] : l)).filter(Boolean);
-  }
-  return p;
-}
 
 // ───────────────────────── Lanceur : une seule saisie pour l'IA, les applis et les fichiers ─────────────────────────
 // « ouvre Grimoire », « lance firefox », « ouvre mes téléchargements » : ouvert tout de suite, sans passer par l'IA.
@@ -822,9 +851,9 @@ function buildVolet() {
   conv.addEventListener('dragenter', convOver);
   conv.addEventListener('dragover', convOver);
   conv.addEventListener('dragleave', (ev) => { if (!conv.contains(ev.relatedTarget)) conv.classList.remove('drop-on'); });
-  conv.addEventListener('drop', (ev) => {
+  conv.addEventListener('drop', async (ev) => {
     ev.preventDefault(); conv.classList.remove('drop-on');
-    const paths = dropPaths(ev.dataTransfer);
+    const { paths } = await dropInfo(ev);
     DRAG_PATHS = null;
     if (paths.length) attachToChat(paths);
   });
@@ -835,6 +864,7 @@ function applyVolet() {
   $('#volet').hidden = !open;
   $('#voletTab').hidden = open;
   document.body.classList.toggle('volet-ferme', !open);
+  document.body.classList.toggle('volet-gauche', D.b.volet_cote === 'gauche');
   applyVoletWidth();
   if (open) scFades(); // replié, la colonne n'avait pas de hauteur : le fondu est recalculé à l'ouverture
   iconFades();
@@ -860,7 +890,8 @@ function bindVoletResize() {
   });
   window.addEventListener('mousemove', (ev) => {
     if (!drag) return;
-    drag.now = voletWidth(drag.w + (drag.x - ev.clientX));
+    const dx = D.b?.volet_cote === 'gauche' ? ev.clientX - drag.x : drag.x - ev.clientX;
+    drag.now = voletWidth(drag.w + dx);
     applyVoletWidth(drag.now);
     scFades(); iconFades();
   });
@@ -890,9 +921,12 @@ async function onVoletClick(ev) {
   if (b.dataset.sc !== undefined) {
     if (ev.target.closest('.x')) return removeShortcut(b.dataset.sc);
     if (D.editSc) return;
-    return runShortcut(D.sc.find((s) => s.id === b.dataset.sc));
+    return runShortcut(D.sc.find((s) => s.id === b.dataset.sc), false, b);
   }
-  if (b.dataset.run !== undefined) return toggleWindows(b.dataset.run);
+  if (b.dataset.run !== undefined) {
+    const g = D.win.map[b.dataset.run];
+    return g?.n > 1 ? windowsMenu(g, b) : toggleWindows(b.dataset.run);
+  }
   if (b.dataset.todo !== undefined) return openMain({ vue: 'sort', chemin: b.dataset.todo });
   if (b.dataset.chip !== undefined) return CHIPS[+b.dataset.chip].run();
   if (b.dataset.act) return chatAct(b, ev);
@@ -988,12 +1022,30 @@ async function loadWindows() {
   renderShortcuts();
 }
 window.archivisteFenetres = debounce(loadWindows, 60);  // appelé par la fenêtre GTK dès qu'une fenêtre change
-async function toggleWindows(cle, fallback, action = 'basculer') {
+async function toggleWindows(cle, fallback, action = 'basculer', fenetre = undefined) {
   let r;
-  try { r = await post('/api/fenetres/action', { cle, action }); } catch (e) { return toast(e.message, 'err'); }
+  try { r = await post('/api/fenetres/action', { cle, action, fenetre }); } catch (e) { return toast(e.message, 'err'); }
   if (!r.ouverte && fallback) return fallback();  // fermée entre-temps : on la lance
   setTimeout(loadWindows, 350);
   return null;
+}
+// Menu ouvert à côté d'un raccourci (vers l'intérieur de l'écran, que le volet soit à droite ou à gauche)
+function menuBeside(el, items) {
+  const r = el.getBoundingClientRect();
+  const m = showMenu(0, r.top, items);
+  const w = m.getBoundingClientRect().width;
+  m.style.left = `${D.b?.volet_cote === 'gauche' ? r.right + 8 : Math.max(6, r.left - w - 8)}px`;
+  return m;
+}
+// Plusieurs fenêtres pour la même appli : on choisit laquelle ramener
+function windowsMenu(g, el, fresh) {
+  const front = g.devant && !g.reduit;
+  const items = [{ header: `${g.nom} — ${g.n} fenêtres` },
+    ...(g.fenetres || []).map((w) => ({ label: w.titre || g.nom, sub: w.reduit ? 'réduite' : '', icon: 'app', act: () => toggleWindows(g.cle, null, 'afficher', w.id) })),
+    'sep',
+    { label: front ? 'Tout réduire' : 'Tout ramener devant', icon: front ? 'down' : 'up', act: () => toggleWindows(g.cle, null, front ? 'reduire' : 'afficher') }];
+  if (fresh) items.push({ label: 'Nouvelle fenêtre', icon: 'plus', act: fresh });
+  return menuBeside(el, items);
 }
 function winMenuItems(g) {
   if (!g || !g.n) return [];
@@ -1032,10 +1084,12 @@ function scFades() {
   el.classList.toggle('fade-t', el.scrollTop > 2);
   el.classList.toggle('fade-b', el.scrollTop + el.clientHeight < el.scrollHeight - 2);
 }
-function runShortcut(s, fresh = false) {
+function runShortcut(s, fresh = false, anchor = null) {
   if (!s) return null;
   if (!s.ok) return toast(`Introuvable : ${s.cible || s.titre}. Clic droit › Retirer des raccourcis.`, 'err');
-  // déjà ouverte : le clic ramène sa fenêtre devant, ou la réduit si elle y est déjà (« Nouvelle fenêtre » au clic droit)
+  // déjà ouverte : le clic ramène sa fenêtre devant, ou la réduit si elle y est déjà (« Nouvelle fenêtre » au clic droit) ;
+  // plusieurs fenêtres : on propose de choisir
+  if (!fresh && anchor && winOf(s)?.n > 1) return windowsMenu(winOf(s), anchor, s.type === 'app' ? () => runShortcut(s, true) : null);
   if (!fresh && winOf(s)?.n) return toggleWindows(winKey(s), () => runShortcut(s, true));
   if (s.type === 'archiviste') return openMain({});
   if (s.type === 'app') return s.cible.startsWith('/') ? launchLauncher(s.cible) : launchApp(s.cible, s.titre, undefined, true);
@@ -1122,6 +1176,23 @@ async function pickAppDialog() {
     ]);
   });
 }
+// Ce qu'un raccourci fait d'un fichier qu'on lâche dessus : « app » l'ouvre avec cette appli, « dossier » l'y range.
+function dropKind(t) {
+  if (!t) return null;
+  if (t.dataset.run !== undefined) return D.win.map[t.dataset.run]?.app ? 'app' : null;
+  const s = D.sc.find((x) => x.id === t.dataset.sc);
+  return s && s.ok && (s.type === 'app' || s.type === 'dossier') ? s.type : null;
+}
+async function openWithTile(t, paths) {
+  if (t.dataset.run !== undefined) { const g = D.win.map[t.dataset.run]; return launchApp(g.app, g.nom, paths); }
+  const s = D.sc.find((x) => x.id === t.dataset.sc);
+  if (!s.cible.startsWith('/')) return launchApp(s.cible, s.titre, paths);
+  try {
+    const r = await post('/api/apps/lancer', { fichier: s.cible, fichiers: paths });
+    toast(r.confiance ? `« ${s.titre} » n'a encore jamais été lancé : clique d'abord dessus une fois pour l'autoriser.` : `Ouverture avec ${s.titre}…`);
+  } catch (e) { toast(e.message, 'err'); }
+  return null;
+}
 function bindShortcutDnD() {
   const sc = $('#rail'); // toute la colonne accepte le dépôt, y compris sous le dernier raccourci
   let dragId = null;
@@ -1145,9 +1216,11 @@ function bindShortcutDnD() {
     ev.preventDefault();
     ev.dataTransfer.dropEffect = dragId ? 'move' : 'copy';
     const t = ev.target.closest('[data-sc]');
-    $$('.drag-over', sc).forEach((x) => x.classList.toggle('drag-over', x === t));
-    if (t && dragId) t.classList.add('drag-over');
-    sc.classList.toggle('drop-on', !dragId);
+    const over = dragId ? t : ev.target.closest('[data-sc], [data-run]');
+    const takes = !dragId && dropKind(over);  // un fichier survole une appli ou un dossier : il sera ouvert / rangé
+    $$('.drag-over', sc).forEach((x) => x.classList.toggle('drag-over', x === over && (dragId || takes)));
+    if (over && (dragId || takes)) over.classList.add('drag-over');
+    sc.classList.toggle('drop-on', !dragId && !takes);  // ailleurs dans la colonne : il sera épinglé
   });
   sc.addEventListener('dragleave', (ev) => { if (!sc.contains(ev.relatedTarget)) { sc.classList.remove('drop-on'); $$('.drag-over', sc).forEach((x) => x.classList.remove('drag-over')); } });
   sc.addEventListener('drop', async (ev) => {
@@ -1162,9 +1235,17 @@ function bindShortcutDnD() {
       dragId = null;
       return reorderShortcuts(ids);
     }
-    const paths = dropPaths(ev.dataTransfer);
+    const over = ev.target.closest('[data-sc], [data-run]');
+    const { paths, copy } = await dropInfo(ev);
     DRAG_PATHS = null;
     if (!paths.length) return toast('Rien à épingler : fais plutôt un clic droit sur l\'élément › Épingler aux raccourcis.');
+    const kind = dropKind(over);
+    if (kind === 'app') return openWithTile(over, paths);  // lâché sur une appli : ouvert avec elle
+    if (kind === 'dossier') {                              // lâché sur un dossier : rangé dedans (Ctrl : copié)
+      const dest = D.sc.find((x) => x.id === over.dataset.sc).cible;
+      const todo = paths.filter((p) => p !== dest && dirname(p) !== dest);
+      return todo.length ? movePaths(todo, dest, copy) : toast('Déjà dans ce dossier.');
+    }
     for (const p of paths.slice(0, 8)) {
       const it = D.items.find((x) => x.path === p);
       const e = it?.e;
@@ -1269,30 +1350,15 @@ const avatar = (a) => (a ? `<span class="av">${esc(a.icone)}</span>` : '<img src
 function attChips(list) {
   return list?.length ? `<div class="q-atts">${list.map((x) => `<span title="${esc(x.path)}">${ic(x.kind === 'folder' ? 'folder' : 'file')}${esc(x.name)}</span>`).join('')}</div>` : '';
 }
-function msgActs(i) {
-  return `<div class="acts"><button class="icon-btn sm" data-act="copy" data-m="${i}" title="Copier">${ic('copy', 'sm')}</button>${MODE === 'bureau' ? `<button class="icon-btn sm" data-act="docx" data-m="${i}" title="${hasGrimoire() ? 'Envoyer vers Grimoire (document Word)' : 'Enregistrer en document Word'}">${ic('quill', 'sm')}</button>` : ''}</div>`;
-}
-function convHtml(msgs, from = 0) {
-  const a = agentById(D.conv?.agent_id);
-  const out = [];
-  let turn = null;
-  const flush = () => { if (turn) { out.push(`<div class="a">${avatar(a)}<div class="body">${turn.join('')}</div></div>`); turn = null; } };
-  msgs.forEach((m, i) => {
-    if (i < from) return;
-    if (m.role === 'user') { flush(); out.push(attChips(m.attachments)); if (m.content) out.push(`<div class="q">${esc(m.content)}</div>`); return; }
-    if (!turn) turn = [];
-    if (m.role === 'tool') { turn.push(stepHtml({ ...m, name: m.tool_name, id: m.call_id })); return; }
-    if (m.role === 'error') { turn.push(errorHtml(m.content, i === msgs.length - 1 && m.reessayer !== false && !D.conv?.pending)); return; }
-    if (m.content) turn.push(`<div class="md">${md(m.content)}</div>${msgActs(i)}`);
-  });
-  if (D.conv?.pending?.length) {
-    if (!turn) turn = [];
-    for (const c of D.conv.pending) turn.push(stepHtml({ ...c, waiting: !!c.needs }));
-    turn.push(confirmHtml(D.conv.pending.filter((x) => x.needs)));
-  }
-  flush();
-  return out.join('');
-}
+// Habillage du volet et de « Demander » : compact, sans nom d'agent. Le rendu lui-même est celui de la fenêtre
+// principale (chatHtml, chatLiveTurn, chatAction dans app.js) : mêmes réponses, mêmes boutons, mêmes corrections.
+const VOLET_SKIN = {
+  save: false,
+  get office() { return MODE === 'bureau'; },  // la petite fenêtre « Demander » n'a pas la place d'un sélecteur de dossier
+  user: (m) => attChips(m.attachments) + (m.content ? `<div class="q">${esc(m.content)}</div>` : ''),
+  bot: (a, inner) => `<div class="a">${avatar(a)}<div class="body">${inner}</div></div>`,
+};
+const convHtml = (msgs, from = 0) => chatHtml({ ...D.conv, messages: msgs }, VOLET_SKIN, from);
 function renderConv() {
   const el = $('#vMsgs');
   if (!el) return;
@@ -1337,44 +1403,7 @@ function sendFromComposer() {
 }
 function liveTurn(container) {
   const a = agentById(D.conv?.agent_id);
-  const el = document.createElement('div');
-  el.className = 'a';
-  el.innerHTML = `${avatar(a)}<div class="body"><div class="row muted typing" style="font-size:12.5px"><span class="spinner"></span> ${esc(a?.modele || S.settings.model)} réfléchit…</div></div>`;
-  container.append(el);
-  const body = $('.body', el);
-  let seg = null;
-  let raf = 0;
-  const untype = () => $('.typing', body)?.remove();
-  const paint = () => { raf = 0; if (seg) { seg.el.innerHTML = md(seg.text); scrollMsgs(); } };
-  return {
-    on(ev) {
-      switch (ev.t) {
-        case 'content':
-          untype();
-          if (!seg) { const d = document.createElement('div'); d.className = 'md'; body.append(d); seg = { el: d, text: '' }; }
-          seg.text += ev.d;
-          if (!raf) raf = requestAnimationFrame(paint);
-          break;
-        case 'message_end': if (seg) paint(); seg = null; break;
-        case 'tool_call':
-          untype();
-          body.insertAdjacentHTML('beforeend', stepHtml({ id: ev.id, name: ev.name, description: ev.description, pending: !ev.needs_confirm, waiting: ev.needs_confirm }));
-          scrollMsgs(); break;
-        case 'tool_result': {
-          const old = $(`.step[data-step="${CSS.escape(ev.id)}"]`, container);
-          const html = stepHtml({ id: ev.id, name: ev.name, description: old ? $('.desc', old).textContent : '', ok: ev.ok, refuse: ev.refuse, summary: ev.summary });
-          if (old) old.outerHTML = html; else body.insertAdjacentHTML('beforeend', html);
-          scrollMsgs(); break;
-        }
-        case 'confirm': untype(); body.insertAdjacentHTML('beforeend', confirmHtml(ev.pending)); scrollMsgs(true); break;
-        case 'notice': body.insertAdjacentHTML('beforeend', `<div class="notice">${esc(ev.d)}</div>`); break;
-        case 'error': untype(); body.insertAdjacentHTML('beforeend', errorHtml(ev.d, false)); scrollMsgs(true); break;
-        default: break;
-      }
-      reportSize();
-    },
-    error(msg) { untype(); body.insertAdjacentHTML('beforeend', errorHtml(msg, false)); },
-  };
+  return chatLiveTurn(container, VOLET_SKIN, { agent: a, model: D.conv?.modele || a?.modele || S.settings.model, scroll: scrollMsgs, onChange: reportSize });
 }
 function setVBusy(on) {
   D.busy = on;
@@ -1417,7 +1446,7 @@ async function sendChat({ text = '', atts = [], decisions = null, regenerate = f
       container.insertAdjacentHTML('beforeend', attChips(atts.map((p) => ({ path: p, name: basename(p), kind: 'file' }))) + (text ? `<div class="q">${esc(text)}</div>` : ''));
     }
     if (decisions) { body.decisions = decisions; $$('.confirm-card', container).forEach((x) => x.remove()); }
-    if (regenerate) { body.regenerate = true; $$('.err-box', container).pop()?.remove(); }
+    if (regenerate) { body.regenerate = true; $$('.a', container).pop()?.remove(); }  // la réponse (ou l'erreur) qu'on refait
     live = liveTurn(container);
     scrollMsgs(true);
     D.ctrl = new AbortController();
@@ -1443,26 +1472,7 @@ async function sendChat({ text = '', atts = [], decisions = null, regenerate = f
   }
   return null;
 }
-function chatAct(b) {
-  const act = b.dataset.act;
-  const seg = b.closest('.seg');
-  const card = b.closest('.confirm-card');
-  const text = () => D.conv?.messages?.[+b.dataset.m]?.content || '';
-  if (act === 'copy') return copyText(text());
-  if (act === 'retry') return sendChat({ regenerate: true });
-  if (act === 'docx') return sendToOffice(text(), 'docx', D.conv?.titre);
-  if (act === 'cfYes' || act === 'cfNo') { $$('button', seg).forEach((x) => x.classList.toggle('on', x === b)); return null; }
-  if (act === 'cfAll' || act === 'cfNone') {
-    $$('.confirm-item', card).forEach((it) => { $('.yes', it).classList.toggle('on', act === 'cfAll'); $('.no', it).classList.toggle('on', act === 'cfNone'); });
-  }
-  if (['cfSend', 'cfAll', 'cfNone'].includes(act)) {
-    const decisions = {};
-    $$('.confirm-item', card).forEach((it) => { decisions[it.dataset.id] = $('.yes', it).classList.contains('on'); });
-    $$('button', card).forEach((x) => { x.disabled = true; });
-    return sendChat({ decisions });
-  }
-  return null;
-}
+const chatAct = (b) => chatAction(b, { conv: () => D.conv, send: sendChat });
 
 // ───────────────────────── Fenêtre « Demander » (Super + Espace) ─────────────────────────
 function postToGtk(msg) { try { window.webkit.messageHandlers.archiviste.postMessage(JSON.stringify(msg)); } catch { /* hors de la fenêtre GTK */ } }
@@ -1531,6 +1541,9 @@ async function initBureau() {
     return;
   }
   S.home = S.settings.home;
+  clipListener = refreshSel;
+  clipLoad();
+  window.addEventListener('focus', clipLoad);
   refreshVStatus();
   if (MODE === 'demander') {
     const inp = $('#askIn');
@@ -1551,7 +1564,7 @@ async function initBureau() {
   loadWindows();
   try { D.rv = (await api('/api/bureau/sig')).rv; } catch { /* */ }
   loadApps();
-  setInterval(poll, 2500);
+  setInterval(() => { if (!D.push || Date.now() - D.lastPoll >= 30000) poll(); }, 2500);
   setInterval(() => { if (!document.hidden) refreshVStatus(); }, 60000);
   setInterval(loadTodo, 5 * 60000);
   setInterval(applyFond, 60000);

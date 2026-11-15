@@ -1,8 +1,24 @@
 """Faux serveur Ollama pour tester Archiviste sans GPU."""
-import json, re, sys, time
+import hashlib, json, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 11434
+
+
+# Faux dépôt de versions (GitHub) : une plus récente que n'importe quelle vraie, deux plus anciennes.
+def deb(version):
+    return b"!<arch>\n" + f"faux paquet archiviste {version}".encode()
+
+
+def release(version):
+    name = f"archiviste_{version}_all.deb"
+    return {"tag_name": "v" + version, "body": f"Notes de la version {version}", "html_url": "http://exemple.invalid/" + version,
+            "published_at": "2026-01-01T00:00:00Z", "draft": False,
+            "assets": [{"name": name, "size": len(deb(version)), "digest": "sha256:" + hashlib.sha256(deb(version)).hexdigest(),
+                        "browser_download_url": f"http://127.0.0.1:{PORT}/maj/paquets/{name}"}]}
+
+
+RELEASES = ["9.9.9", "1.0.0", "0.5.0"]
 
 
 class H(BaseHTTPRequestHandler):
@@ -32,6 +48,19 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(d)
 
     def do_GET(self):
+        if self.path == "/maj/releases/latest":
+            return self.j(release(RELEASES[0]))
+        if self.path.startswith("/maj/releases"):
+            return self.j([release(v) for v in RELEASES])
+        m = re.match(r"^/maj/paquets/archiviste_([0-9.]+)_all\.deb$", self.path)
+        if m and m.group(1) in RELEASES:
+            d = deb(m.group(1))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.debian.binary-package")
+            self.send_header("Content-Length", str(len(d)))
+            self.end_headers()
+            self.wfile.write(d)
+            return None
         if self.path == "/api/version":
             return self.j({"version": "0.13.0-mock"})
         if self.path == "/api/tags":
