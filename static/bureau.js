@@ -789,6 +789,7 @@ function applyVolet() {
   $('#volet').hidden = !open;
   $('#voletTab').hidden = open;
   document.body.classList.toggle('volet-ferme', !open);
+  if (open) scFades(); // replié, la colonne n'avait pas de hauteur : le fondu est recalculé à l'ouverture
 }
 function setVolet(open) {
   D.b.volet = open;
