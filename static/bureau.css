@@ -236,6 +236,9 @@ body.volet-resize, body.volet-resize * { cursor: ew-resize !important; }
 /* ── notifications, menus, fenêtres sur le bureau ── */
 .bureau-page #toasts { right: calc(var(--mr) + var(--vwr) + 10px); bottom: calc(var(--mb) + 18px); }
 .bureau-page .toast { background: rgba(28, 21, 17, .94); color: #f1e6d4; }
+.bureau-page .tache { background: rgba(28, 21, 17, .95); color: #f1e6d4; border-color: rgba(234, 217, 184, .14); }
+.bureau-page .tache .tk-sub { color: rgba(241, 230, 212, .65); }
+.bureau-page .tk-bar { background: rgba(255, 255, 255, .1); }
 .bureau-page .menu { background: rgba(28, 21, 17, .97); border-color: rgba(234, 217, 184, .16); color: #f1e6d4; }
 .bureau-page .menu button { color: #f1e6d4; }
 .bureau-page .menu .ck { width: 16px; text-align: center; color: #e09a68; }

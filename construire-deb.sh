@@ -14,7 +14,7 @@ mkdir -p "$PKG/DEBIAN" "$PKG/opt/archiviste" "$PKG/usr/bin" "$PKG/usr/share/appl
          "$PKG/usr/share/doc/archiviste" "$PKG/usr/share/icons/hicolor/scalable/apps"
 
 # Application
-cp archiviste.py fenetre.py indexeur.py "$PKG/opt/archiviste/"
+cp archiviste.py fenetre.py indexeur.py archives.py "$PKG/opt/archiviste/"
 cp -r static "$PKG/opt/archiviste/static"
 find "$PKG/opt/archiviste" -type d -exec chmod 755 {} +
 find "$PKG/opt/archiviste" -type f -exec chmod 644 {} +
@@ -45,10 +45,11 @@ Type=Application
 Name=Archiviste
 GenericName=Fichiers et IA locale
 Comment=Gérer, trier et modifier tes fichiers avec ton IA locale (Ollama)
-Exec=archiviste
+Exec=archiviste %U
 Icon=archiviste
 Terminal=false
 Categories=Utility;FileManager;
+MimeType=inode/directory;
 Keywords=fichiers;tri;ia;ollama;qwen;agents;prompts;
 StartupWMClass=archiviste
 StartupNotify=true
