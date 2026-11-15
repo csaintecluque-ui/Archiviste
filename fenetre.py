@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import urllib.parse
 from pathlib import Path
 
@@ -44,6 +45,11 @@ try:
     from gi.repository import GdkX11
 except (ImportError, ValueError):
     GdkX11 = None
+try:  # suivi des fenêtres ouvertes (repères sur les raccourcis du volet) : facultatif
+    gi.require_version("Wnck", "3.0")
+    from gi.repository import Wnck
+except (ImportError, ValueError):
+    Wnck = None
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -174,6 +180,120 @@ def icon_lookup(name: str, size: int) -> dict:
     GLib.idle_add(work)
     done.wait(3)
     return out
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Fenêtres ouvertes sur le bureau (libwnck, X11)
+# ════════════════════════════════════════════════════════════════════
+class SuiviFenetres:
+    """Sait quelles applis ont une fenêtre ouverte, réduite ou devant, et peut les ramener, les réduire ou les
+    fermer : le volet du bureau s'en sert comme d'un dock (repère sur le raccourci, clic pour ramener ou réduire).
+    Tout se passe dans la boucle GTK ; le serveur ne lit que la dernière photo (snapshot), sans attendre."""
+
+    def __init__(self, on_change, x_time):
+        self.version = 0
+        self._snap: list[dict] = []
+        self._recent: list[int] = []   # identifiants X, de la fenêtre la plus récemment active à la plus ancienne
+        self._watched: set[int] = set()
+        self._timer = 0
+        self._on_change = on_change
+        self._x_time = x_time
+        # « pager » : nos demandes sont traitées comme celles d'une barre des tâches (pas d'anti-vol de focus)
+        Wnck.set_client_type(Wnck.ClientType.PAGER)
+        self.screen = Wnck.Screen.get_default()
+        if self.screen is None:
+            raise RuntimeError("écran X11 introuvable")
+        self.screen.connect("window-opened", self._opened)
+        self.screen.connect("window-closed", self._later)
+        self.screen.connect("active-window-changed", self._active)
+        self.screen.force_update()
+        self._recent = [w.get_xid() for w in reversed(self.screen.get_windows_stacked()) if self._shown(w)]
+        for w in self.screen.get_windows():
+            self._watch(w)
+        self._rebuild()
+
+    @staticmethod
+    def _shown(w) -> bool:
+        """Une fenêtre « de barre des tâches » : normale, pas le bureau, pas un panneau, pas une boîte flottante."""
+        return w.get_window_type() == Wnck.WindowType.NORMAL and not w.is_skip_tasklist()
+
+    def _watch(self, w) -> None:
+        xid = w.get_xid()
+        if xid in self._watched:
+            return
+        self._watched.add(xid)
+        for sig in ("state-changed", "name-changed", "class-changed", "type-changed"):
+            try:
+                w.connect(sig, self._later)
+            except TypeError:
+                pass  # signal absent de cette version de libwnck
+
+    def _opened(self, screen, w) -> None:
+        self._watch(w)
+        self._later()
+
+    def _active(self, *args) -> None:
+        w = self.screen.get_active_window()
+        if w is not None and self._shown(w):
+            xid = w.get_xid()
+            if not self._recent or self._recent[0] != xid:
+                self._recent = [xid] + [x for x in self._recent if x != xid]
+        self._later()
+
+    def _later(self, *args) -> None:
+        if not self._timer:
+            self._timer = GLib.timeout_add(120, self._rebuild)
+
+    def _rebuild(self) -> bool:
+        self._timer = 0
+        try:
+            wins = {w.get_xid(): w for w in self.screen.get_windows() if self._shown(w)}
+            self._watched &= {w.get_xid() for w in self.screen.get_windows()}
+            self._recent = [x for x in self._recent if x in wins] + [x for x in wins if x not in self._recent]
+            me = os.getpid()
+            snap = []
+            for xid in self._recent:
+                w = wins[xid]
+                snap.append({"xid": xid, "titre": w.get_name() or "", "cls": w.get_class_group_name() or "",
+                             "inst": w.get_class_instance_name() or "", "pid": w.get_pid() or 0,
+                             "reduit": bool(w.is_minimized()), "soi": w.get_pid() == me})
+            if snap != self._snap:
+                self._snap = snap  # remplacé d'un coup : lisible sans verrou depuis les requêtes du serveur
+                self.version += 1
+                self._on_change()
+        except Exception:  # noqa: BLE001 — un souci de suivi ne doit jamais gêner le bureau
+            traceback.print_exc()
+        return False
+
+    def snapshot(self) -> list[dict]:
+        return list(self._snap)
+
+    def act(self, xids, action: str) -> None:
+        """afficher, reduire ou fermer ces fenêtres (appelé depuis le serveur : exécuté dans la boucle GTK)."""
+        GLib.idle_add(self._act, list(xids), action)
+
+    def _act(self, xids: list, action: str) -> bool:
+        try:
+            ts = self._x_time()
+            wins = {w.get_xid(): w for w in self.screen.get_windows()}
+            targets = [wins[x] for x in xids if x in wins]
+            if action == "reduire":
+                for w in targets:
+                    w.minimize()
+            elif action == "fermer":
+                for w in targets:
+                    w.close(ts)
+            else:  # afficher : la plus récente en dernier, pour qu'elle finisse devant les autres
+                for w in reversed(targets):
+                    ws = w.get_workspace()
+                    if ws is not None and ws != self.screen.get_active_workspace():
+                        ws.activate(ts)
+                    if w.is_minimized():
+                        w.unminimize(ts)
+                    w.activate(ts)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -491,6 +611,7 @@ class Application(Gtk.Application):
         self.demande = None
         self.base = None
         self.ctx = None
+        self.suivi = None
         for name, desc in (("bureau", "Afficher le bureau Archiviste"),
                            ("demander", "Ouvrir « Demander à l'Archiviste »"),
                            ("fenetre", "Ouvrir la fenêtre principale"),
@@ -507,6 +628,7 @@ class Application(Gtk.Application):
         A.RELAUNCH_HOOK = lambda: GLib.idle_add(self.relaunch)
         A.UI_HOOK = lambda action, data=None: GLib.idle_add(self.on_ui, action, data or {})
         A.ICON_HOOK = icon_lookup
+        self.start_window_tracking()
         cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "archiviste"
         wdm = WebKit2.WebsiteDataManager(base_data_directory=str(A.DATA_DIR / "webkit"),
                                          base_cache_directory=str(cache / "webkit"))
@@ -514,6 +636,31 @@ class Application(Gtk.Application):
         self.ctx.connect("download-started", self.on_download)
         if os.environ.get("ARCHIVISTE_DEBUG"):
             print(f"Archiviste {A.VERSION} — {self.base}", flush=True)
+
+    # ── fenêtres ouvertes : repères « appli ouverte » du volet ──
+    def start_window_tracking(self) -> None:
+        """Facultatif : sans libwnck (paquet gir1.2-wnck-3.0) ou hors X11, le volet marche comme avant."""
+        disp = Gdk.Display.get_default()
+        if Wnck is None or GdkX11 is None or not isinstance(disp, GdkX11.X11Display):
+            return
+        try:
+            self.suivi = SuiviFenetres(self.on_windows_changed, self.x_time)
+            A.WINDOWS_HOOK = self.suivi
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            self.suivi = None
+
+    def x_time(self) -> int:
+        """Heure du serveur X, exigée par le gestionnaire de fenêtres pour accepter de ramener une fenêtre."""
+        for win in (self.bureau, self.window, self.demande):
+            gw = win.get_window() if win is not None else None
+            if gw is not None and isinstance(gw, GdkX11.X11Window):
+                return GdkX11.x11_get_server_time(gw)
+        return Gtk.get_current_event_time()
+
+    def on_windows_changed(self) -> None:
+        if self.bureau is not None:
+            self.bureau.run_js("window.archivisteFenetres && archivisteFenetres()")
 
     def set_icon(self, win: Gtk.Window) -> None:
         icon = HERE / "static" / "icon-512.png"

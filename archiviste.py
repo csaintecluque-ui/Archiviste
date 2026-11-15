@@ -1256,6 +1256,9 @@ def execute_tool(name: str, args: dict, ctx: dict) -> tuple[dict, str, bool]:
                 msg = f"Aucune application installée ne s'appelle « {a.get('nom', '')} »."
                 return ({"erreur": msg, "applications_proches": proches},
                         msg + (f" Proches : {', '.join(proches)}" if proches else ""), False)
+            if raise_app(app["id"]):
+                return ({"application": app["nom"], "deja_ouverte": True, "affichee": True},
+                        f"Déjà ouverte, ramenée devant : {app['nom']}", True)
             launch_app(app)
             return {"application": app["nom"], "lancee": True}, f"Lancée : {app['nom']}", True
         if name == "ouvrir":
@@ -2866,7 +2869,8 @@ def app_info(aid: str, path: str, e: dict) -> dict:
     return {"id": aid, "nom": desk_val(e, "Name") or aid[:-8], "generique": desk_val(e, "GenericName"),
             "description": desk_val(e, "Comment"), "icone": e.get("Icon", ""), "fichier": path,
             "categories": desk_list(e, "Categories"), "mots": desk_list(e, "Keywords", True),
-            "mime": desk_list(e, "MimeType"), "exec": e.get("Exec", ""), "terminal": to_bool(e.get("Terminal"))}
+            "mime": desk_list(e, "MimeType"), "exec": e.get("Exec", ""), "terminal": to_bool(e.get("Terminal")),
+            "wmclass": e.get("StartupWMClass", "")}
 
 
 def public_app(a: dict) -> dict:
@@ -3247,6 +3251,150 @@ def apps_for(path: str) -> dict:
         apps += [a for a in idx["list"] if "text/plain" in a["mime"] and a not in apps]
     apps.sort(key=lambda a: (a["id"] != defaut, a["nom"].casefold()))
     return {"mime": mime, "defaut": defaut if defaut in idx["by_id"] else None, "apps": [public_app(a) for a in apps]}
+
+
+# ── fenêtres ouvertes (le volet sert de dock : repère « appli ouverte », ramener ou réduire d'un clic) ──
+WINDOWS_HOOK = None  # renseigné par fenetre.py : suivi des fenêtres du bureau — .version, .snapshot(), .act(xids, action)
+_GENERIC_CMDS = {"env", "sh", "bash", "dash", "python", "python3", "flatpak", "snap", "gtk-launch", "xdg-open",
+                 "electron", "java", "wine", "node", "perl", "ruby", "exo-open", "gio", "pkexec", "sudo"}
+
+
+def _proc_names(pid) -> set[str]:
+    """Noms sous lesquels tourne un processus (exécutable, premiers arguments), pour le rattacher à une appli."""
+    out = set()
+    try:
+        out.add(os.path.basename(os.readlink(f"/proc/{int(pid)}/exe")))
+    except (OSError, TypeError, ValueError):
+        pass
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            args = f.read(4096).split(b"\0")
+        for a in args[:2]:
+            a = a.decode("utf-8", "replace")
+            if a and not a.startswith("-"):
+                out.add(os.path.basename(a))
+    except (OSError, TypeError, ValueError):
+        pass
+    return {_compact(_fold(n)) for n in out if n and n.lower() not in _GENERIC_CMDS} - {""}
+
+
+def _app_wm_names(a: dict) -> tuple[str, str, str]:
+    """Nom du fichier .desktop (entier et dernier segment) et commande, réduits à leurs lettres et chiffres."""
+    aid = os.path.basename(a["id"])
+    stem = aid[:-8] if aid.endswith(".desktop") else aid
+    cmd = _exec_cmd(a)
+    return (_compact(_fold(stem)), _compact(_fold(stem.rsplit(".", 1)[-1])),
+            "" if cmd.lower() in _GENERIC_CMDS else _compact(_fold(cmd)))
+
+
+def window_app(win: dict, cands: list[dict]) -> dict | None:
+    """Appli (.desktop) à laquelle appartient une fenêtre, d'après sa classe X11, comme le fait une barre des
+    tâches : StartupWMClass d'abord, puis nom du fichier .desktop, commande, processus, enfin début de nom commun."""
+    cls, inst = _fold(win.get("cls") or ""), _fold(win.get("inst") or "")
+    ccls, cinst = _compact(cls), _compact(inst)
+    if not (ccls or cinst):
+        return None
+    procs = None
+    best, best_score = None, 99.0
+    for a in cands:
+        wc = _fold(a.get("wmclass") or "")
+        stem, last, cmd = _app_wm_names(a)
+        if wc and wc in (cls, inst):
+            score = 0
+        elif ccls and ccls in (stem, last):
+            score = 1
+        elif cinst and cinst in (stem, last):
+            score = 2
+        elif cmd and cmd == ccls:
+            score = 3
+        elif cmd and cmd == cinst:
+            score = 4
+        else:
+            if procs is None:
+                procs = _proc_names(win.get("pid")) if win.get("pid") else set()
+            if cmd and cmd in procs:
+                score = 5
+            else:
+                score = None
+                for k in {stem, last, cmd} - {""}:
+                    for c in {ccls, cinst} - {""}:
+                        short, long_ = sorted((k, c), key=len)
+                        if len(short) >= 4 and long_.startswith(short):
+                            sc = 6 + (len(long_) - len(short)) / 100
+                            score = sc if score is None else min(score, sc)
+                if score is None:
+                    continue
+        if score < best_score:
+            best, best_score = a, score
+    return best
+
+
+def window_groups(internal: bool = False) -> dict:
+    """Fenêtres ouvertes, regroupées par appli, de la plus récemment utilisée à la plus ancienne.
+    Clés : « app:<id du raccourci> », « archiviste » (la fenêtre principale), « win:<classe> » (appli inconnue)."""
+    hook = WINDOWS_HOOK
+    if hook is None:
+        return {"dispo": False, "groupes": [], "sig": ""}
+    wins = hook.snapshot()
+    idx = apps_index()
+    pinned = []
+    for sc in store.read("bureau.json", dict).get("raccourcis") or []:  # lanceurs épinglés par leur fichier
+        c = sc.get("cible", "")
+        if sc.get("type") == "app" and os.path.isabs(c):
+            e = read_ini_section(c)
+            if e:
+                pinned.append(app_info(c, c, e))
+    cands = pinned + idx["list"] + idx["ailleurs"]
+    groups: dict[str, dict] = {}
+    for w in wins:
+        if w.get("soi"):
+            key, nom, icone, app = "archiviste", "Archiviste", "", None
+        else:
+            a = window_app(w, cands)
+            if a:
+                key, nom, icone, app = "app:" + a["id"], a["nom"], a["icone"], a["id"]
+            else:
+                cls = w.get("cls") or w.get("inst") or "Fenêtre"
+                key, nom, icone, app = "win:" + cls.casefold(), cls, (w.get("inst") or cls).lower(), None
+        g = groups.setdefault(key, {"cle": key, "app": app, "nom": nom, "icone": icone, "n": 0, "reduit": True,
+                                    "devant": False, "titres": [], "xids": []})
+        g["n"] += 1
+        g["titres"].append(str(w.get("titre") or "")[:90])
+        g["xids"].append(w["xid"])
+        if not w.get("reduit"):
+            g["reduit"] = False
+    top = next((w for w in wins if not w.get("reduit")), None)
+    if top is not None:
+        next(g for g in groups.values() if top["xid"] in g["xids"])["devant"] = True
+    out = list(groups.values())
+    sig = hashlib.sha1(json.dumps([[g["cle"], g["n"], g["reduit"], g["devant"], g["titres"]] for g in out])
+                       .encode()).hexdigest()[:12]
+    if not internal:
+        out = [{k: v for k, v in g.items() if k != "xids"} for g in out]
+    return {"dispo": True, "groupes": out, "sig": sig}
+
+
+def window_action(cle: str, action: str) -> dict:
+    """basculer : ramène l'appli devant, ou la réduit si elle y est déjà (comme un dock) ; afficher, reduire, fermer."""
+    if WINDOWS_HOOK is None:
+        return {"ok": False, "ouverte": False, "dispo": False}
+    if action not in ("basculer", "afficher", "reduire", "fermer"):
+        raise ApiError("Action inconnue.")
+    g = next((g for g in window_groups(internal=True)["groupes"] if g["cle"] == cle), None)
+    if g is None:
+        return {"ok": False, "ouverte": False, "dispo": True}
+    if action == "basculer":
+        action = "reduire" if g["devant"] and not g["reduit"] else "afficher"
+    WINDOWS_HOOK.act(g["xids"], action)
+    return {"ok": True, "ouverte": True, "dispo": True, "action": action, "nom": g["nom"]}
+
+
+def raise_app(app_id: str) -> bool:
+    """Si l'appli est déjà ouverte, ramène sa fenêtre devant (au lieu d'en lancer une autre). Vrai si c'est fait."""
+    try:
+        return bool(window_action("app:" + app_id, "afficher").get("ouverte"))
+    except Exception:  # noqa: BLE001 — le suivi des fenêtres ne doit jamais empêcher de lancer une appli
+        return False
 
 
 # ── icônes du thème (Mint-Y…) ──
@@ -3741,7 +3889,8 @@ def bureau_public() -> dict:
               images=user_dir("PICTURES", "Images", "Pictures"), musique=user_dir("MUSIC", "Musique", "Music"),
               videos=user_dir("VIDEOS", "Vidéos", "Videos"),
               home=str(HOME), touche_label=accel_label(st.get("touche")), demarrage=AUTOSTART.exists(),
-              fenetre=UI_HOOK is not None, cinnamon="CINNAMON" in ":".join(CUR_DESKTOPS).upper())
+              fenetre=UI_HOOK is not None, cinnamon="CINNAMON" in ":".join(CUR_DESKTOPS).upper(),
+              fenetres=WINDOWS_HOOK is not None)
     return st
 
 
@@ -4357,7 +4506,8 @@ def r_bureau_sig(h, q, b):
         cv = f"{cid}:{os.stat(DATA_DIR / conv_path(cid)).st_mtime_ns}"
     except (ApiError, OSError):
         cv = ""
-    return {"sig": bureau_sig(), "rv": rv, "cv": cv}
+    hook = WINDOWS_HOOK  # « fv » change quand une fenêtre s'ouvre, se ferme, est réduite ou passe devant
+    return {"sig": bureau_sig(), "rv": rv, "cv": cv, "fv": hook.version if hook is not None else -1}
 
 
 @route("GET", "/api/bureau/a-ranger")
@@ -4450,6 +4600,17 @@ def r_app_ask(h, q, b):
     return {"ok": True}
 
 
+# ── Fenêtres ouvertes ──
+@route("GET", "/api/fenetres")
+def r_windows(h, q, b):
+    return window_groups()
+
+
+@route("POST", "/api/fenetres/action")
+def r_windows_action(h, q, b):
+    return window_action(str(b.get("cle") or ""), str(b.get("action") or "basculer"))
+
+
 # ── Applications installées et raccourcis ──
 @route("GET", "/api/apps")
 def r_apps(h, q, b):
@@ -4471,6 +4632,8 @@ def r_apps_launch(h, q, b):
         a = apps_index()["by_id"].get(str(b["id"]))
         if not a:
             raise ApiError("Cette application n'est plus installée.", 404)
+        if to_bool(b.get("ramener")) and not files and raise_app(a["id"]):
+            return {"ok": True, "nom": a["nom"], "ramenee": True}  # déjà ouverte : sa fenêtre revient devant
         launch_app(a, files)
         return {"ok": True, "nom": a["nom"]}
     path = os.path.realpath(str(b.get("fichier") or ""))

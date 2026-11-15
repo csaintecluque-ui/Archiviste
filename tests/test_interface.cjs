@@ -207,6 +207,50 @@ async function main() {
   await page.unroute('**/api/fs/search?rapide=1**');
   await page.fill('#vIn', '');
 
+  console.log('— volet : applis ouvertes (repères sur les raccourcis)');
+  const json = (o) => ({ status: 200, contentType: 'application/json', body: JSON.stringify(o) });
+  const shortcuts = [
+    { id: 'r_t1', type: 'app', cible: 'firefox.desktop', nom: '', titre: 'Firefox', icone: 'firefox', ok: true, description: '' },
+    { id: 'r_t2', type: 'app', cible: 'org.gnome.Terminal.desktop', nom: '', titre: 'Terminal', icone: 'terminal', ok: true, description: '' },
+  ];
+  const windows = { dispo: true, sig: 's1', groupes: [
+    { cle: 'app:firefox.desktop', app: 'firefox.desktop', nom: 'Firefox', icone: 'firefox', n: 2, reduit: false, devant: true, titres: ['Accueil', 'Autre onglet'] },
+    { cle: 'app:vlc.desktop', app: 'vlc.desktop', nom: 'VLC', icone: 'vlc', n: 1, reduit: true, devant: false, titres: ['Film'] },
+  ] };
+  const acts = [];
+  const starts = [];
+  let open = true;
+  await page.route('**/api/raccourcis', (r) => r.fulfill(json(shortcuts)));
+  await page.route('**/api/fenetres', (r) => r.fulfill(json(windows)));
+  await page.route('**/api/fenetres/action', (r) => { acts.push(JSON.parse(r.request().postData())); r.fulfill(json({ ok: open, ouverte: open, dispo: true })); });
+  await page.route('**/api/apps/lancer', (r) => { starts.push(JSON.parse(r.request().postData())); r.fulfill(json({ ok: true, nom: 'x' })); });
+  await page.evaluate(async () => { await loadShortcuts(); await loadWindows(); });
+  const tile = (id) => `#sc [data-sc="${id}"]`;
+  const cls = (sel) => page.evaluate((s) => document.querySelector(s)?.className || '', sel);
+  check(/\brun\b/.test(await cls(tile('r_t1'))) && /\bfront\b/.test(await cls(tile('r_t1'))) && (await page.innerText(`${tile('r_t1')} .nb`)) === '2',
+    'appli ouverte : repère « devant » et nombre de fenêtres sur son raccourci');
+  check(!/\brun\b/.test(await cls(tile('r_t2'))) && await page.locator(`${tile('r_t2')} .run-dot`).count() === 0, 'appli fermée : pas de repère');
+  check(/\bmini\b/.test(await cls('#sc [data-run="app:vlc.desktop"]')) && await page.locator('#sc .sep').count() === 1, 'appli ouverte sans raccourci : ajoutée à la colonne, marquée « réduite »');
+  await page.click(tile('r_t1'));
+  await sleep(250);
+  check(acts.length === 1 && acts[0].cle === 'app:firefox.desktop' && acts[0].action === 'basculer' && starts.length === 0, 'clic sur une appli ouverte : sa fenêtre est ramenée ou réduite, rien n\'est relancé');
+  await page.click(tile('r_t2'));
+  await sleep(250);
+  check(starts.length === 1 && starts[0].id === 'org.gnome.Terminal.desktop' && acts.length === 1, 'clic sur une appli fermée : elle est lancée');
+  await page.click('#sc [data-run="app:vlc.desktop"]');
+  await sleep(250);
+  check(acts.length === 2 && acts[1].cle === 'app:vlc.desktop', 'clic sur une appli sans raccourci : sa fenêtre revient');
+  open = false;
+  await page.click(tile('r_t1'));
+  await sleep(350);
+  check(acts.length === 3 && starts.length === 2 && starts[1].id === 'firefox.desktop', 'appli fermée entre-temps : le clic la relance');
+  await page.click(tile('r_t1'), { button: 'right' });
+  const menu = await page.innerText('.menu');
+  check(menu.includes('Réduire') && menu.includes('Nouvelle fenêtre') && menu.includes('Fermer les 2 fenêtres'), 'clic droit : réduire, nouvelle fenêtre, fermer');
+  await page.keyboard.press('Escape');
+  for (const u of ['**/api/raccourcis', '**/api/fenetres', '**/api/fenetres/action', '**/api/apps/lancer']) await page.unroute(u);
+  await page.evaluate(async () => { D.win = { dispo: false, groupes: [], map: {}, sig: 'x' }; D.sc = []; await loadShortcuts(); await loadWindows(); });
+
   // ── fenêtre principale ──
   console.log('— fenêtre principale');
   const main = watch(await ctx.newPage());

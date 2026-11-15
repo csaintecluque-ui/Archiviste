@@ -2343,6 +2343,7 @@ async function renderBureauCard(rapport) {
     </div>
     <dl class="muted" style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:12px 0 0;font-size:13px">
       <dt>Demander partout</dt><dd style="margin:0">${b.touche ? `<span class="kbd">${esc(b.touche_label)}</span> ouvre une petite fenêtre « Demander à l'Archiviste » par-dessus tes fenêtres` : b.actif ? 'pas de raccourci clavier (voir Paramètres système › Clavier, commande <code>archiviste --demander</code>)' : 'actif avec le bureau'}</dd>
+      <dt>Applis ouvertes</dt><dd style="margin:0">${b.fenetres ? '✓ un repère sur le raccourci du volet quand l\'appli est ouverte ; un clic la ramène devant ou la réduit' : b.actif ? '— suivi indisponible : dans un terminal, <code>sudo apt install gir1.2-wnck-3.0</code>, puis relance Archiviste' : 'actif avec le bureau'}</dd>
       <dt>Au démarrage</dt><dd style="margin:0">${b.demarrage ? '✓ le bureau s\'affiche à l\'ouverture de session' : '—'}</dd>
       <dt>En cas de souci</dt><dd style="margin:0">dans un terminal : <code>archiviste --sans-bureau</code> rend le bureau à Nemo</dd>
     </dl>

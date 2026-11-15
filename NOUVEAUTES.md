@@ -1,6 +1,7 @@
 # Nouveautés
 
 ## 1.4.6
+- **Le volet sert de dock** : un repère apparaît sur le raccourci quand l'appli est ouverte (trait long si elle est devant, petit rond si elle est réduite, et le nombre de fenêtres s'il y en a plusieurs). Un clic ramène sa fenêtre au lieu d'en lancer une autre ; si elle est déjà devant, il la réduit. Les applis ouvertes sans raccourci (ton navigateur, par exemple) s'ajoutent à la colonne tant qu'elles sont ouvertes : une fenêtre réduite ne « disparaît » plus. Clic droit : Réduire, Nouvelle fenêtre, Fermer, Épingler. « ouvre Firefox » ramène aussi Firefox s'il est déjà ouvert.
 - **Liens symboliques** : mettre à la corbeille, renommer, déplacer ou copier un lien agit maintenant sur le lien, plus sur le dossier ou le fichier qu'il vise. Avant, « Suppr » sur un lien du bureau envoyait le vrai dossier à la corbeille.
 - **Corbeille depuis le bureau** : une confirmation est demandée pour un dossier ou pour plusieurs éléments, comme dans la fenêtre principale.
 - **Les erreurs de l'IA restent affichées** (volet, « Demander », fenêtre principale) : si Ollama est arrêté ou si le modèle manque, le message ne disparaît plus au bout d'une seconde. Un bouton **Réessayer** relance la même demande, et la pastille de statut passe au rouge tout de suite.

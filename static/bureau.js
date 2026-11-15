@@ -12,6 +12,7 @@ const D = {
   b: null, items: [], sel: new Set(), anchor: null, sig: '', rv: '', apps: null, favs: [], sc: [], todo: null,
   conv: null, busy: false, ctrl: null, atts: [], editSc: false, ownFond: Q.get('fond') === '1', fondKey: '',
   cv: undefined, resizing: false, autoNew: false,
+  fv: undefined, win: { dispo: false, groupes: [], map: {}, sig: '' }, scDrag: false, winDirty: false,
 };
 const IS_WRITING = () => { const a = document.activeElement; return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable); };
 const appIconUrl = (name, size = 64) => `/api/icone?t=${enc(TOKEN)}&n=${enc(name)}&s=${size}`;
@@ -157,6 +158,7 @@ async function poll() {
   }
   // la discussion du volet a avancé ailleurs (fenêtre « Demander », fenêtre principale) : on la remet à jour
   if (r.cv !== D.cv) { D.cv = r.cv; if (!D.busy) syncConv(false); }
+  if (r.fv !== D.fv) { D.fv = r.fv; loadWindows(); }  // une fenêtre s'est ouverte, fermée, réduite…
 }
 
 // ───────────────────────── Ouvrir, lancer ─────────────────────────
@@ -172,11 +174,13 @@ function openFolder(p) {
   if (D.b?.dossiers === 'systeme') return openWithSystem(p);
   return openMain({ vue: 'files', chemin: p });
 }
-async function launchApp(id, nom, fichiers) {
+async function launchApp(id, nom, fichiers, fresh = false) {
   try {
-    const r = await post('/api/apps/lancer', { id, fichiers });
-    toast(`Lancement de ${nom || r.nom || 'l\'application'}…`);
+    // déjà ouverte : sa fenêtre revient devant au lieu d'en lancer une autre (sauf « Nouvelle fenêtre »)
+    const r = await post('/api/apps/lancer', { id, fichiers, ramener: !fresh && !fichiers?.length });
+    toast(r.ramenee ? `${nom || r.nom} est déjà ouvert : je le ramène devant` : `Lancement de ${nom || r.nom || 'l\'application'}…`);
     if (MODE === 'demander') closePopup();
+    else setTimeout(loadWindows, 1200);
   } catch (e) { toast(e.message, 'err'); }
 }
 async function launchLauncher(path) {
@@ -881,13 +885,14 @@ function setVolet(open) {
   post('/api/bureau/reglages', { volet: open }).catch(() => {});
 }
 async function onVoletClick(ev) {
-  const b = ev.target.closest('[data-v], [data-act], [data-sc], [data-todo], [data-chip]');
+  const b = ev.target.closest('[data-v], [data-act], [data-sc], [data-run], [data-todo], [data-chip]');
   if (!b) return;
   if (b.dataset.sc !== undefined) {
     if (ev.target.closest('.x')) return removeShortcut(b.dataset.sc);
     if (D.editSc) return;
     return runShortcut(D.sc.find((s) => s.id === b.dataset.sc));
   }
+  if (b.dataset.run !== undefined) return toggleWindows(b.dataset.run);
   if (b.dataset.todo !== undefined) return openMain({ vue: 'sort', chemin: b.dataset.todo });
   if (b.dataset.chip !== undefined) return CHIPS[+b.dataset.chip].run();
   if (b.dataset.act) return chatAct(b, ev);
@@ -918,6 +923,8 @@ async function onVoletClick(ev) {
 function onVoletContext(ev) {
   const t = ev.target.closest('[data-sc]');
   if (t) { ev.preventDefault(); return shortcutMenu(D.sc.find((s) => s.id === t.dataset.sc), ev.clientX, ev.clientY); }
+  const o = ev.target.closest('[data-run]');
+  if (o) { ev.preventDefault(); return openAppMenu(D.win.map[o.dataset.run], ev.clientX, ev.clientY); }
   if (!ev.target.closest('textarea, input, .msgs')) ev.preventDefault();
   return null;
 }
@@ -958,13 +965,64 @@ function scIcon(s) {
   if (s.type === 'dossier') return `<span class="ico">${ic(s.cible === D.b?.home ? 'home' : 'folder')}</span>`;
   return `<span class="ico" style="color:${KIND_COLOR[s.kind] || '#f0b98f'}">${ic(KIND_ICON[s.kind] || 'file')}</span>`;
 }
+// ── fenêtres ouvertes : le volet sert de dock ──
+// Un repère sur le raccourci dit que l'appli est ouverte (trait plein), devant (trait long) ou réduite (trait creux).
+// Un clic la ramène devant, ou la réduit si elle y est déjà. Les applis ouvertes sans raccourci apparaissent
+// à la suite, le temps qu'elles restent ouvertes : une fenêtre réduite ne « disparaît » plus.
+const winKey = (s) => (s.type === 'archiviste' ? 'archiviste' : s.type === 'app' ? `app:${s.cible}` : null);
+const winOf = (s) => { const k = winKey(s); return k ? D.win.map[k] : null; };
+function winClass(g) { return g && g.n ? `run${g.devant ? ' front' : ''}${g.reduit ? ' mini' : ''}` : ''; }
+function winHint(g) {
+  if (!g || !g.n) return '';
+  const what = g.n > 1 ? `${g.n} fenêtres ouvertes` : g.reduit ? 'Ouverte, réduite' : 'Ouverte';
+  return `\n${what} — clic : ${g.devant && !g.reduit ? 'réduire' : 'ramener devant'}`;
+}
+function winMarks(g) { return g && g.n ? `<i class="run-dot"></i>${g.n > 1 ? `<span class="nb">${g.n}</span>` : ''}` : ''; }
+async function loadWindows() {
+  if (MODE !== 'bureau') return;
+  let r;
+  try { r = await api('/api/fenetres'); } catch { return; }
+  if (r.sig === D.win.sig && r.dispo === D.win.dispo) return;
+  D.win = { ...r, map: Object.fromEntries(r.groupes.map((g) => [g.cle, g])) };
+  if (D.scDrag) { D.winDirty = true; return; }  // pas de nouveau dessin au milieu d'un glisser
+  renderShortcuts();
+}
+window.archivisteFenetres = debounce(loadWindows, 60);  // appelé par la fenêtre GTK dès qu'une fenêtre change
+async function toggleWindows(cle, fallback, action = 'basculer') {
+  let r;
+  try { r = await post('/api/fenetres/action', { cle, action }); } catch (e) { return toast(e.message, 'err'); }
+  if (!r.ouverte && fallback) return fallback();  // fermée entre-temps : on la lance
+  setTimeout(loadWindows, 350);
+  return null;
+}
+function winMenuItems(g) {
+  if (!g || !g.n) return [];
+  const front = g.devant && !g.reduit;
+  return [
+    { label: front ? 'Réduire' : 'Ramener devant', icon: front ? 'down' : 'up', act: () => toggleWindows(g.cle, null, front ? 'reduire' : 'afficher') },
+    { label: g.n > 1 ? `Fermer les ${g.n} fenêtres` : 'Fermer la fenêtre', icon: 'x', act: () => toggleWindows(g.cle, null, 'fermer') },
+  ];
+}
+function openAppMenu(g, x, y) {
+  if (!g) return;
+  const m = [{ header: g.nom }, ...winMenuItems(g)];
+  if (g.app && !g.app.startsWith('/')) m.push('sep', { label: 'Épingler aux raccourcis', icon: 'star', act: () => pinShortcut('app', g.app).then(loadShortcuts) });
+  showMenu(x, y, m);
+}
 function renderShortcuts() {
   const el = $('#sc');
   if (!el) return;
   el.classList.toggle('edit', D.editSc);
-  el.innerHTML = D.sc.map((s) => `<button class="t ${s.ok ? '' : 'ko'}" data-sc="${esc(s.id)}" draggable="true" title="${esc(s.titre)}${s.description ? '\n' + esc(s.description) : ''}">
-    ${scIcon(s)}<span class="lbl">${esc(s.titre)}</span>${D.editSc ? '<span class="x" title="Retirer">×</span>' : ''}</button>`).join('')
-    || `<button class="t add" data-v="addSc" title="Épingler une appli, un dossier ou un fichier"><span class="ico">${ic('plus')}</span><span class="lbl">Ajouter</span></button>`;
+  const pinned = new Set(D.sc.map(winKey).filter(Boolean));
+  const others = D.win.groupes.filter((g) => !pinned.has(g.cle));
+  el.innerHTML = (D.sc.map((s) => {
+    const g = winOf(s);
+    return `<button class="t ${s.ok ? '' : 'ko'} ${winClass(g)}" data-sc="${esc(s.id)}" draggable="true" title="${esc(s.titre)}${s.description ? '\n' + esc(s.description) : ''}${esc(winHint(g))}">
+    ${scIcon(s)}<span class="lbl">${esc(s.titre)}</span>${winMarks(g)}${D.editSc ? '<span class="x" title="Retirer">×</span>' : ''}</button>`;
+  }).join('')
+    || `<button class="t add" data-v="addSc" title="Épingler une appli, un dossier ou un fichier"><span class="ico">${ic('plus')}</span><span class="lbl">Ajouter</span></button>`)
+    + (others.length ? `<div class="sep" title="Applis ouvertes sans raccourci"></div>${others.map((g) => `<button class="t open ${winClass(g)}" data-run="${esc(g.cle)}" title="${esc(g.titres[0] || g.nom)}${esc(winHint(g))}\nClic droit : épingler, fermer">
+    <span class="ico app"><img class="app-ic" src="${appIconUrl(g.icone || 'application-x-executable', 48)}" alt="" draggable="false"></span><span class="lbl">${esc(g.nom)}</span>${winMarks(g)}</button>`).join('')}` : '');
   scFades();
 }
 // Colonne des raccourcis : un fondu en haut / en bas signale qu'il y en a d'autres en faisant défiler.
@@ -974,11 +1032,13 @@ function scFades() {
   el.classList.toggle('fade-t', el.scrollTop > 2);
   el.classList.toggle('fade-b', el.scrollTop + el.clientHeight < el.scrollHeight - 2);
 }
-function runShortcut(s) {
+function runShortcut(s, fresh = false) {
   if (!s) return null;
   if (!s.ok) return toast(`Introuvable : ${s.cible || s.titre}. Clic droit › Retirer des raccourcis.`, 'err');
+  // déjà ouverte : le clic ramène sa fenêtre devant, ou la réduit si elle y est déjà (« Nouvelle fenêtre » au clic droit)
+  if (!fresh && winOf(s)?.n) return toggleWindows(winKey(s), () => runShortcut(s, true));
   if (s.type === 'archiviste') return openMain({});
-  if (s.type === 'app') return s.cible.startsWith('/') ? launchLauncher(s.cible) : launchApp(s.cible, s.titre);
+  if (s.type === 'app') return s.cible.startsWith('/') ? launchLauncher(s.cible) : launchApp(s.cible, s.titre, undefined, true);
   if (s.type === 'dossier') return openFolder(s.cible);
   return openFile({ path: s.cible, name: basename(s.cible), dir: false, ext: s.ext || '', kind: s.kind });
 }
@@ -993,7 +1053,9 @@ function shortcutMenu(s, x, y) {
   const i = D.sc.indexOf(s);
   const ids = D.sc.map((z) => z.id);
   const swap = (j) => { const c = ids.slice(); [c[i], c[j]] = [c[j], c[i]]; reorderShortcuts(c); };
-  const m = [{ header: s.titre }, { label: s.type === 'app' ? 'Lancer' : 'Ouvrir', icon: s.type === 'app' ? 'play' : 'external', act: () => runShortcut(s) }];
+  const g = winOf(s);
+  const m = [{ header: s.titre }, ...winMenuItems(g),
+    { label: g?.n ? 'Nouvelle fenêtre' : s.type === 'app' ? 'Lancer' : 'Ouvrir', icon: s.type === 'app' ? 'play' : 'external', act: () => runShortcut(s, true) }];
   if (s.type === 'dossier' || s.type === 'fichier') {
     m.push({ label: 'Afficher dans Archiviste', icon: 'folder', act: () => openMain(s.type === 'dossier' ? { vue: 'files', chemin: s.cible } : { vue: 'files', chemin: dirname(s.cible), select: s.cible }) });
     if (s.type === 'fichier') m.push({ label: 'En discuter', icon: 'chat', act: () => attachToChat([s.cible]) });
@@ -1069,10 +1131,15 @@ function bindShortcutDnD() {
     const t = ev.target.closest('[data-sc]');
     if (!t) return;
     dragId = t.dataset.sc;
+    D.scDrag = true;
     ev.dataTransfer.setData('text/plain', t.querySelector('.lbl')?.textContent || 'raccourci');
     ev.dataTransfer.effectAllowed = 'move';
   });
-  sc.addEventListener('dragend', () => { dragId = null; $$('.drag-over', sc).forEach((x) => x.classList.remove('drag-over')); sc.classList.remove('drop-on'); });
+  sc.addEventListener('dragend', () => {
+    dragId = null; D.scDrag = false;
+    $$('.drag-over', sc).forEach((x) => x.classList.remove('drag-over')); sc.classList.remove('drop-on');
+    if (D.winDirty) { D.winDirty = false; renderShortcuts(); }
+  });
   sc.addEventListener('dragenter', (ev) => { ev.preventDefault(); ev.dataTransfer.dropEffect = dragId ? 'move' : 'copy'; });
   sc.addEventListener('dragover', (ev) => {
     ev.preventDefault();
@@ -1481,6 +1548,7 @@ async function initBureau() {
   bindDesk();
   applyFond();
   await Promise.all([loadElements(), loadShortcuts(), loadConv(), loadTodo()]);
+  loadWindows();
   try { D.rv = (await api('/api/bureau/sig')).rv; } catch { /* */ }
   loadApps();
   setInterval(poll, 2500);

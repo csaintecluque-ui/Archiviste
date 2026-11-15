@@ -17,7 +17,7 @@ Rien ne quitte ta machine.
 ## Installation
 
 1. Télécharge le dernier paquet **`archiviste_X.Y.Z_all.deb`** sur la page [Releases](https://github.com/csaintecluque-ui/Archiviste/releases/latest).
-2. Double-clique dessus puis « Installer » (ou `sudo apt install ./archiviste_X.Y.Z_all.deb`). Le paquet installe ce qu'il faut (moteur d'affichage WebKitGTK de GNOME, lecture des PDF).
+2. Double-clique dessus puis « Installer » (ou `sudo apt install ./archiviste_X.Y.Z_all.deb`). Le paquet installe ce qu'il faut (moteur d'affichage WebKitGTK de GNOME, lecture des PDF, suivi des fenêtres ouvertes).
 3. Menu → **Archiviste** : l'appli s'ouvre dans sa propre fenêtre, avec son icône dans la barre des tâches.
 
 > Si tu avais la toute première version (celle qui s'ouvrait dans Firefox), Archiviste la retire tout seul au premier lancement ; tes agents, prompts et discussions sont conservés.
@@ -49,6 +49,8 @@ Relancer Archiviste ramène la fenêtre existante au premier plan (une seule fen
 La discussion du volet : « ouvre Grimoire », « lance Firefox », « ouvre mes téléchargements » ouvrent tout de suite (sans l'IA), même avec une faute de frappe (« ouvrr le terminale ») ; pendant que tu tapes, elle propose tes applis et tes fichiers (flèches puis <kbd>Entrée</kbd>, clic droit pour épingler) ; tout le reste part à l'Archiviste, qui peut lui aussi ouvrir des applis et des fichiers.
 
 Le volet se règle en largeur : glisse son bord gauche (double-clic pour revenir à la largeur d'origine). Quand tu te remets à écrire après une longue pause (4 heures par défaut, réglable dans **Réglages → Bureau**, ou « jamais »), il repart sur une discussion neuve ; « Reprendre la discussion précédente » la rouvre, et elle reste de toute façon dans l'onglet Discussion. Si l'IA ne peut pas répondre (Ollama arrêté, modèle absent), le message d'erreur reste affiché avec un bouton **Réessayer**.
+
+La colonne des raccourcis sert aussi de **dock** : un repère sur le raccourci indique que l'appli est ouverte (trait long : devant ; petit rond : réduite ; un chiffre s'il y a plusieurs fenêtres). Un clic ramène sa fenêtre, ou la réduit si elle est déjà devant ; les applis ouvertes sans raccourci s'ajoutent sous un séparateur le temps qu'elles restent ouvertes. Clic droit : Réduire / Ramener devant, Nouvelle fenêtre, Fermer, Épingler.
 
 Les raccourcis sont en colonne sur le bord droit du volet, pour laisser toute la hauteur à la discussion ; s'il y en a beaucoup, la colonne défile. Clic pour ouvrir, glisser pour réordonner, clic droit pour renommer, monter, descendre ou retirer, crayon en bas de la colonne pour en retirer plusieurs, « + » pour ajouter une application (toutes celles du menu, tes favoris en premier), un dossier ou un fichier.
 
@@ -111,6 +113,7 @@ Sauvegarde / transfert de tes agents et prompts : **Réglages → Sauvegarde →
 | Fenêtre blanche ou vide | Lance `archiviste` dans un terminal pour voir le message ; avec le pilote NVIDIA, essaie `WEBKIT_DISABLE_COMPOSITING_MODE=1 archiviste`. |
 | Bureau : le fond reste noir | Réglages → Bureau → Fond d'écran : « Dessiné par Archiviste ». |
 | Bureau : les icônes de Nemo réapparaissent par-dessus | Réglages → Bureau : désactive puis réactive (Archiviste remet `desktop-layout` à `false::false`). |
+| Bureau : pas de repère sur les raccourcis des applis ouvertes | Réglages → Bureau → « Applis ouvertes » doit être coché. Sinon : `sudo apt install gir1.2-wnck-3.0`, puis relance Archiviste (le suivi des fenêtres demande une session X11, celle de Cinnamon par défaut). |
 | Bureau : tout revenir comme avant | `archiviste --sans-bureau` dans un terminal. |
 | Voir ce qui se passe | `ARCHIVISTE_DEBUG=1 archiviste` dans un terminal affiche les échanges. <kbd>F12</kbd> ouvre l'inspecteur. |
 
@@ -121,7 +124,7 @@ Sauvegarde / transfert de tes agents et prompts : **Réglages → Sauvegarde →
 ## Pour bidouiller
 
 - `archiviste.py` — le serveur (Python, bibliothèque standard uniquement) : fichiers, corbeille, Ollama, agents et leurs outils (`TOOLS`), tri.
-- `fenetre.py` — la fenêtre d'application (GTK 3 + WebKitGTK) qui embarque le serveur.
+- `fenetre.py` — la fenêtre d'application (GTK 3 + WebKitGTK) qui embarque le serveur, et le suivi des fenêtres ouvertes (`SuiviFenetres`, libwnck) pour les repères du volet ; côté serveur : `window_groups()` et `window_app()` dans `archiviste.py`.
 - Documents Office : `make_docx()` (Markdown → Word) et `make_xlsx()` (tableaux Markdown → Excel) dans `archiviste.py`, vérifiés à l'ouverture dans Grimoire.
 - `construire-deb.sh` — construit `dist/archiviste_<version>_all.deb` (GitHub le fait tout seul à chaque version).
 - `tests/lancer.sh` — tests de bout en bout avec un faux Ollama (lancés aussi par GitHub avant chaque publication) : l'API (`test_api.py`), quelques fonctions (`test_unites.py`), puis l'interface dans Chrome sans affichage (`test_interface.cjs` : volet du bureau et fenêtre principale). Pour ces derniers : Node.js, puis une fois `npm install --prefix tests`.
