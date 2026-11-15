@@ -37,7 +37,7 @@ from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -999,7 +999,8 @@ TOOLS = {
     "ouvrir_application": {
         "label": "Ouvrir une application", "modifie": False,
         "description": ("Lance une application installée sur le PC (ex : Grimoire, Firefox, Terminal, "
-                        "Calculatrice, LibreOffice). Utilise-le dès qu'on te demande d'ouvrir ou de lancer une appli."),
+                        "Calculatrice, LibreOffice). Utilise-le dès qu'on te demande d'ouvrir ou de lancer une appli. "
+                        "Le nom peut être approximatif ou mal orthographié : l'outil trouve l'appli la plus proche."),
         "properties": {"nom": _p("Nom de l'application, tel que l'utilisateur l'a dit (ex : grimoire).")},
         "required": ["nom"],
     },
@@ -2457,6 +2458,9 @@ LANG_KEYS = [k for k in dict.fromkeys(
 if LANG_KEYS and "_" in LANG_KEYS[0]:
     LANG_KEYS.append(LANG_KEYS[0].split("_")[0])
 CUR_DESKTOPS = [d.strip() for d in (os.environ.get("XDG_CURRENT_DESKTOP") or "X-Cinnamon").split(":") if d.strip()]
+# Comme le menu de Cinnamon : les applis marquées « GNOME » (ex. le Terminal, OnlyShowIn=GNOME;Unity;) y apparaissent aussi.
+if any("CINNAMON" in d.upper() for d in CUR_DESKTOPS) and "GNOME" not in CUR_DESKTOPS:
+    CUR_DESKTOPS.append("GNOME")
 
 BUREAU_DEFAUT = {
     "actif": False,            # le bureau Archiviste remplace celui de Nemo
@@ -2608,15 +2612,19 @@ def desk_list(e: dict, key: str, localized: bool = False) -> list[str]:
     return [_desk_unescape(x).strip() for x in re.split(r"(?<!\\);", raw) if x.strip()]
 
 
-def app_visible(e: dict) -> bool:
+def shown_here(e: dict) -> bool:
+    only = desk_list(e, "OnlyShowIn")
+    if only and not any(d in only for d in CUR_DESKTOPS):
+        return False
+    return not any(d in desk_list(e, "NotShowIn") for d in CUR_DESKTOPS)
+
+
+def app_visible(e: dict, any_desktop: bool = False) -> bool:
     if e.get("Type", "Application") != "Application":
         return False
     if to_bool(e.get("NoDisplay")) or to_bool(e.get("Hidden")):
         return False
-    only = desk_list(e, "OnlyShowIn")
-    if only and not any(d in only for d in CUR_DESKTOPS):
-        return False
-    if any(d in desk_list(e, "NotShowIn") for d in CUR_DESKTOPS):
+    if not any_desktop and not shown_here(e):
         return False
     tx = e.get("TryExec")
     if tx and not (os.access(tx, os.X_OK) if os.path.isabs(tx) else shutil.which(tx)):
@@ -2647,10 +2655,11 @@ def app_info(aid: str, path: str, e: dict) -> dict:
 
 
 def public_app(a: dict) -> dict:
-    return {k: a[k] for k in ("id", "nom", "generique", "description", "icone", "categories", "mots")}
+    return {**{k: a[k] for k in ("id", "nom", "generique", "description", "icone", "categories", "mots")},
+            "cmd": _exec_cmd(a)}
 
 
-_APPS = {"sig": None, "list": [], "by_id": {}}
+_APPS = {"sig": None, "list": [], "by_id": {}, "ailleurs": []}
 _APPS_LOCK = threading.Lock()
 
 
@@ -2667,7 +2676,7 @@ def apps_index() -> dict:
     with _APPS_LOCK:
         if _APPS["sig"] == sig:
             return _APPS
-        by_id, seen = {}, set()
+        by_id, seen, ailleurs = {}, set(), []
         for d in dirs:
             for dirpath, _, files in os.walk(d):
                 for fn in sorted(files):
@@ -2683,13 +2692,16 @@ def apps_index() -> dict:
                     seen.add(aid)
                     if e and app_visible(e):
                         by_id[aid] = app_info(aid, full, e)
+                    elif e and app_visible(e, any_desktop=True):  # prévue pour un autre bureau : dernier recours
+                        ailleurs.append(app_info(aid, full, e))
         for aid, a in list(by_id.items()):
             # un lanceur « terminal » qui masque l'appli du paquet (vieux script…) : on affiche et lance l'appli
             alt = next((x for x in a.get("alts", []) if not x["terminal"]), None) if a["terminal"] else None
             if alt:
                 rest = [x for x in a["alts"] if x is not alt]
                 by_id[aid] = {**alt, "alts": [{k: v for k, v in a.items() if k != "alts"}] + rest}
-        _APPS.update(sig=sig, by_id=by_id, list=sorted(by_id.values(), key=lambda a: a["nom"].casefold()))
+        _APPS.update(sig=sig, by_id=by_id, list=sorted(by_id.values(), key=lambda a: a["nom"].casefold()),
+                     ailleurs=ailleurs)
         return _APPS
 
 
@@ -2711,8 +2723,8 @@ def launch_app(a: dict, files: list[str] | None = None) -> None:
     launch_desktop(launch_entry(a)["fichier"], files)
 
 
-_ART_RE = re.compile(r"^(l['’]\s*appli(cation)?|l['’]\s*app|le\s+logiciel|le\s+programme|la|le|les|l['’]|mon|ma|mes)\s*",
-                     re.I)
+_ART_RE = re.compile(r"^(?:l['’]\s*appli(?:cation)?\b|l['’]\s*app\b|le\s+logiciel\b|le\s+programme\b|"
+                     r"(?:la|le|les|mon|ma|mes)\s+|l['’]\s*)\s*", re.I)
 APP_SYNONYMES = {"navigateur": "WebBrowser", "internet": "WebBrowser", "web": "WebBrowser",
                  "terminal": "TerminalEmulator", "console": "TerminalEmulator",
                  "fichiers": "FileManager", "explorateur": "FileManager", "gestionnaire de fichiers": "FileManager",
@@ -2725,41 +2737,113 @@ def _fold(t: str) -> str:
     return "".join(c for c in t if unicodedata.category(c) != "Mn").strip()
 
 
-def match_app(query: str) -> tuple[dict | None, list[str]]:
-    """Trouve l'appli la plus proche d'un nom dit par l'utilisateur (« grimoire », « le navigateur »…)."""
-    q = _fold(query).strip(" .!?\"'«»")
-    for _ in range(2):
-        q = _ART_RE.sub("", q).strip()
-    if not q:
-        return None, []
-    apps = apps_index()["list"]
+def _osa(a: str, b: str) -> int:
+    """Distance d'édition (fautes de frappe, lettre en trop/en moins, deux lettres inversées)."""
+    if a == b:
+        return 0
+    prev2, prev = None, list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+def _tolerance(n: int) -> int:
+    return 0 if n <= 2 else 1 if n <= 5 else 2 if n <= 9 else 3
+
+
+def _compact(t: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", t)
+
+
+def _fuzzy_word(w: str, tokens: set, strict: bool = False) -> int | None:
+    """Meilleure distance entre un mot tapé et les mots d'une appli (début de mot compris : « grimio » → grimoire)."""
+    tol = _tolerance(len(w)) - (1 if strict else 0)
+    best = None
+    for t in tokens:
+        if len(t) < 2:
+            continue
+        d = _osa(w, t)
+        if len(t) > len(w) >= 3:
+            d = min(d, _osa(w, t[:len(w)]) + (0 if t.startswith(w[:2]) else 1))
+        if d <= tol and (best is None or d < best):
+            best = d
+    return best
+
+
+def _app_tokens(a: dict) -> tuple[set, set]:
+    name = _fold(a["nom"])
+    words = {_compact(w) for w in re.split(r"[\s\-_.]+", name)}
+    words |= {_compact(_fold(a["id"][:-8].rsplit(".", 1)[-1])), _compact(_fold(_exec_cmd(a)))}
+    extra = {_compact(w) for w in re.split(r"[\s\-_.]+", _fold(a["generique"]))}
+    extra |= {_compact(_fold(m)) for m in a["mots"]}
+    return {w for w in words if w}, {w for w in extra if w}
+
+
+def _score_apps(q: str, apps: list[dict]) -> list:
+    """(score, terminal?, longueur, appli) : 0 exact … 4 mot-clé, 6+ orthographe approchée, 9 synonyme."""
+    qc = _compact(q)
+    qwords = [_compact(w) for w in q.split() if _compact(w)]
     scored = []
     for a in apps:
         name = _fold(a["nom"])
         stem = _fold(a["id"][:-8].rsplit(".", 1)[-1])
         cmd = _fold(_exec_cmd(a))
-        if q in (name, stem, cmd, _fold(a["generique"])):
+        gen = _fold(a["generique"])
+        if q in (name, stem, cmd, gen) or qc in (_compact(name), _compact(stem)):
             sc = 0
-        elif name.startswith(q) or stem.startswith(q):
+        elif name.startswith(q) or stem.startswith(q) or _compact(name).startswith(qc):
             sc = 1
         elif any(w.startswith(q) for w in name.split()):
             sc = 2
         elif q in name or q in stem:
             sc = 3
-        elif q in _fold(a["generique"]) or any(_fold(m).startswith(q) for m in a["mots"]):
+        elif q in gen or any(_fold(m).startswith(q) for m in a["mots"]):
             sc = 4
         else:
-            continue
+            sc = None
+            main, extra = _app_tokens(a)
+            if qwords:
+                ds = [_fuzzy_word(w, main) for w in qwords]
+                if all(d is not None for d in ds):
+                    sc = 6 + sum(ds)
+                else:
+                    ds = [_fuzzy_word(w, main) if _fuzzy_word(w, main) is not None else _fuzzy_word(w, extra, strict=True)
+                          for w in qwords]
+                    if all(d is not None for d in ds):
+                        sc = 7.5 + sum(ds)
+            if sc is None and len(qc) >= 4 and _osa(qc, _compact(name)) <= _tolerance(len(qc)):
+                sc = 6 + _osa(qc, _compact(name))
+            if sc is None:
+                continue
         scored.append((sc, bool(a.get("terminal")), len(name), a))
     if not scored and q in APP_SYNONYMES:
         cat = APP_SYNONYMES[q]
-        scored = [(5, bool(a.get("terminal")), 0, a) for a in apps if cat in a["categories"]]
-    if not scored:
-        words = [w for w in q.split() if len(w) > 2]
-        proches = [a["nom"] for a in apps if any(w in _fold(a["nom"]) for w in words)][:5]
-        return None, proches
-    scored.sort(key=lambda x: (x[0], x[1], x[2]))
-    return scored[0][3], [x[3]["nom"] for x in scored[1:5]]
+        scored = [(9, bool(a.get("terminal")), 0, a) for a in apps if cat in a["categories"]]
+    return scored
+
+
+def match_app(query: str) -> tuple[dict | None, list[str]]:
+    """Trouve l'appli la plus proche d'un nom dit par l'utilisateur, même mal orthographié
+    (« grimoire », « le terminale », « firefoks », « libre office »…)."""
+    q = _fold(query).strip(" .!?\"'«»")
+    for _ in range(3):
+        q = _ART_RE.sub("", q).strip()
+    if not q:
+        return None, []
+    idx = apps_index()
+    found = _score_apps(q, idx["list"]) or _score_apps(q, idx["ailleurs"])
+    if not found:
+        qc = _compact(q)
+        near = sorted(idx["list"], key=lambda a: _osa(qc, _compact(_fold(a["nom"]))[:len(qc) + 2]))[:4]
+        return None, [a["nom"] for a in near]
+    found.sort(key=lambda x: (x[0], x[1], x[2]))
+    return found[0][3], [x[3]["nom"] for x in found[1:5]]
 
 
 def open_path(path: str) -> str:
@@ -2796,6 +2880,7 @@ def terminal_app() -> str | None:
     if found:
         return found
     return next((a["id"] for a in apps_index()["list"] if "TerminalEmulator" in a["categories"]), None)
+
 
 
 _GIO_LAUNCH = None

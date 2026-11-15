@@ -45,7 +45,7 @@ Relancer Archiviste ramène la fenêtre existante au premier plan (une seule fen
 | Clavier | <kbd>Entrée</kbd> ouvrir · <kbd>F2</kbd> renommer · <kbd>Suppr</kbd> corbeille · <kbd>Ctrl</kbd>+<kbd>A</kbd> · flèches · taper du texte → discussion du volet |
 | Glisser-déposer | sur un dossier : déplacer (<kbd>Ctrl</kbd> : copier) · sur la corbeille · sur les raccourcis : épingler · sur la discussion : joindre · depuis Nemo : vers le bureau |
 
-La discussion du volet : « ouvre Grimoire », « lance Firefox », « ouvre mes téléchargements » ouvrent tout de suite (sans l'IA) ; pendant que tu tapes, elle propose tes applis et tes fichiers (flèches puis <kbd>Entrée</kbd>, clic droit pour épingler) ; tout le reste part à l'Archiviste, qui peut lui aussi ouvrir des applis et des fichiers.
+La discussion du volet : « ouvre Grimoire », « lance Firefox », « ouvre mes téléchargements » ouvrent tout de suite (sans l'IA), même avec une faute de frappe (« ouvrr le terminale ») ; pendant que tu tapes, elle propose tes applis et tes fichiers (flèches puis <kbd>Entrée</kbd>, clic droit pour épingler) ; tout le reste part à l'Archiviste, qui peut lui aussi ouvrir des applis et des fichiers.
 
 Les raccourcis du volet : clic pour ouvrir, glisser pour réordonner, clic droit pour renommer ou retirer, « Modifier » pour retirer plusieurs, « + » pour ajouter une application (toutes celles du menu, tes favoris en premier), un dossier ou un fichier.
 

@@ -1,5 +1,9 @@
 # Nouveautés
 
+## 1.4.3
+- **Le Terminal est trouvé** : les applis marquées pour GNOME (dont le Terminal de Mint) sont maintenant reconnues, comme dans le menu de Cinnamon. Elles réapparaissent aussi dans « + Ajouter ».
+- **Orthographe approchée** : « terminale », « grimio », « firefoks », « libre office », « ouvrr le terminal »… trouvent quand même la bonne appli, dans la discussion comme pour l'IA.
+
 ## 1.4.2
 - **Mises à jour plus fiables** : Archiviste installe lui-même la nouvelle version (ton mot de passe est demandé par la fenêtre de Mint) au lieu de passer par l'installateur de paquets, qui pouvait échouer avec « erreur logicielle dans aptkit ». Si une autre installation est en cours, il attend qu'elle se termine ; en cas d'échec, il affiche la vraie raison et propose de réessayer.
 

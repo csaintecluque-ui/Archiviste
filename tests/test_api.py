@@ -152,6 +152,12 @@ res = [e for e in ev if e["t"] == "tool_result"]
 check(res and res[0]["name"] == "ouvrir_application" and not res[0]["ok"] and ev[-1]["t"] == "done",
       "outil ouvrir_application appelé, appli absente signalée")
 check(any(e["t"] == "content" for e in ev), "le modèle répond après l'outil")
+os.makedirs(HOME + "/.local/share/applications", exist_ok=True)
+open(HOME + "/.local/share/applications/grimoire-essai.desktop", "w").write(
+    "[Desktop Entry]\nType=Application\nName=Grimoire\nExec=/bin/true\nOnlyShowIn=GNOME;Unity;\n")
+ev = stream("/api/chat", {"conv_id": c2["id"], "message": "ouvre grimio"})
+res = [e for e in ev if e["t"] == "tool_result"]
+check(res and res[0]["ok"] and "Grimoire" in res[0]["summary"], f"orthographe approchée + appli « GNOME » : {res and res[0]['summary']}")
 
 print("— agent avec outils et validation")
 c = call("POST", "/api/conversations", {"agent_id": a["id"]})

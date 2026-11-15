@@ -484,29 +484,94 @@ function pathsFromUris(list) {
 // ───────────────────────── Lanceur : une seule saisie pour l'IA, les applis et les fichiers ─────────────────────────
 // « ouvre Grimoire », « lance firefox », « ouvre mes téléchargements » : ouvert tout de suite, sans passer par l'IA.
 // Le reste part à l'Archiviste. Utilisé par la discussion du volet et par la fenêtre « Demander » (Super + Espace).
-const OPEN_RE = /^(?:(?:peux|pourrais)[- ]tu\s+|tu\s+peux\s+|merci\s+d['’]\s*)?(?:ouvre|ouvrir|ouvres|lance|lancer|lances|d[ée]marre|d[ée]marrer|affiche|afficher|montre|montrer|va\s+dans|aller\s+dans)\b\s*(?:-?\s*moi\s+)?(.*)$/i;
+const VERBES = ['ouvre', 'ouvrir', 'ouvres', 'lance', 'lancer', 'lances', 'demarre', 'demarrer', 'affiche', 'afficher', 'montre', 'montrer'];
 const ART_RE = /^(?:l['’]\s*appli(?:cation)?|l['’]\s*app|le\s+logiciel|le\s+programme|le\s+dossier|le\s+fichier|la\s+|le\s+|les\s+|l['’]\s*|mes\s+|mon\s+|ma\s+)\s*/i;
+// « ouvre Grimoire », « lance firefox », « ouvrr le terminal » (faute de frappe), « ou le Terminal » (incertain)
 function parseIntent(text) {
-  const m = String(text || '').trim().replace(/[?!.…]+$/, '').match(OPEN_RE);
-  if (!m) return null;
-  let t = m[1].trim();
+  let t = String(text || '').trim().replace(/[?!.…]+$/, '')
+    .replace(/^(?:(?:peux|pourrais)[- ]tu\s+|tu\s+peux\s+|merci\s+d['’]\s*|stp\s+|svp\s+)/i, '');
+  let weak = false;
+  const dans = t.match(/^(?:va|aller)\s+dans\s+(.+)$/i);
+  if (dans) t = dans[1];
+  else {
+    const m = t.match(/^(\S+?)(?:-moi)?\s+(?:moi\s+)?(.+)$/i);
+    if (!m) return null;
+    const v = norm(m[1]).replace(/[^a-z]/g, '');
+    if (!VERBES.includes(v)) {
+      if (v === 'ou' || v === 'ouv') weak = true;
+      else if (!(v.length >= 4 && VERBES.some((x) => osa(v, x) <= 1))) return null;
+    }
+    t = m[2];
+  }
   for (let i = 0; i < 3; i++) t = t.replace(ART_RE, '').trim();
-  return t || null;
+  return t ? { target: t, weak } : null;
+}
+// ── orthographe approchée : « terminale », « grimio », « firefoks », « libre office » ──
+function osa(a, b) {
+  if (a === b) return 0;
+  let prev2 = null;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) cur[j] = Math.min(cur[j], prev2[j - 2] + 1);
+    }
+    prev2 = prev; prev = cur;
+  }
+  return prev[b.length];
+}
+const tolerance = (n) => (n <= 2 ? 0 : n <= 5 ? 1 : n <= 9 ? 2 : 3);
+const compact = (t) => norm(t).replace(/[^a-z0-9]/g, '');
+function fuzzyWord(w, tokens, strict = false) {
+  const tol = tolerance(w.length) - (strict ? 1 : 0);
+  let best = null;
+  for (const t of tokens) {
+    if (t.length < 2) continue;
+    let d = osa(w, t);
+    if (t.length > w.length && w.length >= 3) d = Math.min(d, osa(w, t.slice(0, w.length)) + (t.startsWith(w.slice(0, 2)) ? 0 : 1));
+    if (d <= tol && (best === null || d < best)) best = d;
+  }
+  return best;
+}
+const SYNONYMES = { navigateur: 'WebBrowser', internet: 'WebBrowser', web: 'WebBrowser', terminal: 'TerminalEmulator',
+  console: 'TerminalEmulator', fichiers: 'FileManager', explorateur: 'FileManager', mail: 'Email', courriel: 'Email', messagerie: 'Email' };
+function appTokens(a) {
+  if (!a._tok) {
+    const split = (t) => norm(t).split(/[\s\-_.]+/).map((w) => w.replace(/[^a-z0-9]/g, '')).filter(Boolean);
+    a._tok = {
+      main: new Set([...split(a.nom), compact(a.id.replace(/\.desktop$/, '').split('.').pop()), compact(a.cmd || '')].filter(Boolean)),
+      extra: new Set([...split(a.generique), ...a.mots.map(compact)].filter(Boolean)),
+    };
+  }
+  return a._tok;
 }
 function scoreApp(a, n) {
   const name = norm(a.nom);
-  if (name === n || norm(a.id.replace(/\.desktop$/, '').split('.').pop()) === n) return 0;
-  if (name.startsWith(n)) return 1;
+  const stem = norm(a.id.replace(/\.desktop$/, '').split('.').pop());
+  const nc = n.replace(/[^a-z0-9]/g, '');
+  if (name === n || stem === n || norm(a.cmd) === n || [compact(a.nom), compact(stem), compact(a.cmd || '')].includes(nc)) return 0;
+  if (name.startsWith(n) || stem.startsWith(n) || compact(a.nom).startsWith(nc)) return 1;
   if (name.split(/\s+/).some((w) => w.startsWith(n))) return 2;
   if (name.includes(n)) return 3;
   if (norm(a.generique).includes(n) || a.mots.some((m) => norm(m).startsWith(n)) || norm(a.id).includes(n)) return 4;
+  const words = n.split(/\s+/).map((w) => w.replace(/[^a-z0-9]/g, '')).filter(Boolean);
+  if (!words.length) return -1;
+  const { main, extra } = appTokens(a);
+  let ds = words.map((w) => fuzzyWord(w, main));
+  if (ds.every((d) => d !== null)) return 6 + ds.reduce((x, y) => x + y, 0);
+  ds = words.map((w) => fuzzyWord(w, main) ?? fuzzyWord(w, extra, true));
+  if (ds.every((d) => d !== null)) return 7.5 + ds.reduce((x, y) => x + y, 0);
+  if (nc.length >= 4 && osa(nc, compact(a.nom)) <= tolerance(nc.length)) return 6 + osa(nc, compact(a.nom));
   return -1;
 }
 function matchApps(q) {
-  const n = norm(q);
+  const n = norm(q).replace(/^(l['’]\s*appli(cation)?|l['’]\s*app|le\s+logiciel|le\s+programme|(la|le|les|mon|ma|mes)\s+|l['’]\s*)/, '').trim();
   if (!D.apps || n.length < 2) return [];
-  return D.apps.map((a) => [scoreApp(a, n), a]).filter((x) => x[0] >= 0)
-    .sort((x, y) => x[0] - y[0] || x[1].nom.localeCompare(y[1].nom)).slice(0, 5).map(([s, a]) => ({ s, a }));
+  let res = D.apps.map((a) => [scoreApp(a, n), a]).filter((x) => x[0] >= 0);
+  if (!res.length && SYNONYMES[n]) res = D.apps.filter((a) => a.categories.includes(SYNONYMES[n])).map((a) => [9, a]);
+  return res.sort((x, y) => x[0] - y[0] || x[1].nom.localeCompare(y[1].nom)).slice(0, 5).map(([s, a]) => ({ s, a }));
 }
 function specialDirs(q) {
   const n = norm(q);
@@ -518,11 +583,11 @@ function specialDirs(q) {
     [['dossier personnel', 'home', 'maison', 'perso'], D.b.home, 'Dossier personnel'],
     [['corbeille', 'poubelle'], '#corbeille', 'Corbeille'],
   ];
-  return list.filter(([keys]) => keys.some((k) => k.startsWith(n) || n.startsWith(k)))
+  return list.filter(([keys]) => keys.some((k) => k.startsWith(n) || n.startsWith(k) || osa(n, k.slice(0, n.length + 1)) <= tolerance(n.length)))
     .map(([, path, name]) => ({ name, path, dir: true, kind: 'folder', ext: '', special: true }));
 }
 function makeLauncher({ input, box, onAsk, always = false }) {
-  const L = { q: '', target: '', intent: null, items: [], idx: 0, seq: 0, files: null, loading: false };
+  const L = { q: '', target: '', intent: null, weak: false, items: [], idx: 0, seq: 0, files: null, loading: false };
   const visible = () => !box.hidden;
   const hide = () => { box.hidden = true; box.innerHTML = ''; L.items = []; reportSize(); };
   const search = debounce(async (q, seq) => {
@@ -538,7 +603,9 @@ function makeLauncher({ input, box, onAsk, always = false }) {
     const text = input.value.trim();
     L.q = text; L.seq++; L.idx = 0; L.files = null; L.loading = false;
     if (text.length < 2 || text.length > 90 || text.includes('\n')) return hide();
-    L.intent = parseIntent(text);
+    const pi = parseIntent(text);
+    L.intent = pi ? pi.target : null;
+    L.weak = pi ? pi.weak : false;
     L.target = L.intent || text;
     const words = L.target.split(/\s+/).length;
     if (D.apps === null) loadApps().then(build);
@@ -553,7 +620,7 @@ function makeLauncher({ input, box, onAsk, always = false }) {
     const acts = [...apps.map(({ a }) => ({ kind: 'app', a })), ...files.map((e) => ({ kind: 'file', e }))];
     const ask = { kind: 'ask' };
     const oneApp = apps.length && apps[0].s <= 1 && L.target.split(/\s+/).length <= 2;
-    const strong = L.intent ? acts.length > 0 : oneApp;
+    const strong = L.intent ? (L.weak ? apps.length > 0 && apps[0].s <= 7 : acts.length > 0) : oneApp;
     L.items = strong ? [acts[0], ask, ...acts.slice(1)] : [ask, ...acts];
     L.idx = Math.min(L.idx, L.items.length - 1);
     if (!always && !acts.length && !(L.intent && L.loading)) return hide();
