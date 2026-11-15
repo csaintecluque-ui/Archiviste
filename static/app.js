@@ -2445,7 +2445,7 @@ function updateModalBody(i) {
   const d = i.derniere || {};
   return `<p style="margin:0">Tu as la version <b>${esc(i.actuelle)}</b>. La version <b>${esc(d.version)}</b> est disponible${d.taille ? ` (${fmtSize(d.taille)})` : ''}.</p>
     ${d.notes ? `<div class="notes-maj md">${md(d.notes)}</div>` : ''}
-    <p class="muted" style="font-size:12.5px;margin:0">Archiviste télécharge le paquet depuis GitHub, vérifie son empreinte, puis ouvre l'installateur de paquets de Mint : clique sur « Installer » (ton mot de passe est demandé). Il te proposera ensuite de redémarrer.</p>`;
+    <p class="muted" style="font-size:12.5px;margin:0">Archiviste télécharge le paquet depuis GitHub, vérifie son empreinte, puis l'installe : ton mot de passe est demandé par une fenêtre de Mint. Il te proposera ensuite de redémarrer.</p>`;
 }
 function showUpdateModal() {
   const i = UPD.info;
@@ -2460,32 +2460,53 @@ function showUpdateModal() {
     onClose: () => { UPD.modal = null; },
   });
   UPD.modal = m;
+  const relaunchFooter = () => { m.mf.innerHTML = `<button class="btn" data-close>Plus tard</button><button class="btn primary" data-u="relaunch">${ic('refresh', 'sm')} Relancer maintenant</button>`; };
   m.el.addEventListener('click', async (e) => {
     const b = e.target.closest('[data-u]');
     if (!b) return;
     if (b.dataset.u === 'relaunch') return relaunchApp();
-    b.disabled = true;
-    b.innerHTML = '<span class="spinner"></span> Téléchargement…';
-    try {
-      const r = await post('/api/update/install');
-      m.mb.innerHTML = r.ouvert
-        ? `<div class="banner">${ic('info')}<div><b>L'installateur de paquets s'est ouvert.</b><br>Clique sur « Installer » et saisis ton mot de passe. Cette fenêtre te proposera ensuite de relancer Archiviste.</div></div>`
-        : `<div class="banner">${ic('info')}<div>Paquet téléchargé : <code>${esc(r.fichier)}</code><br>Ouvre-le (double-clic) pour l'installer, ou dans un terminal : <code>sudo apt install ${esc(r.fichier)}</code></div></div>`;
-      b.innerHTML = '<span class="spinner"></span> En attente de l\'installation…';
-      clearInterval(UPD.poll);
-      UPD.poll = setInterval(async () => {
-        const st = await refreshUpdate();
-        if (st && st.relancer) {
-          clearInterval(UPD.poll);
-          m.mb.innerHTML = updateModalBody(st);
-          b.disabled = false; b.dataset.u = 'relaunch'; b.innerHTML = `${ic('refresh', 'sm')} Relancer maintenant`;
-        }
-      }, 4000);
-      setTimeout(() => clearInterval(UPD.poll), 20 * 60 * 1000);
-    } catch (err) {
-      toast(err.message, 'err');
-      b.disabled = false; b.innerHTML = `${ic('download', 'sm')} Réessayer`;
+    const mode = b.dataset.u === 'installateur' ? 'installateur' : 'auto';
+    const ver = i.derniere?.version || '';
+    $$('[data-u]', m.el).forEach((x) => { x.disabled = true; });
+    b.innerHTML = '<span class="spinner"></span> Installation…';
+    if (mode === 'auto') {
+      m.mb.innerHTML = `<div class="banner">${ic('info')}<div><b>Téléchargement puis installation d'Archiviste ${esc(ver)}.</b><br>Une fenêtre de Mint va te demander ton mot de passe : il faut les droits d'administrateur pour installer un logiciel. Si une autre installation est en cours, Archiviste attend qu'elle se termine.</div></div>`;
     }
+    let r;
+    try { r = await post('/api/update/install', { mode }); } catch (err) {
+      toast(err.message, 'err');
+      $$('[data-u]', m.el).forEach((x) => { x.disabled = false; });
+      b.innerHTML = `${ic('download', 'sm')} Réessayer`;
+      return;
+    }
+    if (r.installe) {
+      const st = await refreshUpdate();
+      m.mb.innerHTML = updateModalBody(st && st.relancer ? st : { relancer: true, installee: r.version });
+      relaunchFooter();
+      return;
+    }
+    if (r.installe === false) {
+      m.mb.innerHTML = `<div class="banner danger">${ic('alert')}<div><b>${esc(r.erreur)}</b></div></div>
+        ${r.sortie ? `<details style="margin-top:10px"><summary class="muted" style="cursor:pointer;font-size:12.5px">Détails techniques</summary><pre class="pv-text" style="max-height:220px;white-space:pre-wrap">${esc(r.sortie)}</pre></details>` : ''}
+        <p class="muted" style="font-size:12.5px;margin:10px 0 0">Autre solution, dans un terminal : <code>sudo apt install ${esc(r.fichier)}</code></p>`;
+      m.mf.innerHTML = `<button class="btn" data-close>Fermer</button><button class="btn" data-u="installateur">Avec l'installateur de Mint</button><button class="btn primary" data-u="install">${ic('refresh', 'sm')} Réessayer</button>`;
+      return;
+    }
+    // installateur graphique de Mint (au choix, ou si la fenêtre de mot de passe n'existe pas sur ce PC)
+    m.mb.innerHTML = r.ouvert
+      ? `<div class="banner">${ic('info')}<div><b>L'installateur de paquets s'est ouvert.</b><br>Clique sur « Installer » et saisis ton mot de passe. Cette fenêtre te proposera ensuite de relancer Archiviste.</div></div>`
+      : `<div class="banner">${ic('info')}<div>Paquet téléchargé : <code>${esc(r.fichier)}</code><br>Dans un terminal : <code>sudo apt install ${esc(r.fichier)}</code></div></div>`;
+    b.innerHTML = '<span class="spinner"></span> En attente de l\'installation…';
+    clearInterval(UPD.poll);
+    UPD.poll = setInterval(async () => {
+      const st = await refreshUpdate();
+      if (st && st.relancer) {
+        clearInterval(UPD.poll);
+        m.mb.innerHTML = updateModalBody(st);
+        relaunchFooter();
+      }
+    }, 4000);
+    setTimeout(() => clearInterval(UPD.poll), 20 * 60 * 1000);
   });
 }
 

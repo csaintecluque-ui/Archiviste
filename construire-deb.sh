@@ -33,6 +33,11 @@ exec /usr/bin/python3 /opt/archiviste/archiviste.py "$@"
 EOF
 chmod 755 "$PKG/usr/bin/archiviste" "$PKG/usr/bin/archiviste-serveur"
 
+# Installation des mises à jour depuis l'appli (mot de passe demandé par la fenêtre de Mint)
+mkdir -p "$PKG/usr/lib/archiviste" "$PKG/usr/share/polkit-1/actions"
+install -m 755 paquet/installer-maj "$PKG/usr/lib/archiviste/installer-maj"
+install -m 644 paquet/fr.csc.archiviste.policy "$PKG/usr/share/polkit-1/actions/fr.csc.archiviste.policy"
+
 # Raccourci du menu
 cat > "$PKG/usr/share/applications/fr.csc.Archiviste.desktop" <<'EOF'
 [Desktop Entry]

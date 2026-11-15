@@ -1,5 +1,8 @@
 # Nouveautés
 
+## 1.4.2
+- **Mises à jour plus fiables** : Archiviste installe lui-même la nouvelle version (ton mot de passe est demandé par la fenêtre de Mint) au lieu de passer par l'installateur de paquets, qui pouvait échouer avec « erreur logicielle dans aptkit ». Si une autre installation est en cours, il attend qu'elle se termine ; en cas d'échec, il affiche la vraie raison et propose de réessayer.
+
 ## 1.4.1
 - **Une seule saisie sur le bureau** : la barre du haut disparaît, tout passe par la discussion du volet. Pendant que tu tapes, elle propose tes applis, tes fichiers et tes dossiers ; taper n'importe où sur le bureau y écrit directement.
 - **« ouvre Grimoire », « lance Firefox », « ouvre mes téléchargements »** : ouvert tout de suite, sans attendre l'IA.

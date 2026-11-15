@@ -1,0 +1,14 @@
+#!/bin/sh
+# Archiviste — installe sa propre mise à jour (lancé par pkexec, après le mot de passe).
+# N'accepte qu'un paquet .deb nommé « archiviste » ; apt-get attend qu'une autre installation se termine.
+set -eu
+deb="${1:-}"
+case "$deb" in
+  /*.deb) ;;
+  *) echo "Chemin de paquet invalide : $deb" >&2; exit 2 ;;
+esac
+[ -f "$deb" ] || { echo "Paquet introuvable : $deb" >&2; exit 2; }
+nom="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
+[ "$nom" = "archiviste" ] || { echo "Ce paquet n'est pas Archiviste ($nom)" >&2; exit 3; }
+export DEBIAN_FRONTEND=noninteractive
+exec /usr/bin/apt-get install -y --no-remove -o DPkg::Lock::Timeout=180 "$deb"

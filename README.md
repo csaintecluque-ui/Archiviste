@@ -55,7 +55,7 @@ Commandes : `archiviste` (fenêtre), `archiviste --bureau`, `archiviste --demand
 
 ## Mises à jour
 
-Archiviste vérifie les nouvelles versions sur ce dépôt au démarrage puis toutes les 6 heures. Quand il y en a une, une pastille apparaît en bas à gauche : un clic, il télécharge le paquet, **vérifie son empreinte**, et ouvre l'installateur de paquets de Mint (« Installer » + mot de passe). Il propose ensuite de redémarrer. Réglages → À propos : « Vérifier maintenant », ou désactiver la vérification automatique.
+Archiviste vérifie les nouvelles versions sur ce dépôt au démarrage puis toutes les 6 heures. Quand il y en a une, une pastille apparaît en bas à gauche : un clic, il télécharge le paquet, **vérifie son empreinte** et l'installe (ton mot de passe est demandé par la fenêtre de Mint ; il attend si une autre installation est en cours). Il propose ensuite de redémarrer. En cas d'échec, il affiche la raison, et « Avec l'installateur de Mint » reste possible. Réglages → À propos : « Vérifier maintenant », ou désactiver la vérification automatique.
 
 Pour publier une nouvelle version : change `VERSION` dans `archiviste.py`, ajoute une section dans `NOUVEAUTES.md`, puis pousse sur `main`. GitHub lance les tests, construit le `.deb` et publie la release `vX.Y.Z` avec ces notes ; les Archiviste installés la proposent ensuite d'eux-mêmes. Sur une pull request, le `.deb` est construit pour essai (onglet Actions → Artifacts) sans être publié.
 

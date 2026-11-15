@@ -37,7 +37,7 @@ from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -2307,7 +2307,12 @@ def check_update() -> dict:
     return update_info()
 
 
-def download_update() -> dict:
+UPDATE_HELPER = os.environ.get("ARCHIVISTE_MAJ_HELPER") or "/usr/lib/archiviste/installer-maj"
+_install_lock = threading.Lock()
+
+
+def fetch_update() -> tuple[Path, dict]:
+    """Télécharge le paquet de la dernière version (ou reprend celui déjà téléchargé s'il est intact)."""
     info = update_info() if UPDATE_STATE["latest"] else check_update()
     lt = UPDATE_STATE["latest"]
     if not info["disponible"]:
@@ -2319,6 +2324,14 @@ def download_update() -> dict:
     folder = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "archiviste" / "mises-a-jour"
     folder.mkdir(parents=True, exist_ok=True)
     dest, tmp = folder / name, folder / (name + ".part")
+    digest = str(lt.get("digest") or "")
+    if dest.is_file() and digest.startswith("sha256:"):
+        h = hashlib.sha256()
+        with open(dest, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() == digest[7:].lower():
+            return dest, lt
     sha = hashlib.sha256()
     req = urllib.request.Request(lt["deb"], headers={"User-Agent": f"Archiviste/{VERSION}"})
     try:
@@ -2336,7 +2349,6 @@ def download_update() -> dict:
     except ApiError:
         tmp.unlink(missing_ok=True)
         raise
-    digest = str(lt.get("digest") or "")
     with open(tmp, "rb") as f:
         magic = f.read(8)
     if magic != b"!<arch>\n" or (digest.startswith("sha256:") and digest[7:].lower() != sha.hexdigest()):
@@ -2346,9 +2358,80 @@ def download_update() -> dict:
     for old in folder.glob("archiviste_*_all.deb"):
         if old != dest:
             old.unlink(missing_ok=True)
-    opener = shutil.which("xdg-open")
-    opened = bool(opener) and _launch([opener, str(dest)])
-    return {"fichier": str(dest), "ouvert": opened, "version": lt["version"]}
+    return dest, lt
+
+
+def _apt_tail(out: str, n: int = 25) -> str:
+    lines = [l for l in out.replace("\r", "\n").splitlines()
+             if l.strip() and not re.match(r"^\(?(Lecture de la base|Reading database)", l)]
+    return "\n".join(lines[-n:])
+
+
+def _apt_explain(out: str, code: int) -> str:
+    low = out.lower()
+    if code == 126:
+        return "Installation annulée : le mot de passe n'a pas été saisi."
+    if code == 127:
+        return "Autorisation refusée par le système (ou aucune fenêtre de mot de passe disponible)."
+    if "could not get lock" in low or "verrou" in low or "lock-frontend" in low:
+        return ("Une autre installation occupe le gestionnaire de paquets (gestionnaire de mises à jour, "
+                "installateur encore ouvert…). Ferme-la ou attends une minute, puis réessaie.")
+    if "unmet dependencies" in low or "dépendances non satisfaites" in low or "--fix-broken" in low:
+        return ("Les paquets du système sont dans un état incohérent. Dans un terminal : "
+                "sudo apt --fix-broken install, puis réessaie.")
+    if "n'est pas archiviste" in low or "not archiviste" in low:
+        return "Le paquet téléchargé n'est pas celui d'Archiviste : installation refusée."
+    return "L'installation a échoué."
+
+
+def run_installer(deb: Path) -> dict | None:
+    """Installe le paquet avec apt-get, après le mot de passe demandé par la fenêtre de Mint (pkexec).
+    apt-get attend qu'une autre installation se termine au lieu d'échouer. Renvoie None si impossible ici."""
+    import tempfile
+    pk = os.environ.get("ARCHIVISTE_PKEXEC") or shutil.which("pkexec")
+    apt = shutil.which("apt-get")
+    if not pk or not apt:
+        return None
+    work = tempfile.mkdtemp(prefix="archiviste-maj-")
+    try:
+        os.chmod(work, 0o755)  # lisible par l'utilisateur « _apt » d'apt
+        copy = os.path.join(work, deb.name)
+        shutil.copyfile(deb, copy)
+        os.chmod(copy, 0o644)
+        if os.access(UPDATE_HELPER, os.X_OK):
+            cmd = [pk, UPDATE_HELPER, copy]
+        else:
+            cmd = [pk, "/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", apt, "install", "-y", "--no-remove",
+                   "-o", "DPkg::Lock::Timeout=180", copy]
+        try:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1500)
+        except subprocess.TimeoutExpired:
+            return {"installe": False, "erreur": "L'installation prend trop de temps : vérifie le gestionnaire de paquets.",
+                    "sortie": ""}
+        out = (r.stdout or "") + "\n" + (r.stderr or "")
+        ok = r.returncode == 0
+        return {"installe": ok, "erreur": None if ok else _apt_explain(out, r.returncode),
+                "sortie": _apt_tail(out), "code": r.returncode}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def download_update(mode: str = "auto") -> dict:
+    """Télécharge puis installe la mise à jour. mode « installateur » : ouvre plutôt l'installateur de Mint."""
+    if not _install_lock.acquire(blocking=False):
+        raise ApiError("Une installation est déjà en cours.")
+    try:
+        dest, lt = fetch_update()
+        if mode != "installateur":
+            res = run_installer(dest)
+            if res is not None:
+                res.update(fichier=str(dest), version=lt["version"], relancer=update_info()["relancer"])
+                return res
+        opener = shutil.which("xdg-open")
+        opened = bool(opener) and _launch([opener, str(dest)])
+        return {"fichier": str(dest), "ouvert": opened, "version": lt["version"]}
+    finally:
+        _install_lock.release()
 
 
 def _update_loop() -> None:
@@ -3461,7 +3544,7 @@ def r_update_check(h, q, b):
 
 @route("POST", "/api/update/install")
 def r_update_install(h, q, b):
-    return download_update()
+    return download_update(str(b.get("mode") or "auto"))
 
 
 @route("POST", "/api/app/relaunch")
