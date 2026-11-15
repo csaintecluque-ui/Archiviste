@@ -11,6 +11,7 @@ Rien ne quitte ta machine.
 | **Agents** | Assistants spécialisés : consignes + outils (lister, lire, chercher, écrire, déplacer, renommer, mettre à la corbeille, trouver les doublons) + un dossier de travail dont ils ne sortent pas. 4 agents fournis : Rangeur, Lecteur, Rédacteur, Nettoyeur. |
 | **Prompts** | Bibliothèque de consignes réutilisables, avec variables `{{comme_ceci}}` demandées au moment de l'utilisation. |
 | **Corbeille** | La même que celle de Nemo : restaurer ou supprimer définitivement. |
+| **Bureau** | En option, Archiviste remplace les icônes du bureau de Mint : tes fichiers, une barre « Demande à l'Archiviste… » qui cherche aussi tes applis et tes fichiers, et un volet à droite (raccourcis, fichiers à ranger, discussion). Clic droit sur une appli, un dossier ou un fichier → **Épingler aux raccourcis**. <kbd>Super</kbd>+<kbd>Espace</kbd> pose une question depuis n'importe quelle fenêtre. |
 | **Grimoire** | Si l'appli de bureau Grimoire est installée : les .docx et .xlsx s'ouvrent dedans d'un double-clic, « Fichier ▾ » crée un document Word ou un classeur qui s'y ouvre, et chaque réponse de l'IA peut partir dans Grimoire en document mis en forme (titres, listes, tableaux) ou, si elle contient des tableaux, en classeur. Les agents ont un outil « Créer un document Word/Excel ». |
 
 ## Installation
@@ -26,6 +27,29 @@ Raccourcis de la fenêtre : <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>Ctrl</kbd>+<kbd>
 Relancer Archiviste ramène la fenêtre existante au premier plan (une seule fenêtre à la fois). Le serveur tourne à l'intérieur de l'appli : fermer la fenêtre arrête tout.
 
 > Besoin de l'ouvrir dans un navigateur ? `archiviste-serveur` puis <http://127.0.0.1:8765>.
+
+## Bureau Archiviste
+
+**Réglages → Bureau → Activer le bureau Archiviste.** En un clic, Archiviste :
+
+1. masque les icônes du bureau de Nemo (réglage `org.nemo.desktop desktop-layout`, l'ancien est mémorisé) ;
+2. affiche son propre bureau sous toutes les fenêtres, sur l'écran principal : les fichiers de `~/Bureau`, le dossier personnel, la corbeille, les clés USB ; le fond d'écran reste celui de Cinnamon ;
+3. se lance à l'ouverture de session (`~/.config/autostart/archiviste-bureau.desktop`) ;
+4. ajoute le raccourci clavier <kbd>Super</kbd>+<kbd>Espace</kbd> → « Demander à l'Archiviste » (si cette touche est déjà prise, il en choisit une autre et l'affiche dans les réglages).
+
+| Sur le bureau | |
+|---|---|
+| Double-clic | ouvre (Word/Excel dans Grimoire, dossiers dans Archiviste ou Nemo selon le réglage, lanceurs .desktop) |
+| Clic droit sur un élément | Ouvrir avec…, Résumer avec l'IA, En discuter, **Épingler aux raccourcis**, Renommer, Corbeille… |
+| Clic droit sur le fond | nouveau dossier / document Word / classeur / fichier texte, ranger le bureau avec l'IA, trier les icônes, masquer le volet, fond d'écran |
+| Clavier | <kbd>Entrée</kbd> ouvrir · <kbd>F2</kbd> renommer · <kbd>Suppr</kbd> corbeille · <kbd>Ctrl</kbd>+<kbd>A</kbd> · flèches · taper du texte → barre de l'Archiviste |
+| Glisser-déposer | sur un dossier : déplacer (<kbd>Ctrl</kbd> : copier) · sur la corbeille · sur les raccourcis : épingler · sur la discussion : joindre · depuis Nemo : vers le bureau |
+
+Les raccourcis du volet : clic pour ouvrir, glisser pour réordonner, clic droit pour renommer ou retirer, « Modifier » pour retirer plusieurs, « + » pour ajouter une application (toutes celles du menu, tes favoris en premier), un dossier ou un fichier.
+
+Pour revenir au bureau de Mint : **Réglages → Bureau → Rendre le bureau à Nemo**, ou dans un terminal `archiviste --sans-bureau`. Tes raccourcis sont gardés.
+
+Commandes : `archiviste` (fenêtre), `archiviste --bureau`, `archiviste --demander`, `archiviste --sans-bureau`.
 
 ## Mises à jour
 
@@ -78,6 +102,9 @@ Sauvegarde / transfert de tes agents et prompts : **Réglages → Sauvegarde →
 | Réponses très lentes | Vérifie `nvidia-smi` pendant une réponse : si la carte ne travaille pas, installe le pilote NVIDIA. |
 | Un agent n'utilise pas ses outils | Petit modèle : reformule plus directement (« liste le dossier puis range les PDF dans Factures »), baisse sa température, ou choisis un modèle plus gros pour cet agent. |
 | Fenêtre blanche ou vide | Lance `archiviste` dans un terminal pour voir le message ; avec le pilote NVIDIA, essaie `WEBKIT_DISABLE_COMPOSITING_MODE=1 archiviste`. |
+| Bureau : le fond reste noir | Réglages → Bureau → Fond d'écran : « Dessiné par Archiviste ». |
+| Bureau : les icônes de Nemo réapparaissent par-dessus | Réglages → Bureau : désactive puis réactive (Archiviste remet `desktop-layout` à `false::false`). |
+| Bureau : tout revenir comme avant | `archiviste --sans-bureau` dans un terminal. |
 | Voir ce qui se passe | `ARCHIVISTE_DEBUG=1 archiviste` dans un terminal affiche les échanges. <kbd>F12</kbd> ouvre l'inspecteur. |
 
 ## Désinstallation
@@ -92,6 +119,7 @@ Sauvegarde / transfert de tes agents et prompts : **Réglages → Sauvegarde →
 - `construire-deb.sh` — construit `dist/archiviste_<version>_all.deb` (GitHub le fait tout seul à chaque version).
 - `tests/lancer.sh` — tests de bout en bout avec un faux Ollama (lancés aussi par GitHub avant chaque publication).
 - `NOUVEAUTES.md` — ce qui change à chaque version (repris dans la release et affiché dans l'appli).
+- `static/bureau.html`, `bureau.js`, `bureau.css` — le bureau et la fenêtre « Demander » (réutilisent les outils d'`app.js`). Côté serveur : section « Bureau » d'`archiviste.py` (lanceurs .desktop, icônes du thème, raccourcis, activation).
 - `static/app.js` — l'interface (sans framework). `static/app.css` — le style (palette encre / cuivre / parchemin).
 - Lancer à la main pour tester : `python3 fenetre.py` (fenêtre) ou `python3 archiviste.py` (navigateur) (variables : `ARCHIVISTE_PORT`, `ARCHIVISTE_DATA`, `ARCHIVISTE_DEBUG=1`).
 - Ajouter un outil d'agent : une entrée dans `TOOLS` + un bloc dans `execute_tool()`. Il apparaît automatiquement dans l'éditeur d'agents.

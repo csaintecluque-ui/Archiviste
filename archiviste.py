@@ -11,6 +11,7 @@ Données (réglages, prompts, agents, discussions, journal des tris) :
 """
 from __future__ import annotations
 
+import ast
 import base64
 import datetime as dt
 import hashlib
@@ -36,7 +37,7 @@ from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -235,7 +236,11 @@ def allowed_roots(settings: dict | None = None) -> list[str]:
         rp = os.path.realpath(os.path.expanduser(r))
         if os.path.isdir(rp):
             out.append(rp)
-    return out or [os.path.realpath(str(HOME))]
+    out = out or [os.path.realpath(str(HOME))]
+    desk = desktop_dir()  # le bureau reste toujours accessible
+    if desk != "/" and os.path.isdir(desk) and not any(within(desk, r) for r in out):
+        out.append(desk)
+    return out
 
 
 def within(path: str, root: str) -> bool:
@@ -692,14 +697,15 @@ def walk_files(base: str, show_hidden: bool, max_items: int = 20000, deadline: f
                 return
 
 
-def fs_search(base: str, query: str, in_content: bool, roots=None, show_hidden=False, limit=300) -> dict:
+def fs_search(base: str, query: str, in_content: bool, roots=None, show_hidden=False, limit=300,
+              delay: float = 12) -> dict:
     real = safe_path(base, roots=roots, must_exist=True)
     q = (query or "").strip()
     if not q:
         raise ApiError("Que faut-il chercher ?")
     wildcard = any(c in q for c in "*?[")
     ql = q.casefold()
-    results, deadline = [], time.time() + 12
+    results, deadline = [], time.time() + delay
     # dossiers dont le nom correspond
     for dirpath, dirnames, _ in os.walk(real):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and (show_hidden or not d.startswith("."))]
@@ -2318,6 +2324,877 @@ def _update_loop() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════
+#  Bureau : remplace le bureau de Nemo (icônes, raccourcis, volet IA)
+# ════════════════════════════════════════════════════════════════════
+UI_HOOK = None  # renseigné par fenetre.py : UI_HOOK(action, données) agit sur les fenêtres GTK
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+AUTOSTART = CONFIG_HOME / "autostart" / "archiviste-bureau.desktop"
+LANG_KEYS = [k for k in dict.fromkeys(
+    [(os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "fr_FR")
+     .split(".")[0].split("@")[0]]) if k and k not in ("C", "POSIX")]
+if LANG_KEYS and "_" in LANG_KEYS[0]:
+    LANG_KEYS.append(LANG_KEYS[0].split("_")[0])
+CUR_DESKTOPS = [d.strip() for d in (os.environ.get("XDG_CURRENT_DESKTOP") or "X-Cinnamon").split(":") if d.strip()]
+
+BUREAU_DEFAUT = {
+    "actif": False,            # le bureau Archiviste remplace celui de Nemo
+    "volet": True,             # volet de droite déplié
+    "conv": None,              # discussion du volet
+    "tri": "nom",              # nom | date | type
+    "dossiers": "archiviste",  # un dossier du bureau s'ouvre dans : archiviste | systeme
+    "fond": "auto",            # auto | archiviste : dessiner soi-même le fond d'écran
+    "nemo_avant": None,        # réglage du bureau de Nemo avant activation (pour le rétablir)
+    "touche": None,            # raccourci clavier « Demander à l'Archiviste » posé dans Cinnamon
+}
+
+
+def bureau_state() -> dict:
+    st = dict(BUREAU_DEFAUT)
+    st.update(store.read("bureau.json", dict))
+    return st
+
+
+def bureau_save(st: dict) -> None:
+    store.write("bureau.json", st)
+
+
+def user_dir(key: str, *fallbacks: str) -> str:
+    """Dossiers spéciaux de xdg-user-dirs : DESKTOP → ~/Bureau, DOWNLOAD → ~/Téléchargements…"""
+    try:
+        for line in (CONFIG_HOME / "user-dirs.dirs").read_text("utf-8").splitlines():
+            m = re.match(r'^\s*XDG_%s_DIR\s*=\s*"(.*)"\s*$' % key, line)
+            if m:
+                return os.path.realpath(os.path.expanduser(m.group(1).replace("$HOME", str(HOME))))
+    except OSError:
+        pass
+    for name in fallbacks:
+        if (HOME / name).is_dir():
+            return os.path.realpath(HOME / name)
+    return os.path.realpath(HOME / fallbacks[0])
+
+
+def desktop_dir() -> str:
+    return user_dir("DESKTOP", "Bureau", "Desktop")
+
+
+def downloads_dir() -> str:
+    return user_dir("DOWNLOAD", "Téléchargements", "Downloads")
+
+
+def path_label(p: str) -> str:
+    rp = os.path.realpath(p) if p else p
+    if rp == os.path.realpath(HOME):
+        return "Dossier personnel"
+    if rp == desktop_dir():
+        return "Bureau"
+    return os.path.basename(rp.rstrip("/")) or rp
+
+
+# ── commandes système ──
+def gs(*args, timeout: float = 6):
+    exe = shutil.which("gsettings")
+    if not exe:
+        return None
+    try:
+        return subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def gv(s):
+    """Valeur GVariant au format texte (chaîne, booléen, nombre, liste) → Python."""
+    if s is None:
+        return None
+    s = s.strip()
+    if s.startswith("@"):
+        s = s.split(" ", 1)[1] if " " in s else ""
+    if s in ("true", "false"):
+        return s == "true"
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
+
+def gv_quote(s: str) -> str:
+    return "'" + str(s).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def gv_list(items) -> str:
+    return "[" + ", ".join(gv_quote(x) for x in items) + "]" if items else "@as []"
+
+
+def gs_get(schema: str, key: str):
+    r = gs("get", schema, key)
+    return gv(r.stdout) if r is not None and r.returncode == 0 else None
+
+
+def gs_set(schema: str, key: str, value: str) -> bool:
+    r = gs("set", schema, key, value)
+    return r is not None and r.returncode == 0
+
+
+def gs_has(schema: str, key: str | None = None) -> bool:
+    r = gs("list-keys", schema)
+    return r is not None and r.returncode == 0 and (key is None or key in r.stdout.split())
+
+
+# ── lanceurs .desktop ──
+_DESK_ESC = {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\", ";": ";"}
+
+
+def _desk_unescape(v: str) -> str:
+    return re.sub(r"\\(.)", lambda m: _DESK_ESC.get(m.group(1), m.group(0)), v)
+
+
+def read_ini_section(path: str, section: str = "Desktop Entry") -> dict | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read(300_000)
+    except OSError:
+        return None
+    entry, inside = {}, False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if inside:
+                break
+            inside = line[1:-1] == section
+            continue
+        if inside and "=" in line:
+            k, v = line.split("=", 1)
+            entry.setdefault(k.strip(), v.strip())
+    return entry or None
+
+
+def desk_val(e: dict, key: str, localized: bool = True) -> str:
+    if localized:
+        for lk in LANG_KEYS:
+            v = e.get(f"{key}[{lk}]")
+            if v:
+                return _desk_unescape(v)
+    return _desk_unescape(e.get(key, ""))
+
+
+def desk_list(e: dict, key: str, localized: bool = False) -> list[str]:
+    raw = ""
+    if localized:
+        raw = next((e[f"{key}[{lk}]"] for lk in LANG_KEYS if e.get(f"{key}[{lk}]")), "")
+    raw = raw or e.get(key, "")
+    return [_desk_unescape(x).strip() for x in re.split(r"(?<!\\);", raw) if x.strip()]
+
+
+def app_visible(e: dict) -> bool:
+    if e.get("Type", "Application") != "Application":
+        return False
+    if to_bool(e.get("NoDisplay")) or to_bool(e.get("Hidden")):
+        return False
+    only = desk_list(e, "OnlyShowIn")
+    if only and not any(d in only for d in CUR_DESKTOPS):
+        return False
+    if any(d in desk_list(e, "NotShowIn") for d in CUR_DESKTOPS):
+        return False
+    tx = e.get("TryExec")
+    if tx and not (os.access(tx, os.X_OK) if os.path.isabs(tx) else shutil.which(tx)):
+        return False
+    return bool(e.get("Exec"))
+
+
+def app_dirs() -> list[str]:
+    dirs = [XDG_DATA / "applications"]
+    for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"):
+        if d.strip():
+            dirs.append(Path(d.strip()) / "applications")
+    dirs += [XDG_DATA / "flatpak/exports/share/applications", Path("/var/lib/flatpak/exports/share/applications"),
+             Path("/var/lib/snapd/desktop/applications")]
+    out = []
+    for d in dirs:
+        rp = os.path.realpath(d)
+        if rp not in out and os.path.isdir(rp):
+            out.append(rp)
+    return out
+
+
+def app_info(aid: str, path: str, e: dict) -> dict:
+    return {"id": aid, "nom": desk_val(e, "Name") or aid[:-8], "generique": desk_val(e, "GenericName"),
+            "description": desk_val(e, "Comment"), "icone": e.get("Icon", ""), "fichier": path,
+            "categories": desk_list(e, "Categories"), "mots": desk_list(e, "Keywords", True),
+            "mime": desk_list(e, "MimeType"), "exec": e.get("Exec", ""), "terminal": to_bool(e.get("Terminal"))}
+
+
+def public_app(a: dict) -> dict:
+    return {k: a[k] for k in ("id", "nom", "generique", "description", "icone", "categories", "mots")}
+
+
+_APPS = {"sig": None, "list": [], "by_id": {}}
+_APPS_LOCK = threading.Lock()
+
+
+def apps_index() -> dict:
+    """Applications installées (menu de Mint), lues dans les fichiers .desktop, mises en cache."""
+    dirs = app_dirs()
+    sig = []
+    for d in dirs:
+        try:
+            sig.append((d, os.stat(d).st_mtime_ns))
+        except OSError:
+            pass
+    sig = tuple(sig)
+    with _APPS_LOCK:
+        if _APPS["sig"] == sig:
+            return _APPS
+        by_id, seen = {}, set()
+        for d in dirs:
+            for dirpath, _, files in os.walk(d):
+                for fn in sorted(files):
+                    if not fn.endswith(".desktop"):
+                        continue
+                    full = os.path.join(dirpath, fn)
+                    aid = os.path.relpath(full, d).replace(os.sep, "-")
+                    if aid in seen:
+                        continue
+                    seen.add(aid)
+                    e = read_ini_section(full)
+                    if e and app_visible(e):
+                        by_id[aid] = app_info(aid, full, e)
+        _APPS.update(sig=sig, by_id=by_id, list=sorted(by_id.values(), key=lambda a: a["nom"].casefold()))
+        return _APPS
+
+
+def _exec_cmd(a: dict) -> str:
+    return os.path.basename((a.get("exec") or "").split(" ", 1)[0].strip('"'))
+
+
+def find_app(*names: str) -> str | None:
+    """Identifiant d'une appli installée d'après son nom de commande ou de fichier .desktop."""
+    apps = apps_index()["by_id"]
+    want = {n.lower() for n in names}
+    for a in apps.values():
+        stem = a["id"][:-8].lower()
+        if stem in want or stem.rsplit(".", 1)[-1] in want or _exec_cmd(a).lower() in want:
+            return a["id"]
+    return None
+
+
+def terminal_app() -> str | None:
+    pref = gs_get("org.cinnamon.desktop.default-applications.terminal", "exec")
+    found = find_app(os.path.basename(pref)) if isinstance(pref, str) and pref else None
+    if found:
+        return found
+    found = find_app("gnome-terminal", "org.gnome.terminal", "xfce4-terminal", "tilix", "konsole", "mate-terminal")
+    if found:
+        return found
+    return next((a["id"] for a in apps_index()["list"] if "TerminalEmulator" in a["categories"]), None)
+
+
+_GIO_LAUNCH = None
+
+
+def gio_launch_ok() -> bool:
+    global _GIO_LAUNCH
+    if _GIO_LAUNCH is None:
+        exe = shutil.which("gio")
+        try:
+            _GIO_LAUNCH = bool(exe) and subprocess.run([exe, "help", "launch"], capture_output=True,
+                                                       timeout=5).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _GIO_LAUNCH = False
+    return _GIO_LAUNCH
+
+
+def exec_argv(e: dict, path: str, files: list[str]) -> list[str]:
+    """Commande d'un lanceur (codes %f, %U… remplacés), si « gio launch » n'est pas disponible."""
+    import shlex
+    try:
+        args = shlex.split(e.get("Exec", ""))
+    except ValueError:
+        raise ApiError("La commande de ce lanceur est illisible.")
+    out = []
+    for a in args:
+        if a in ("%f", "%u"):
+            out += files[:1]
+        elif a in ("%F", "%U"):
+            out += files
+        elif a == "%i":
+            if e.get("Icon"):
+                out += ["--icon", e["Icon"]]
+        elif a == "%c":
+            out.append(desk_val(e, "Name"))
+        elif a == "%k":
+            out.append(path)
+        else:
+            a = re.sub(r"%([a-zA-Z%])", lambda m: "%" if m.group(1) == "%" else "", a)
+            if a:
+                out.append(a)
+    if not out:
+        raise ApiError("Ce lanceur n'a pas de commande.")
+    if to_bool(e.get("Terminal")):
+        term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal")
+        if term:
+            out = [term, "-e"] + out
+    return out
+
+
+def launch_desktop(path: str, files: list[str] | None = None) -> None:
+    import tempfile
+    files = files or []
+    e = read_ini_section(path)
+    if not e:
+        raise ApiError("Lanceur illisible.")
+    if e.get("Type") == "Link":
+        url = e.get("URL", "")
+        if not url.startswith(("http://", "https://", "file://")):
+            raise ApiError("Lien non pris en charge.")
+        opener = shutil.which("xdg-open")
+        if not opener or not _launch([opener, url]):
+            raise ApiError("Impossible d'ouvrir ce lien.")
+        return
+    if gio_launch_ok():
+        with tempfile.TemporaryFile() as err:
+            try:
+                r = subprocess.run(["gio", "launch", path, *files], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=err, timeout=10, start_new_session=True)
+                if r.returncode == 0:
+                    return
+            except subprocess.TimeoutExpired:
+                return
+            except OSError:
+                pass
+    if not _launch(exec_argv(e, path, files)):
+        raise ApiError("Le lancement a échoué.")
+
+
+def mime_of(path: str) -> str:
+    if os.path.isdir(path):
+        return "inode/directory"
+    exe = shutil.which("gio")
+    if exe:
+        try:
+            r = subprocess.run([exe, "info", "-a", "standard::content-type", path],
+                               capture_output=True, text=True, timeout=5)
+            m = re.search(r"standard::content-type:\s*(\S+)", r.stdout)
+            if m:
+                return m.group(1)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+
+def apps_for(path: str) -> dict:
+    mime = mime_of(path)
+    idx = apps_index()
+    defaut = None
+    exe = shutil.which("xdg-mime")
+    if exe:
+        try:
+            r = subprocess.run([exe, "query", "default", mime], capture_output=True, text=True, timeout=5)
+            defaut = r.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            pass
+    family = mime.split("/")[0] + "/*"
+    apps = [a for a in idx["list"] if mime in a["mime"] or family in a["mime"]]
+    if mime.startswith("text/") and mime != "text/plain":
+        apps += [a for a in idx["list"] if "text/plain" in a["mime"] and a not in apps]
+    apps.sort(key=lambda a: (a["id"] != defaut, a["nom"].casefold()))
+    return {"mime": mime, "defaut": defaut if defaut in idx["by_id"] else None, "apps": [public_app(a) for a in apps]}
+
+
+# ── icônes du thème (Mint-Y…) ──
+_ICON_IDX: dict = {}
+_ICON_LOCK = threading.Lock()
+_ICON_THEME = {"name": None, "t": 0.0}
+ICON_DIR_RE = re.compile(r"^(\d+)(?:x\d+)?(?:@(\d+)x?)?$")
+ICON_FILE_EXTS = (".png", ".svg")
+
+
+def icon_bases() -> list[str]:
+    bases = [str(HOME / ".icons"), str(XDG_DATA / "icons")]
+    for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"):
+        if d.strip():
+            bases.append(os.path.join(d.strip(), "icons"))
+    bases += [str(XDG_DATA / "flatpak/exports/share/icons"), "/var/lib/flatpak/exports/share/icons"]
+    out = []
+    for b in bases:
+        rp = os.path.realpath(b)
+        if rp not in out and os.path.isdir(rp):
+            out.append(rp)
+    return out
+
+
+def icon_theme_name() -> str:
+    if _ICON_THEME["name"] and time.time() - _ICON_THEME["t"] < 60:
+        return _ICON_THEME["name"]
+    name = None
+    for schema in ("org.cinnamon.desktop.interface", "org.gnome.desktop.interface"):
+        v = gs_get(schema, "icon-theme")
+        if isinstance(v, str) and v:
+            name = v
+            break
+    if not name:
+        ini = read_ini_section(str(CONFIG_HOME / "gtk-3.0" / "settings.ini"), "Settings") or {}
+        name = ini.get("gtk-icon-theme-name") or "hicolor"
+    _ICON_THEME.update(name=name, t=time.time())
+    return name
+
+
+def theme_chain(name: str) -> list[str]:
+    chain, todo = [], [name]
+    while todo:
+        t = todo.pop(0)
+        if t in chain or len(chain) > 12:
+            continue
+        chain.append(t)
+        for b in icon_bases():
+            idx = read_ini_section(os.path.join(b, t, "index.theme"), "Icon Theme")
+            if idx is not None:
+                todo += [x.strip() for x in idx.get("Inherits", "").split(",") if x.strip()]
+                break
+    for t in ("Mint-Y", "Adwaita", "hicolor"):
+        if t not in chain:
+            chain.append(t)
+    return chain
+
+
+def theme_index(theme: str) -> dict:
+    with _ICON_LOCK:
+        if theme in _ICON_IDX:
+            return _ICON_IDX[theme]
+        idx: dict[str, list] = {}
+        for b in icon_bases():
+            root = os.path.join(b, theme)
+            if not os.path.isdir(root):
+                continue
+            for dirpath, _, files in os.walk(root):
+                rel = os.path.relpath(dirpath, root).split(os.sep)
+                size = 0
+                for part in rel:
+                    m = ICON_DIR_RE.match(part)
+                    if m:
+                        size = int(m.group(1)) * int(m.group(2) or 1)
+                for fn in files:
+                    stem, ext = os.path.splitext(fn)
+                    ext = ext.lower()
+                    if ext in ICON_FILE_EXTS:
+                        idx.setdefault(stem, []).append((10_000 if ext == ".svg" else size, os.path.join(dirpath, fn)))
+        _ICON_IDX[theme] = idx
+        return idx
+
+
+def find_icon(name: str, size: int = 48) -> str | None:
+    name = (name or "").strip()
+    if not name or "\x00" in name:
+        return None
+    if os.path.isabs(name):
+        ok = os.path.splitext(name)[1].lower() in (".png", ".svg", ".jpg", ".jpeg", ".webp", ".gif", ".ico")
+        return name if ok and os.path.isfile(name) and os.path.getsize(name) < 4_000_000 else None
+    stem = name[:-4] if name.lower().endswith((".png", ".svg", ".xpm")) else name
+    want = max(16, min(512, size)) * 2  # net sur écran HiDPI ou avec zoom
+    for theme in theme_chain(icon_theme_name()):
+        cands = theme_index(theme).get(stem)
+        if not cands:
+            continue
+        svg = [p for s, p in cands if s == 10_000]
+        if svg:
+            return svg[0]
+        bigger = sorted(c for c in cands if c[0] >= want)
+        return (bigger[0] if bigger else max(cands))[1]
+    for d in ("/usr/share/pixmaps", str(XDG_DATA / "pixmaps")):
+        for ext in ICON_FILE_EXTS:
+            p = os.path.join(d, stem + ext)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+# ── fond d'écran ──
+WALL_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "svg"}
+
+
+def wallpaper_info() -> dict:
+    uri = opts = color = None
+    for schema in ("org.cinnamon.desktop.background", "org.gnome.desktop.background"):
+        uri = gs_get(schema, "picture-uri")
+        if isinstance(uri, str):
+            opts = gs_get(schema, "picture-options")
+            color = gs_get(schema, "primary-color")
+            break
+    path = None
+    if isinstance(uri, str) and uri.startswith("file://"):
+        path = urllib.parse.unquote(urllib.parse.urlsplit(uri).path)
+        if not os.path.isfile(path) or ext_of(path) not in WALL_EXTS:
+            path = None
+    return {"chemin": path, "options": opts if isinstance(opts, str) else "zoom",
+            "couleur": color if isinstance(color, str) and color.startswith("#") else "#1b1512",
+            "mtime": os.path.getmtime(path) if path else 0}
+
+
+# ── contenu du bureau ──
+def volumes() -> list[dict]:
+    """Clés USB et disques montés (comme les icônes de volumes du bureau de Nemo)."""
+    user = os.environ.get("USER") or HOME.name
+    out = []
+    for base in (f"/media/{user}", f"/run/media/{user}"):
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(base, n)
+            if os.path.ismount(p):
+                out.append({"nom": n, "path": p})
+    return out
+
+
+def trash_count() -> int:
+    try:
+        return len(os.listdir(TRASH_DIR / "files"))
+    except OSError:
+        return 0
+
+
+def bureau_sig() -> str:
+    parts = []
+    for p in (desktop_dir(), str(TRASH_DIR / "files")):
+        try:
+            parts.append(str(os.stat(p).st_mtime_ns))
+        except OSError:
+            parts.append("0")
+    parts.append(",".join(v["nom"] for v in volumes()))
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+def launcher_info(path: str) -> dict | None:
+    e = read_ini_section(path)
+    if not e:
+        return None
+    return {"nom": desk_val(e, "Name") or os.path.basename(path)[:-8], "icone": e.get("Icon", ""),
+            "description": desk_val(e, "Comment"), "type": e.get("Type", "Application"),
+            "fiable": os.access(path, os.X_OK)}
+
+
+def bureau_elements() -> dict:
+    desk = desktop_dir()
+    os.makedirs(desk, exist_ok=True)
+    items = []
+    with os.scandir(desk) as it:
+        for de in it:
+            if de.name.startswith(".") or de.name.endswith(".archiviste-part"):
+                continue
+            e = entry_info(de.path, de.name)
+            if not e["dir"] and e["ext"] == "desktop":
+                e["lanceur"] = launcher_info(de.path)
+            items.append(e)
+    return {"dossier": desk, "elements": items, "volumes": volumes(), "corbeille": trash_count(),
+            "home": str(HOME), "sig": bureau_sig()}
+
+
+def a_ranger() -> dict:
+    """Fichiers « en vrac » dans Téléchargements et sur le bureau."""
+    out = {}
+    for key, path in (("telechargements", downloads_dir()), ("bureau", desktop_dir())):
+        n, oldest, size = 0, None, 0
+        try:
+            with os.scandir(path) as it:
+                for de in it:
+                    if de.name.startswith(".") or de.name.endswith((".desktop", ".part", ".crdownload",
+                                                                    ".archiviste-part")):
+                        continue
+                    try:
+                        if de.is_dir():
+                            continue
+                        st = de.stat()
+                    except OSError:
+                        continue
+                    n += 1
+                    size += st.st_size
+                    oldest = st.st_mtime if oldest is None else min(oldest, st.st_mtime)
+        except OSError:
+            pass
+        out[key] = {"chemin": path, "fichiers": n, "depuis": oldest, "taille": size}
+    return out
+
+
+# ── raccourcis du volet ──
+MAX_SHORTCUTS = 32
+
+
+def default_shortcuts() -> list[dict]:
+    sc = [{"type": "archiviste", "cible": ""}]
+    g = find_app("grimoire")
+    if g:
+        sc.append({"type": "app", "cible": g})
+    sc.append({"type": "dossier", "cible": os.path.realpath(HOME)})
+    for key, fb in (("DOCUMENTS", ("Documents",)), ("DOWNLOAD", ("Téléchargements", "Downloads"))):
+        p = user_dir(key, *fb)
+        if os.path.isdir(p) and p != os.path.realpath(HOME):
+            sc.append({"type": "dossier", "cible": p})
+    t = terminal_app()
+    if t:
+        sc.append({"type": "app", "cible": t})
+    for s in sc:
+        s["id"] = new_id("r_")
+    return sc
+
+
+def shortcuts_raw() -> list[dict]:
+    st = store.read("bureau.json", dict)
+    if not isinstance(st.get("raccourcis"), list):
+        st["raccourcis"] = default_shortcuts()
+        store.write("bureau.json", st)
+    return st["raccourcis"]
+
+
+def shortcuts_save(lst: list[dict]) -> None:
+    st = store.read("bureau.json", dict)
+    st["raccourcis"] = lst
+    store.write("bureau.json", st)
+
+
+def resolve_shortcut(s: dict) -> dict:
+    r = {"id": s.get("id"), "type": s.get("type"), "cible": s.get("cible", ""), "nom": s.get("nom") or ""}
+    t = r["type"]
+    if t == "archiviste":
+        r.update(titre=r["nom"] or "Archiviste", ok=True, description="Ouvrir la fenêtre d'Archiviste")
+    elif t == "app":
+        c = r["cible"]
+        if os.path.isabs(c):
+            li = launcher_info(c) if os.path.isfile(c) else None
+            r.update(titre=r["nom"] or (li["nom"] if li else os.path.basename(c)), icone=li["icone"] if li else "",
+                     ok=bool(li), description=(li or {}).get("description", ""))
+        else:
+            a = apps_index()["by_id"].get(c)
+            r.update(titre=r["nom"] or (a["nom"] if a else c.removesuffix(".desktop")), icone=a["icone"] if a else "",
+                     ok=bool(a), description=a["description"] if a else "")
+    else:
+        p = r["cible"]
+        ok = os.path.exists(p)
+        r.update(titre=r["nom"] or path_label(p), ok=ok, description=p)
+        if ok:
+            e = entry_info(p)
+            r.update(ext=e["ext"], kind=e["kind"], dir=e["dir"])
+    if not r.get("ok"):
+        r["description"] = "Introuvable : " + (r.get("description") or r["cible"])
+    return r
+
+
+def shortcuts() -> list[dict]:
+    return [resolve_shortcut(s) for s in shortcuts_raw()]
+
+
+def shortcut_add(b: dict) -> dict:
+    t = str(b.get("type") or "")
+    cible = str(b.get("cible") or "")
+    lst = shortcuts_raw()
+    if t == "archiviste":
+        cible = ""
+    elif t == "app":
+        if os.path.isabs(cible):
+            cible = os.path.realpath(cible)
+            if not cible.endswith(".desktop") or not os.path.isfile(cible):
+                raise ApiError("Lanceur introuvable.", 404)
+            # copie d'une appli du menu (« Ajouter au bureau ») : on épingle l'appli elle-même
+            ex = (read_ini_section(cible) or {}).get("Exec")
+            bn = os.path.basename(cible).lower()
+            same = next((a for a in apps_index()["list"] if a["id"].lower() == bn or (ex and a["exec"] == ex)), None)
+            if same:
+                cible = same["id"]
+        elif cible not in apps_index()["by_id"]:
+            raise ApiError("Cette application n'est pas installée.", 404)
+    elif t in ("dossier", "fichier"):
+        cible = safe_path(cible, must_exist=True)
+        t = "dossier" if os.path.isdir(cible) else "fichier"
+    else:
+        raise ApiError("Type de raccourci inconnu.")
+    for s in lst:
+        if s.get("type") == t and s.get("cible", "") == cible:
+            return {"deja": True, "raccourci": resolve_shortcut(s), "raccourcis": shortcuts()}
+    if len(lst) >= MAX_SHORTCUTS:
+        raise ApiError(f"Le volet est plein ({MAX_SHORTCUTS} raccourcis) : retires-en un d'abord.")
+    item = {"id": new_id("r_"), "type": t, "cible": cible}
+    nom = str(b.get("nom") or "").strip()[:60]
+    if nom:
+        item["nom"] = nom
+    lst.append(item)
+    shortcuts_save(lst)
+    return {"deja": False, "raccourci": resolve_shortcut(item), "raccourcis": shortcuts()}
+
+
+# ── activation : démarrage auto, bureau de Nemo, raccourci clavier ──
+KB_BASE = "org.cinnamon.desktop.keybindings"
+KB_RELOC = "org.cinnamon.desktop.keybindings.custom-keybinding"
+KB_NAME = "archiviste-demander"
+KB_CANDIDATS = ["<Super>space", "<Primary><Alt>space", "<Super><Alt>space"]
+
+
+def launcher_cmd() -> str:
+    if shutil.which("archiviste"):
+        return "archiviste"
+    return f'"{sys.executable}" "{APP_DIR / "fenetre.py"}"'
+
+
+def accel_label(a: str | None) -> str:
+    if not a:
+        return ""
+    names = {"super": "Super", "primary": "Ctrl", "control": "Ctrl", "alt": "Alt", "shift": "Maj"}
+    mods = [names.get(m.lower(), m) for m in re.findall(r"<([^>]+)>", a)]
+    key = re.sub(r"<[^>]+>", "", a)
+    key = {"space": "Espace"}.get(key.lower(), key.upper() if len(key) == 1 else key)
+    return " + ".join(mods + [key])
+
+
+def _norm_accel(a: str) -> str:
+    return re.sub(r"<(control|ctrl)>", "<primary>", a.strip().lower())
+
+
+def _kb_path(name: str) -> str:
+    return f"/org/cinnamon/desktop/keybindings/custom-keybindings/{name}/"
+
+
+def used_accels() -> set[str]:
+    acc: set[str] = set()
+    for schema in (KB_BASE, KB_BASE + ".wm", KB_BASE + ".media-keys"):
+        r = gs("list-recursively", schema)
+        if r is None or r.returncode != 0:
+            continue
+        for line in r.stdout.splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) == 3:
+                v = gv(parts[2])
+                for x in (v if isinstance(v, list) else [v]):
+                    if isinstance(x, str) and x.startswith("<"):
+                        acc.add(_norm_accel(x))
+    for name in gs_get(KB_BASE, "custom-list") or []:
+        if name == KB_NAME:
+            continue
+        v = gs_get(f"{KB_RELOC}:{_kb_path(name)}", "binding")
+        for x in (v if isinstance(v, list) else [v]):
+            if isinstance(x, str) and x:
+                acc.add(_norm_accel(x))
+    return acc
+
+
+def set_keybinding(on: bool, st: dict) -> dict:
+    step = {"etape": "touche", "titre": "Raccourci clavier « Demander à l'Archiviste »"}
+    if not gs_has(KB_BASE, "custom-list"):
+        st["touche"] = None
+        return {**step, "ok": None, "message": "Raccourcis personnalisés de Cinnamon introuvables."}
+    reloc = f"{KB_RELOC}:{_kb_path(KB_NAME)}"
+    cur = [x for x in (gs_get(KB_BASE, "custom-list") or []) if isinstance(x, str)]
+    if not on:
+        ok = True
+        if KB_NAME in cur:
+            ok = gs_set(KB_BASE, "custom-list", gv_list([x for x in cur if x != KB_NAME]))
+        for k in ("name", "command", "binding"):
+            gs("reset", reloc, k)
+        st["touche"] = None
+        return {**step, "ok": ok, "message": "Raccourci retiré." if ok else "Impossible de retirer le raccourci."}
+    used = used_accels()
+    accel = next((a for a in KB_CANDIDATS if _norm_accel(a) not in used), None)
+    if not accel:
+        return {**step, "ok": False, "message": "Super + Espace et ses variantes sont déjà pris : choisis une touche "
+                                                "dans Paramètres système › Clavier (commande : archiviste --demander)."}
+    rng = gs("range", reloc, "binding")
+    single = rng is not None and rng.returncode == 0 and rng.stdout.split()[-1:] == ["s"]
+    ok = (gs_set(reloc, "name", gv_quote("Archiviste — demander"))
+          and gs_set(reloc, "command", gv_quote(launcher_cmd() + " --demander"))
+          and gs_set(reloc, "binding", gv_quote(accel) if single else gv_list([accel])))
+    if ok and KB_NAME not in cur:
+        ok = gs_set(KB_BASE, "custom-list", gv_list(cur + [KB_NAME]))
+    st["touche"] = accel if ok else None
+    return {**step, "ok": ok, "message": f"{accel_label(accel)} ouvre « Demander à l'Archiviste » partout."
+            if ok else "Le raccourci n'a pas pu être enregistré dans Cinnamon."}
+
+
+def set_nemo_desktop(show: bool, st: dict) -> dict:
+    step = {"etape": "nemo", "titre": "Icônes du bureau de Nemo"}
+    schema = "org.nemo.desktop"
+    if gs_has(schema, "desktop-layout"):
+        cur = gs_get(schema, "desktop-layout")
+        if show:
+            val = st.get("nemo_avant") or "true::false"
+            if not isinstance(val, str) or val.startswith("false::false"):
+                val = "true::false"
+            ok = gs_set(schema, "desktop-layout", gv_quote(val))
+            if ok:
+                st["nemo_avant"] = None
+            return {**step, "ok": ok, "message": "Bureau de Nemo rétabli." if ok else "Impossible de rétablir Nemo."}
+        if isinstance(cur, str) and not cur.startswith("false::false"):
+            st["nemo_avant"] = cur
+        ok = gs_set(schema, "desktop-layout", "'false::false'")
+        return {**step, "ok": ok, "message": "Les icônes de Nemo laissent la place à Archiviste." if ok
+                else "Impossible de masquer les icônes de Nemo."}
+    if gs_has(schema, "show-desktop-icons"):
+        ok = gs_set(schema, "show-desktop-icons", "true" if show else "false")
+        return {**step, "ok": ok, "message": "Réglage de Nemo mis à jour." if ok else "Réglage de Nemo impossible."}
+    return {**step, "ok": None, "message": "Bureau de Nemo non détecté : rien à masquer."}
+
+
+def set_autostart(on: bool) -> dict:
+    step = {"etape": "demarrage", "titre": "Démarrage avec la session"}
+    try:
+        if on:
+            AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+            AUTOSTART.write_text(
+                "[Desktop Entry]\nType=Application\nName=Archiviste — bureau\n"
+                "Comment=Bureau Archiviste : icônes, raccourcis et IA locale\n"
+                f"Exec={launcher_cmd()} --bureau\nIcon=archiviste\nTerminal=false\n"
+                "X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Phase=Desktop\n", "utf-8")
+            return {**step, "ok": True, "message": "Le bureau Archiviste s'affichera à chaque ouverture de session."}
+        AUTOSTART.unlink(missing_ok=True)
+        return {**step, "ok": True, "message": "Démarrage automatique retiré."}
+    except OSError as e:
+        return {**step, "ok": False, "message": f"Fichier de démarrage impossible : {e}"}
+
+
+def bureau_activer(on: bool) -> dict:
+    st = bureau_state()
+    rapport = [set_autostart(on), set_nemo_desktop(not on, st), set_keybinding(on, st)]
+    st["actif"] = on
+    bureau_save(st)
+    if UI_HOOK:
+        UI_HOOK("bureau", {"actif": on})
+    return {"actif": on, "rapport": rapport, "fenetre": UI_HOOK is not None,
+            "touche": st.get("touche"), "touche_label": accel_label(st.get("touche"))}
+
+
+def bureau_public() -> dict:
+    st = bureau_state()
+    st.pop("raccourcis", None)
+    st.update(dossier=desktop_dir(), telechargements=downloads_dir(), documents=user_dir("DOCUMENTS", "Documents"),
+              home=str(HOME), touche_label=accel_label(st.get("touche")), demarrage=AUTOSTART.exists(),
+              fenetre=UI_HOOK is not None, cinnamon="CINNAMON" in ":".join(CUR_DESKTOPS).upper())
+    return st
+
+
+def bureau_conv(new: bool = False, agent_id=None) -> dict:
+    st = bureau_state()
+    if not new and st.get("conv"):
+        try:
+            return load_conv(st["conv"])
+        except ApiError:
+            pass
+    c = create_conv({"agent_id": agent_id} if agent_id else {})
+    st["conv"] = c["id"]
+    bureau_save(st)
+    return c
+
+
+SETTINGS_MODULES = {"backgrounds", "display", "desktop", "keyboard", "themes", "panel", "applets"}
+
+
+def open_system_settings(module: str) -> bool:
+    if module not in SETTINGS_MODULES:
+        raise ApiError("Réglage inconnu.")
+    if shutil.which("cinnamon-settings"):
+        return _launch(["cinnamon-settings", module])
+    if shutil.which("gnome-control-center"):
+        return _launch(["gnome-control-center", {"backgrounds": "background"}.get(module, module)])
+    return False
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Serveur HTTP
 # ════════════════════════════════════════════════════════════════════
 ROUTES: list[tuple[str, re.Pattern, object, str]] = []
@@ -2567,6 +3444,8 @@ def r_trash(h, q, b):
 @route("GET", "/api/fs/search")
 def r_search(h, q, b):
     s = get_settings()
+    if q1(q, "rapide") == "1":  # barre de recherche du bureau : peu de résultats, tout de suite
+        return fs_search(q1(q, "path"), q1(q, "q"), False, show_hidden=s["show_hidden"], limit=24, delay=2.5)
     return fs_search(q1(q, "path"), q1(q, "q"), q1(q, "content") == "1", show_hidden=s["show_hidden"])
 
 
@@ -2780,6 +3659,232 @@ def r_oneshot(h, q, b):
     run_oneshot(h, b)
 
 
+# ── Bureau ──
+@route("GET", "/api/bureau")
+def r_bureau(h, q, b):
+    return bureau_public()
+
+
+@route("POST", "/api/bureau/reglages")
+def r_bureau_reglages(h, q, b):
+    st = bureau_state()
+    if "volet" in b:
+        st["volet"] = to_bool(b["volet"])
+    if b.get("tri") in ("nom", "date", "type"):
+        st["tri"] = b["tri"]
+    if b.get("dossiers") in ("archiviste", "systeme"):
+        st["dossiers"] = b["dossiers"]
+    if b.get("fond") in ("auto", "archiviste"):
+        st["fond"] = b["fond"]
+        if UI_HOOK:
+            UI_HOOK("fond", {"fond": b["fond"]})
+    bureau_save(st)
+    return bureau_public()
+
+
+@route("POST", "/api/bureau/activer")
+def r_bureau_activer(h, q, b):
+    return bureau_activer(to_bool(b.get("actif")))
+
+
+@route("GET", "/api/bureau/elements")
+def r_bureau_elements(h, q, b):
+    return bureau_elements()
+
+
+@route("GET", "/api/bureau/sig")
+def r_bureau_sig(h, q, b):
+    try:  # « rv » change quand les raccourcis ou les réglages du bureau changent (depuis l'autre fenêtre)
+        rv = str(os.stat(DATA_DIR / "bureau.json").st_mtime_ns)
+    except OSError:
+        rv = "0"
+    return {"sig": bureau_sig(), "rv": rv}
+
+
+@route("GET", "/api/bureau/a-ranger")
+def r_bureau_a_ranger(h, q, b):
+    return a_ranger()
+
+
+@route("GET", "/api/bureau/fond")
+def r_bureau_fond(h, q, b):
+    return wallpaper_info()
+
+
+@route("GET", "/api/bureau/fond/image", kind="raw")
+def r_bureau_fond_image(h, q, b):
+    p = wallpaper_info()["chemin"]
+    if not p:
+        raise ApiError("Pas de fond d'écran.", 404)
+    h.send_file(p, cache=3600)
+
+
+@route("GET", "/api/bureau/conv")
+def r_bureau_conv(h, q, b):
+    return bureau_conv()
+
+
+@route("POST", "/api/bureau/conv/nouvelle")
+def r_bureau_conv_new(h, q, b):
+    return bureau_conv(new=True, agent_id=b.get("agent_id") or None)
+
+
+@route("POST", "/api/bureau/volume")
+def r_bureau_volume(h, q, b):
+    path = os.path.realpath(str(b.get("path") or ""))
+    if path not in [v["path"] for v in volumes()]:
+        raise ApiError("Ce volume n'est plus monté.", 404)
+    if b.get("action") == "ejecter":
+        exe = shutil.which("gio")
+        if not exe:
+            raise ApiError("Éjection impossible : la commande gio est absente.")
+        try:
+            r = subprocess.run([exe, "mount", "-e", path], capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise ApiError("L'éjection prend trop de temps : un fichier est peut-être encore ouvert.")
+        if r.returncode != 0:
+            raise ApiError("Éjection impossible : " + (r.stderr.strip().splitlines() or ["volume occupé"])[-1])
+        return {"ok": True}
+    opener = shutil.which("xdg-open")
+    if not opener or not _launch([opener, path]):
+        raise ApiError("Ouverture impossible.")
+    return {"ok": True}
+
+
+@route("POST", "/api/systeme/reglages")
+def r_system_settings(h, q, b):
+    if not open_system_settings(str(b.get("module") or "")):
+        raise ApiError("Les paramètres système de Cinnamon sont introuvables.")
+    return {"ok": True}
+
+
+@route("POST", "/api/app/ouvrir")
+def r_app_open(h, q, b):
+    """Ouvre (ou ramène) la fenêtre d'Archiviste sur une vue : files, sort, chat, settings…"""
+    vue = str(b.get("vue") or "")
+    if vue not in ("", "files", "sort", "chat", "agents", "prompts", "trash", "settings"):
+        raise ApiError("Vue inconnue.")
+    data = {"vue": vue} if vue else {}
+    if b.get("chemin"):
+        data["chemin"] = safe_path(b["chemin"], must_exist=True)
+    if b.get("select"):
+        data["select"] = safe_path(b["select"], must_exist=True)
+    if b.get("conv"):
+        conv_path(str(b["conv"]))
+        data["conv"] = str(b["conv"])
+    if UI_HOOK is None:
+        return {"ok": False, "message": "Ouvre Archiviste depuis le menu."}
+    UI_HOOK("ouvrir", data)
+    return {"ok": True}
+
+
+@route("POST", "/api/app/demander")
+def r_app_ask(h, q, b):
+    if UI_HOOK is None:
+        return {"ok": False}
+    UI_HOOK("demander", {"fermer": to_bool(b.get("fermer"))})
+    return {"ok": True}
+
+
+# ── Applications installées et raccourcis ──
+@route("GET", "/api/apps")
+def r_apps(h, q, b):
+    fav = gs_get("org.cinnamon", "favorite-apps")
+    idx = apps_index()
+    return {"apps": [public_app(a) for a in idx["list"]],
+            "favoris": [x for x in (fav if isinstance(fav, list) else []) if x in idx["by_id"]]}
+
+
+@route("GET", "/api/apps/pour")
+def r_apps_for(h, q, b):
+    return apps_for(safe_path(q1(q, "path"), must_exist=True))
+
+
+@route("POST", "/api/apps/lancer")
+def r_apps_launch(h, q, b):
+    files = [safe_path(p, must_exist=True) for p in (b.get("fichiers") or [])][:50]
+    if b.get("id"):
+        a = apps_index()["by_id"].get(str(b["id"]))
+        if not a:
+            raise ApiError("Cette application n'est plus installée.", 404)
+        launch_desktop(a["fichier"], files)
+        return {"ok": True, "nom": a["nom"]}
+    path = os.path.realpath(str(b.get("fichier") or ""))
+    if not path.endswith(".desktop") or not os.path.isfile(path):
+        raise ApiError("Lanceur introuvable.", 404)
+    if not any(within(path, d) for d in app_dirs()):
+        safe_path(path, must_exist=True)
+        # comme Nemo : un lanceur posé sur le bureau doit être marqué « de confiance » avant de s'exécuter
+        if not os.access(path, os.X_OK):
+            if not to_bool(b.get("confiance")):
+                li = launcher_info(path) or {}
+                return {"ok": False, "confiance": True, "nom": li.get("nom") or os.path.basename(path)}
+            os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+            if shutil.which("gio"):
+                subprocess.run(["gio", "set", path, "metadata::trusted", "true"], capture_output=True, timeout=5)
+    launch_desktop(path, files)
+    return {"ok": True}
+
+
+@route("GET", "/api/icone", kind="raw")
+def r_icon(h, q, b):
+    try:
+        size = int(q1(q, "s", "48"))
+    except ValueError:
+        size = 48
+    p = find_icon(q1(q, "n"), size)
+    if not p:
+        raise ApiError("Icône introuvable.", 404)
+    h.send_file(p, cache=86400)
+
+
+@route("GET", "/api/raccourcis")
+def r_shortcuts(h, q, b):
+    return shortcuts()
+
+
+@route("POST", "/api/raccourcis/ajouter")
+def r_shortcut_add(h, q, b):
+    return shortcut_add(b)
+
+
+@route("POST", "/api/raccourcis/ordre")
+def r_shortcut_order(h, q, b):
+    """Nouvel ordre (les identifiants absents sont retirés)."""
+    ids = [str(x) for x in (b.get("ids") or [])]
+    cur = {s["id"]: s for s in shortcuts_raw()}
+    shortcuts_save([cur[i] for i in dict.fromkeys(ids) if i in cur])
+    return shortcuts()
+
+
+@route("POST", "/api/raccourcis/renommer")
+def r_shortcut_rename(h, q, b):
+    lst = shortcuts_raw()
+    for s in lst:
+        if s.get("id") == b.get("id"):
+            nom = str(b.get("nom") or "").strip()[:60]
+            if nom:
+                s["nom"] = nom
+            else:
+                s.pop("nom", None)
+            shortcuts_save(lst)
+            return shortcuts()
+    raise ApiError("Raccourci introuvable.", 404)
+
+
+@route("POST", "/api/raccourcis/retirer")
+def r_shortcut_remove(h, q, b):
+    lst = shortcuts_raw()
+    shortcuts_save([s for s in lst if s.get("id") != b.get("id")])
+    return shortcuts()
+
+
+@route("POST", "/api/raccourcis/defaut")
+def r_shortcut_reset(h, q, b):
+    shortcuts_save(default_shortcuts())
+    return shortcuts()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Archiviste/" + VERSION
     protocol_version = "HTTP/1.1"
@@ -2829,7 +3934,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             raise ClientGone()
 
-    def send_file(self, path: str, download: bool = False):
+    def send_file(self, path: str, download: bool = False, cache: int = 0):
         size = os.path.getsize(path)
         ext = ext_of(path)
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -2867,7 +3972,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         if risky:  # une page HTML/SVG ouverte en aperçu ne doit pas pouvoir exécuter de script
             self.send_header("Content-Security-Policy", "sandbox")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", f"private, max-age={cache}" if cache else "no-store")
         self.end_headers()
         if size == 0:
             return
@@ -2894,7 +3999,7 @@ class Handler(BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
         if target.suffix == ".webmanifest":
             ctype = "application/manifest+json"
-        if target.name == "index.html":
+        if target.name in ("index.html", "bureau.html"):
             data = data.replace(b"__ARCHIVISTE_TOKEN__", TOKEN.encode())
         if ctype.startswith("text/") or ctype in ("application/javascript", "image/svg+xml"):
             ctype += "; charset=utf-8"
@@ -2920,6 +4025,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.serve_static(path[len("/static/"):])
             if path in ("/", "/index.html"):
                 return self.serve_static("index.html")
+            if path in ("/bureau", "/bureau.html"):
+                return self.serve_static("bureau.html")
             if path in ("/manifest.webmanifest", "/icon.svg", "/favicon.svg"):
                 return self.serve_static(path[1:])
             return self.send_json({"error": "introuvable"}, 404)
@@ -3010,6 +4117,8 @@ def prepare() -> None:
     get_agents()
     if not os.environ.get("ARCHIVISTE_SANS_MAJ"):
         threading.Thread(target=_update_loop, name="mises-a-jour", daemon=True).start()
+    if bureau_state().get("actif"):  # prépare les icônes des applis pour un bureau qui s'affiche vite
+        threading.Thread(target=lambda: (apps_index(), find_icon("folder")), name="icones", daemon=True).start()
 
 
 def main():

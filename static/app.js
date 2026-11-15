@@ -464,11 +464,30 @@ function routeFromHash() {
   const [main, query = ''] = h.split('?');
   const [view, sub] = main.split('/');
   const params = new URLSearchParams(query);
-  if (view === 'files') return go('files', { path: params.get('p') });
+  if (view === 'files') return go('files', { path: params.get('p'), select: params.get('s') });
+  if (view === 'sort') return go('sort', { path: params.get('p') });
   if (view === 'chat') return go('chat', { conv: sub });
   if (RENDER[view]) return go(view);
   go('files');
 }
+
+// Appelé par la fenêtre GTK quand le bureau demande d'ouvrir une vue
+window.archivisteNaviguer = (d = {}) => {
+  if (d.vue === 'files') return go('files', { path: d.chemin, select: d.select });
+  if (d.vue === 'sort') return go('sort', { path: d.chemin });
+  if (d.vue === 'chat') return go('chat', { conv: d.conv });
+  if (RENDER[d.vue]) go(d.vue);
+};
+
+// ── Raccourcis du volet du bureau ──
+async function pinShortcut(type, cible, nom) {
+  try {
+    const r = await post('/api/raccourcis/ajouter', { type, cible, nom });
+    toast(r.deja ? `« ${r.raccourci.titre} » est déjà dans les raccourcis` : `« ${r.raccourci.titre} » épinglé aux raccourcis du bureau`, r.deja ? 'info' : 'ok');
+    return r;
+  } catch (e) { toast(e.message, 'err'); return null; }
+}
+const pinItem = (e) => pinShortcut(e.ext === 'desktop' && !e.dir ? 'app' : e.dir ? 'dossier' : 'fichier', e.path);
 
 // ───────────────────────── Statut Ollama ─────────────────────────
 async function refreshStatus() {
@@ -970,6 +989,7 @@ function rowMenu(x, y) {
   items.push({ label: 'Déplacer vers…', icon: 'move', act: () => moveDialog(sel.map((x) => x.path), false) });
   items.push({ label: 'Copier vers…', icon: 'copy', act: () => moveDialog(sel.map((x) => x.path), true) });
   items.push({ label: 'Copier le chemin', icon: 'copy', act: () => copyText(sel.map((x) => x.path).join('\n')) });
+  if (one) items.push({ label: 'Épingler aux raccourcis', icon: 'star', act: () => pinItem(one) });
   items.push('sep');
   if (one && !one.dir) items.push({ label: 'Résumer avec l\'IA', icon: 'sparkles', act: () => summarizeFile(one) });
   items.push({ label: sel.length > 1 ? 'En discuter (joindre)' : 'En discuter', icon: 'chat', act: FILE_ACTS.selChat });
@@ -2250,6 +2270,7 @@ function renderSettings() {
         <div class="roots-list" id="stRoots"></div>
         <div class="pathbox" style="margin-top:8px"><input type="text" id="stNewRoot" placeholder="/media/${esc((S.home || '').split('/').pop() || 'moi')}/Disque"><button class="btn" data-act="pickRoot">${ic('folder', 'sm')} Parcourir…</button><button class="btn" data-act="addRoot">${ic('plus', 'sm')} Ajouter</button></div>
         <label class="switch" style="margin-top:12px"><input type="checkbox" data-f="show_hidden" ${s.show_hidden ? 'checked' : ''}><i></i>Afficher les fichiers cachés par défaut</label></div>
+      <div class="card" id="stBureau"><h2>${ic('panel')} Bureau</h2><p class="muted" style="margin:0;font-size:13px"><span class="spinner"></span> Chargement…</p></div>
       <div class="card"><h2>${ic('save')} Sauvegarde</h2>
         <p class="muted" style="margin-top:-4px;font-size:13px">Exporte tes agents et tes prompts dans un fichier JSON (pour les garder ou les copier sur un autre PC).</p>
         <div class="row"><button class="btn" data-act="export">${ic('download', 'sm')} Exporter</button><button class="btn" data-act="import">${ic('upload', 'sm')} Importer…</button><input type="file" id="stImport" accept=".json,application/json" hidden></div></div>
@@ -2265,8 +2286,59 @@ function renderSettings() {
           <label class="switch"><input type="checkbox" data-f="maj_auto" ${s.maj_auto !== false ? 'checked' : ''}><i></i>Vérifier automatiquement (au démarrage puis toutes les 6 heures)</label></div></div>
     </div>`;
   renderRoots();
+  renderBureauCard();
   $('[data-f="temperature"]', v).addEventListener('input', (e) => { $('[data-tv]', v).textContent = e.target.value; });
   $('#stImport').addEventListener('change', importBackup);
+}
+async function renderBureauCard(rapport) {
+  const el = $('#stBureau');
+  if (!el) return;
+  let b;
+  try { b = await api('/api/bureau'); } catch (e) { el.innerHTML = `<h2>${ic('panel')} Bureau</h2><p class="muted">${esc(e.message)}</p>`; return; }
+  const okIc = (ok) => (ok === true ? '✓' : ok === false ? '✗' : '·');
+  el.innerHTML = `<h2>${ic('panel')} Bureau</h2>
+    <p class="muted" style="margin-top:-4px;font-size:13px">Archiviste remplace les icônes du bureau de Mint : tes fichiers du dossier <span class="mono">${esc(tildify(b.dossier))}</span>, une barre « Demande à l'Archiviste… », et un volet à droite avec tes raccourcis et la discussion. Pour épingler une appli, un dossier ou un fichier : clic droit › <b>Épingler aux raccourcis</b>.</p>
+    <div class="row wrap" style="gap:10px">
+      ${b.actif
+    ? `<span class="chip on">${ic('check', 'sm')} Bureau Archiviste actif</span><button class="btn" data-bu="off">Rendre le bureau à Nemo</button>`
+    : `<button class="btn primary" data-bu="on">${ic('panel', 'sm')} Activer le bureau Archiviste</button>`}
+      ${!b.cinnamon ? '<span class="muted" style="font-size:12.5px">Conçu pour Cinnamon (Linux Mint) : ailleurs, certaines étapes peuvent ne pas s\'appliquer.</span>' : ''}
+    </div>
+    ${rapport ? `<ul class="bu-rapport">${rapport.map((r) => `<li class="${r.ok === false ? 'bad' : r.ok ? 'ok' : ''}"><b>${okIc(r.ok)} ${esc(r.titre)}</b> — ${esc(r.message)}</li>`).join('')}</ul>` : ''}
+    <div class="settings-grid" style="margin-top:12px">
+      <label class="field"><span>Un dossier du bureau s'ouvre dans</span><select data-bf="dossiers">${[['archiviste', 'Archiviste'], ['systeme', 'Le gestionnaire de fichiers (Nemo)']].map(([k, l]) => `<option value="${k}" ${b.dossiers === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label class="field"><span>Fond d'écran</span><select data-bf="fond">${[['auto', 'Celui de Cinnamon (conseillé)'], ['archiviste', 'Dessiné par Archiviste (si le fond reste noir)']].map(([k, l]) => `<option value="${k}" ${b.fond === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+    </div>
+    <dl class="muted" style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:12px 0 0;font-size:13px">
+      <dt>Demander partout</dt><dd style="margin:0">${b.touche ? `<span class="kbd">${esc(b.touche_label)}</span> ouvre une petite fenêtre « Demander à l'Archiviste » par-dessus tes fenêtres` : b.actif ? 'pas de raccourci clavier (voir Paramètres système › Clavier, commande <code>archiviste --demander</code>)' : 'actif avec le bureau'}</dd>
+      <dt>Au démarrage</dt><dd style="margin:0">${b.demarrage ? '✓ le bureau s\'affiche à l\'ouverture de session' : '—'}</dd>
+      <dt>En cas de souci</dt><dd style="margin:0">dans un terminal : <code>archiviste --sans-bureau</code> rend le bureau à Nemo</dd>
+    </dl>
+    <div class="row wrap" style="margin-top:12px"><button class="btn sm" data-bu="raz">${ic('undo', 'sm')} Raccourcis par défaut</button><button class="btn sm" data-bu="fondcin">${ic('image', 'sm')} Changer le fond d'écran…</button></div>`;
+  el.onchange = async (e) => {
+    const k = e.target.dataset.bf;
+    if (!k) return;
+    try { await post('/api/bureau/reglages', { [k]: e.target.value }); toast('Bureau mis à jour', 'ok'); } catch (err) { toast(err.message, 'err'); }
+  };
+  el.onclick = async (e) => {
+    const btn = e.target.closest('[data-bu]');
+    if (!btn) return;
+    const a = btn.dataset.bu;
+    if (a === 'raz') {
+      if (!(await ask('Remettre les raccourcis du volet par défaut (Archiviste, Grimoire, tes dossiers, Terminal) ?', { ok: 'Remettre' }))) return;
+      try { await post('/api/raccourcis/defaut'); toast('Raccourcis remis par défaut', 'ok'); } catch (err) { toast(err.message, 'err'); }
+      return;
+    }
+    if (a === 'fondcin') { try { await post('/api/systeme/reglages', { module: 'backgrounds' }); } catch (err) { toast(err.message, 'err'); } return; }
+    if (a === 'off' && !(await ask('Rendre le bureau à Nemo ? Les icônes de Mint reviennent, le volet et Super + Espace disparaissent. Tes raccourcis sont gardés.', { ok: 'Rendre à Nemo' }))) return;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Un instant…';
+    try {
+      const r = await post('/api/bureau/activer', { actif: a === 'on' });
+      if (!r.fenetre && a === 'on') toast('Ouvre Archiviste depuis le menu pour afficher le bureau.', 'info', { timeout: 8000 });
+      renderBureauCard(r.rapport);
+    } catch (err) { toast(err.message, 'err'); btn.disabled = false; }
+  };
 }
 function updLine() {
   const i = UPD.info;
@@ -2443,4 +2515,4 @@ async function init() {
   setInterval(refreshUpdate, 30 * 60 * 1000);
   routeFromHash();
 }
-init();
+if (document.getElementById('app')) init();

@@ -495,3 +495,8 @@ input[type=range] { accent-color: var(--accent); }
   .frow { grid-template-columns: 26px 26px minmax(0, 1fr) 30px; }
   .frow .size, .frow .date { display: none; }
 }
+
+/* Réglages › Bureau */
+.bu-rapport { list-style: none; margin: 12px 0 0; padding: 10px 12px; border-radius: var(--radius); background: var(--surface2); font-size: 13px; display: grid; gap: 4px; }
+.bu-rapport li.ok b { color: var(--ok); }
+.bu-rapport li.bad b { color: var(--danger); }

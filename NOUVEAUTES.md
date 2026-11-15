@@ -1,5 +1,13 @@
 # Nouveautés
 
+## 1.4.0
+- **Bureau Archiviste** (Réglages → Bureau → « Activer ») : il remplace les icônes du bureau de Nemo. Tes fichiers du dossier Bureau, avec double-clic, clic droit (ouvrir avec…, Grimoire, résumer, en discuter, renommer, corbeille), sélection au lasso, glisser-déposer, clés USB et corbeille.
+- En haut, la barre **« Demande à l'Archiviste… »** : elle trouve aussi tes applis et tes fichiers pendant que tu tapes, et Entrée pose la question à l'IA. Taper n'importe où sur le bureau y écrit directement.
+- À droite, un **volet** repliable : tes raccourcis, les fichiers en vrac à ranger, et une discussion qui reste ouverte (agents et validations compris).
+- **Épingler aux raccourcis** : clic droit sur une appli, un dossier ou un fichier — sur le bureau, dans les résultats de recherche, dans Fichiers — ou bouton « + » qui liste toutes tes applis (favoris du menu en premier). Les raccourcis se réordonnent en les glissant.
+- **Super + Espace** ouvre « Demander à l'Archiviste » par-dessus n'importe quelle fenêtre.
+- Un clic pour revenir au bureau de Mint (Réglages → Bureau), ou `archiviste --sans-bureau` dans un terminal.
+
 ## 1.3.0
 - **Mises à jour automatiques** : Archiviste vérifie les nouvelles versions sur GitHub (au démarrage puis toutes les 6 heures), télécharge le paquet, vérifie son empreinte et ouvre l'installateur de paquets de Mint. Une fois installée, il propose de redémarrer.
 - Réglages → À propos : « Vérifier maintenant » et choix de la vérification automatique.

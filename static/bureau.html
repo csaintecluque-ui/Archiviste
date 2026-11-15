@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="fr" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="archiviste-token" content="__ARCHIVISTE_TOKEN__">
+  <title>Archiviste — bureau</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/bureau.css">
+</head>
+<body class="bureau-page">
+<main id="desk" tabindex="-1" aria-label="Bureau">
+  <div id="icons" class="icons" role="listbox" aria-multiselectable="true"></div>
+  <div id="lasso" hidden></div>
+</main>
+
+<div id="ask" class="ask">
+  <div class="bar glass">
+    <img class="seal" src="/static/logo-seal.svg" alt="Anamnesis · CSC" width="34" height="34">
+    <input id="askIn" type="text" autocomplete="off" spellcheck="false" placeholder="Demande à l'Archiviste… ou cherche un fichier, une appli">
+    <span class="keys" id="askKeys"></span>
+    <button class="go" id="askGo" title="Demander (Entrée)"><span data-icon="send"></span></button>
+  </div>
+  <div id="askRes" class="results glass" hidden></div>
+  <div id="answer" class="answer glass" hidden></div>
+</div>
+
+<aside id="volet" class="side glass" hidden></aside>
+<button id="voletTab" class="vtab glass" hidden title="Afficher le volet"><img src="/favicon.svg" alt="" width="30" height="30"></button>
+
+<div id="toasts"></div>
+<script src="/static/app.js"></script>
+<script src="/static/bureau.js"></script>
+</body>
+</html>

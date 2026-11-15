@@ -48,6 +48,15 @@ Keywords=fichiers;tri;ia;ollama;qwen;agents;prompts;
 StartupWMClass=archiviste
 StartupNotify=true
 SingleMainWindow=true
+Actions=demander;bureau;
+
+[Desktop Action demander]
+Name=Demander à l'Archiviste
+Exec=archiviste --demander
+
+[Desktop Action bureau]
+Name=Afficher le bureau Archiviste
+Exec=archiviste --bureau
 EOF
 
 # Icônes (logo Anamnesis · CSC) : petite version jusqu'à 48 px, sceau complet au-delà
