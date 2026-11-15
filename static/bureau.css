@@ -4,7 +4,7 @@
 @font-face { font-family: 'Cormorant Garamond'; font-weight: 600; font-display: swap;
              src: url(/static/fonts/cormorant-garamond-600.woff2) format('woff2'); }
 
-:root { --mt: 0px; --mb: 0px; --ml: 0px; --mr: 0px; --vw: 452px; --sidew: 428px; --ink-glass: rgba(22, 16, 13, .6); }
+:root { --mt: 0px; --mb: 0px; --ml: 0px; --mr: 0px; --vw: 532px; --sidew: 508px; --railw: 80px; --ink-glass: rgba(22, 16, 13, .6); }
 html, body.bureau-page { background: transparent; }
 body.bureau-page { color: #f1e6d4; user-select: none; -webkit-user-select: none; }
 body.bureau-page.fond-cinnamon { --ink-glass: rgba(20, 15, 12, .8); }
@@ -74,7 +74,16 @@ body.mode-bureau #ask { display: none; }
 
 /* ── volet ── */
 .side { position: fixed; z-index: 15; top: calc(var(--mt) + 16px); right: calc(var(--mr) + 16px); bottom: calc(var(--mb) + 16px);
-        width: var(--sidew); padding: 18px 18px 14px; display: flex; flex-direction: column; gap: 15px; border-radius: 22px; }
+        width: var(--sidew); padding: 0; display: flex; border-radius: 22px; }
+/* colonne de gauche : en-tête, « à ranger », discussion sur toute la hauteur */
+.vmain { flex: 1; min-width: 0; padding: 18px 16px 14px 18px; display: flex; flex-direction: column; gap: 15px; }
+/* colonne de droite : les raccourcis, qui défilent s'il y en a beaucoup */
+.rail { flex: none; width: var(--railw); display: flex; flex-direction: column; gap: 8px; padding: 14px 0 14px;
+        border-left: 1px solid rgba(234, 217, 184, .1); background: rgba(0, 0, 0, .12); border-radius: 0 21px 21px 0; }
+.rail .rfoot { flex: none; display: flex; justify-content: center; gap: 6px; padding: 8px 6px 0; border-top: 1px solid rgba(234, 217, 184, .08); margin: 0 6px; }
+.rail .rfoot .vbtn { width: 30px; height: 30px; }
+.rail .rfoot .vbtn.on { color: #1b1512; background: #c9804f; border-color: #c9804f; }
+.rail.drop-on { box-shadow: inset 0 0 0 2px rgba(140, 184, 116, .7); }
 .side .hd { display: flex; align-items: center; gap: 12px; flex: none; }
 .side .hd b { font-size: 26px; font-weight: 600; line-height: 1; display: block; letter-spacing: .2px; }
 .side .hd small { font-size: 12.5px; color: rgba(241, 230, 212, .68); display: flex; align-items: center; gap: 6px; margin-top: 4px; }
@@ -95,11 +104,19 @@ body.mode-bureau #ask { display: none; }
               display: flex; align-items: center; gap: 6px; }
 .side h3 button.r, .side h3 .r button.lnk { background: none; border: 0; cursor: pointer; color: inherit; font: inherit; padding: 2px 4px; border-radius: 6px; }
 .side h3 button.r:hover, .side h3 .r button.lnk:hover { color: #f1e6d4; background: rgba(255, 255, 255, .06); }
-.sc { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; }
-.sc .t { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 2px 8px; border-radius: 13px; background: rgba(255, 255, 255, .04);
-         border: 1px solid rgba(234, 217, 184, .08); font-size: 11.5px; text-align: center; color: #efe3d1; cursor: pointer; min-width: 0; position: relative; font-family: inherit; }
+.sc { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 4px; padding: 4px 6px;
+       scrollbar-width: none; --fade-t: 0px; --fade-b: 0px;
+       -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--fade-t), #000 calc(100% - var(--fade-b)), transparent 100%);
+       mask-image: linear-gradient(to bottom, transparent 0, #000 var(--fade-t), #000 calc(100% - var(--fade-b)), transparent 100%); }
+.sc::-webkit-scrollbar { display: none; }
+.sc.fade-t { --fade-t: 22px; }
+.sc.fade-b { --fade-b: 22px; }
+.sc .t { flex: none; display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 8px 0 6px; border-radius: 12px; background: none;
+         border: 1px solid transparent; font-size: 10.5px; line-height: 1.2; text-align: center; color: #efe3d1; cursor: pointer; min-width: 0; width: 100%;
+         position: relative; font-family: inherit; }
 .sc .t:hover { background: rgba(201, 128, 79, .16); border-color: rgba(201, 128, 79, .35); }
-.sc .t .lbl { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 4px; }
+.sc .t .lbl { max-width: 100%; padding: 0 2px; overflow: hidden; overflow-wrap: anywhere; hyphens: auto; -webkit-hyphens: auto;
+               display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .sc .t .ico { width: 34px; height: 34px; border-radius: 9px; display: flex; align-items: center; justify-content: center; background: rgba(201, 128, 79, .18); color: #f0b98f; }
 .sc .t .ico.app { background: transparent; }
 .sc .t .ico img { width: 34px; height: 34px; object-fit: contain; }
@@ -107,11 +124,10 @@ body.mode-bureau #ask { display: none; }
 .sc .t.add .ico { background: rgba(255, 255, 255, .05); color: rgba(241, 230, 212, .6); }
 .sc .t.ko { opacity: .45; }
 .sc .t.drag-over { border-color: #8cb874; }
-.sc .t .x { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 50%; background: #e0705a; color: #fff;
+.sc .t .x { position: absolute; top: 1px; right: 3px; width: 20px; height: 20px; border-radius: 50%; background: #e0705a; color: #fff;
             font: 700 13px/20px var(--font-ui); text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
 .sc.edit .t:not(.add) { animation: wiggle .28s ease-in-out infinite alternate; }
 @keyframes wiggle { from { transform: rotate(-1.2deg); } to { transform: rotate(1.2deg); } }
-.sc.drop-on { outline: 2px dashed rgba(140, 184, 116, .7); outline-offset: 4px; border-radius: 12px; }
 .todo { display: flex; align-items: center; gap: 12px; padding: 11px 13px; border-radius: 14px; background: rgba(201, 128, 79, .14);
         border: 1px solid rgba(201, 128, 79, .3); flex: none; }
 .todo .n { font-size: 30px; font-weight: 600; line-height: 1; }
@@ -194,7 +210,7 @@ body.mode-demander #toasts { right: 16px; bottom: 16px; }
 .answer .foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; color: rgba(241, 230, 212, .55); }
 .answer .foot .grow { flex: 1; }
 
-@media (max-width: 1500px) { :root { --sidew: 384px; --vw: 408px; } }
+@media (max-width: 1500px) { :root { --sidew: 452px; --vw: 476px; --railw: 74px; } }
 body.mode-demander .results { max-height: 430px; }
 /* suggestions de la discussion du volet : applis, fichiers, « Demander » */
 .lsugg { position: absolute; left: -2px; right: -2px; bottom: calc(100% + 8px); z-index: 30; max-height: 360px; margin: 0;

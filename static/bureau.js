@@ -745,11 +745,11 @@ async function loadApps() {
 // ───────────────────────── Volet ─────────────────────────
 function buildVolet() {
   const v = $('#volet');
-  v.innerHTML = `
+  // Deux colonnes : la discussion prend toute la hauteur, les raccourcis sont en colonne à droite.
+  v.innerHTML = `<div class="vmain">
     <div class="hd"><img src="/static/logo-seal.svg" alt="Anamnesis · CSC" width="42" height="42">
       <div style="min-width:0"><b class="serif">Archiviste</b><small id="vStatus"><span class="dot"></span><span>…</span></small></div>
       <div class="acts"><button class="vbtn maj" data-v="maj" id="vMaj" hidden title="Mise à jour">${ic('download')}</button><button class="vbtn" data-v="main" title="Ouvrir Archiviste">${ic('external')}</button><button class="vbtn" data-v="fold" title="Replier le volet">${ic('panel')}</button></div></div>
-    <section><h3>${ic('star')}Raccourcis<button class="r" data-v="editSc" id="vEditSc">Modifier</button></h3><div class="sc" id="sc"></div></section>
     <div id="todo" hidden></div>
     <section class="conv" id="conv"><h3>${ic('chat')}Discussion<span class="r"><select id="vAgent" title="Agent"></select>
       <button class="lnk" data-v="newConv" title="Nouvelle discussion">${ic('plus')}</button><button class="lnk" data-v="convMain" title="Continuer dans Archiviste">${ic('external')}</button></span></h3>
@@ -758,7 +758,11 @@ function buildVolet() {
         <button class="clip" data-v="attach" title="Joindre des fichiers">${ic('clip')}</button>
         <textarea id="vIn" rows="1" placeholder="Écris à l'Archiviste, ou « ouvre Grimoire »…"></textarea>
         <button class="send" id="vSend" data-v="send" title="Envoyer">${ic('send')}</button></div></div>
-    </section>`;
+    </section></div>
+    <nav class="rail" id="rail" aria-label="Raccourcis">
+      <div class="sc" id="sc"></div>
+      <div class="rfoot"><button class="vbtn" data-v="addSc" title="Épingler une appli, un dossier ou un fichier">${ic('plus')}</button><button class="vbtn" data-v="editSc" id="vEditSc" title="Modifier les raccourcis (retirer, réordonner)">${ic('pencil')}</button></div>
+    </nav>`;
   v.addEventListener('click', onVoletClick);
   v.addEventListener('contextmenu', onVoletContext);
   const inp = $('#vIn');
@@ -785,6 +789,7 @@ function applyVolet() {
   $('#volet').hidden = !open;
   $('#voletTab').hidden = open;
   document.body.classList.toggle('volet-ferme', !open);
+  if (open) scFades(); // replié, la colonne n'avait pas de hauteur : le fondu est recalculé à l'ouverture
 }
 function setVolet(open) {
   D.b.volet = open;
@@ -806,7 +811,12 @@ async function onVoletClick(ev) {
     case 'main': return openMain({});
     case 'maj': return UPD.info?.relancer && !UPD.info?.disponible ? relaunchApp() : showUpdateModal();
     case 'fold': return setVolet(false);
-    case 'editSc': D.editSc = !D.editSc; b.textContent = D.editSc ? 'Terminé' : 'Modifier'; return renderShortcuts();
+    case 'editSc':
+      D.editSc = !D.editSc;
+      b.innerHTML = ic(D.editSc ? 'check' : 'pencil');
+      b.title = D.editSc ? 'Terminé' : 'Modifier les raccourcis (retirer, réordonner)';
+      b.classList.toggle('on', D.editSc);
+      return renderShortcuts();
     case 'addSc': return addShortcutMenu(b);
     case 'newConv': return newConv();
     case 'convMain': return D.conv && openMain({ vue: 'chat', conv: D.conv.id });
@@ -865,7 +875,15 @@ function renderShortcuts() {
   el.classList.toggle('edit', D.editSc);
   el.innerHTML = D.sc.map((s) => `<button class="t ${s.ok ? '' : 'ko'}" data-sc="${esc(s.id)}" draggable="true" title="${esc(s.titre)}${s.description ? '\n' + esc(s.description) : ''}">
     ${scIcon(s)}<span class="lbl">${esc(s.titre)}</span>${D.editSc ? '<span class="x" title="Retirer">×</span>' : ''}</button>`).join('')
-    + `<button class="t add" data-v="addSc" title="Épingler une appli, un dossier ou un fichier"><span class="ico">${ic('plus')}</span><span class="lbl">Ajouter</span></button>`;
+    || `<button class="t add" data-v="addSc" title="Épingler une appli, un dossier ou un fichier"><span class="ico">${ic('plus')}</span><span class="lbl">Ajouter</span></button>`;
+  scFades();
+}
+// Colonne des raccourcis : un fondu en haut / en bas signale qu'il y en a d'autres en faisant défiler.
+function scFades() {
+  const el = $('#sc');
+  if (!el) return;
+  el.classList.toggle('fade-t', el.scrollTop > 2);
+  el.classList.toggle('fade-b', el.scrollTop + el.clientHeight < el.scrollHeight - 2);
 }
 function runShortcut(s) {
   if (!s) return null;
@@ -897,8 +915,8 @@ function shortcutMenu(s, x, y) {
     if (nom === null) return;
     try { D.sc = await post('/api/raccourcis/renommer', { id: s.id, nom }); renderShortcuts(); } catch (e) { toast(e.message, 'err'); }
   } });
-  if (i > 0) m.push({ label: 'Déplacer vers la gauche', icon: 'up', act: () => swap(i - 1) });
-  if (i < D.sc.length - 1) m.push({ label: 'Déplacer vers la droite', icon: 'move', act: () => swap(i + 1) });
+  if (i > 0) m.push({ label: 'Monter', icon: 'up', act: () => swap(i - 1) });
+  if (i < D.sc.length - 1) m.push({ label: 'Descendre', icon: 'down', act: () => swap(i + 1) });
   m.push('sep');
   m.push({ label: 'Retirer des raccourcis', icon: 'x', danger: true, act: () => removeShortcut(s.id) });
   showMenu(x, y, m);
@@ -954,8 +972,10 @@ async function pickAppDialog() {
   });
 }
 function bindShortcutDnD() {
-  const sc = $('#sc');
+  const sc = $('#rail'); // toute la colonne accepte le dépôt, y compris sous le dernier raccourci
   let dragId = null;
+  $('#sc').addEventListener('scroll', scFades, { passive: true });
+  window.addEventListener('resize', scFades);
   sc.addEventListener('dragstart', (ev) => {
     const t = ev.target.closest('[data-sc]');
     if (!t) return;
