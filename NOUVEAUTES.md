@@ -1,5 +1,9 @@
 # Nouveautés
 
+## 1.4.5
+- **Raccourcis en colonne à droite du volet** : la discussion prend maintenant toute la hauteur du volet. Les raccourcis s'empilent sur le bord droit et la colonne défile quand il y en a beaucoup (un fondu en haut ou en bas indique qu'il en reste).
+- En bas de la colonne : « + » pour ajouter une appli, un dossier ou un fichier, et le crayon pour en retirer plusieurs. Clic droit sur un raccourci : « Monter » / « Descendre ».
+
 ## 1.4.4
 - **Les dossiers avant les applis** : « ouvre téléchargements », « ouvre mes documents », « ouvre le dossier images » ouvrent le dossier, et non plus Transmission ou le Numériseur de documents. Même règle pour l'IA.
 - **Glisser sur les raccourcis** : glisser une icône du bureau (un lanceur comme Claude, un dossier, un fichier) sur les raccourcis du volet l'épingle enfin ; glisser sur la discussion la joint au message.

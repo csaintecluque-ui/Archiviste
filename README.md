@@ -11,7 +11,7 @@ Rien ne quitte ta machine.
 | **Agents** | Assistants spécialisés : consignes + outils (lister, lire, chercher, écrire, déplacer, renommer, mettre à la corbeille, trouver les doublons) + un dossier de travail dont ils ne sortent pas. 4 agents fournis : Rangeur, Lecteur, Rédacteur, Nettoyeur. |
 | **Prompts** | Bibliothèque de consignes réutilisables, avec variables `{{comme_ceci}}` demandées au moment de l'utilisation. |
 | **Corbeille** | La même que celle de Nemo : restaurer ou supprimer définitivement. |
-| **Bureau** | En option, Archiviste remplace les icônes du bureau de Mint : tes fichiers, et un volet à droite (raccourcis, fichiers à ranger, discussion). La discussion sert aussi de lanceur : « ouvre Grimoire » l'ouvre tout de suite, et elle propose tes applis et tes fichiers pendant que tu tapes. Clic droit sur une appli, un dossier ou un fichier → **Épingler aux raccourcis**. <kbd>Super</kbd>+<kbd>Espace</kbd> pose une question depuis n'importe quelle fenêtre. |
+| **Bureau** | En option, Archiviste remplace les icônes du bureau de Mint : tes fichiers, et un volet à droite (discussion, fichiers à ranger, et tes raccourcis en colonne sur le bord). La discussion sert aussi de lanceur : « ouvre Grimoire » l'ouvre tout de suite, et elle propose tes applis et tes fichiers pendant que tu tapes. Clic droit sur une appli, un dossier ou un fichier → **Épingler aux raccourcis**. <kbd>Super</kbd>+<kbd>Espace</kbd> pose une question depuis n'importe quelle fenêtre. |
 | **Grimoire** | Si l'appli de bureau Grimoire est installée : les .docx et .xlsx s'ouvrent dedans d'un double-clic, « Fichier ▾ » crée un document Word ou un classeur qui s'y ouvre, et chaque réponse de l'IA peut partir dans Grimoire en document mis en forme (titres, listes, tableaux) ou, si elle contient des tableaux, en classeur. Les agents ont un outil « Créer un document Word/Excel ». |
 
 ## Installation
@@ -47,7 +47,7 @@ Relancer Archiviste ramène la fenêtre existante au premier plan (une seule fen
 
 La discussion du volet : « ouvre Grimoire », « lance Firefox », « ouvre mes téléchargements » ouvrent tout de suite (sans l'IA), même avec une faute de frappe (« ouvrr le terminale ») ; pendant que tu tapes, elle propose tes applis et tes fichiers (flèches puis <kbd>Entrée</kbd>, clic droit pour épingler) ; tout le reste part à l'Archiviste, qui peut lui aussi ouvrir des applis et des fichiers.
 
-Les raccourcis du volet : clic pour ouvrir, glisser pour réordonner, clic droit pour renommer ou retirer, « Modifier » pour retirer plusieurs, « + » pour ajouter une application (toutes celles du menu, tes favoris en premier), un dossier ou un fichier.
+Les raccourcis sont en colonne sur le bord droit du volet, pour laisser toute la hauteur à la discussion ; s'il y en a beaucoup, la colonne défile. Clic pour ouvrir, glisser pour réordonner, clic droit pour renommer, monter, descendre ou retirer, crayon en bas de la colonne pour en retirer plusieurs, « + » pour ajouter une application (toutes celles du menu, tes favoris en premier), un dossier ou un fichier.
 
 Pour revenir au bureau de Mint : **Réglages → Bureau → Rendre le bureau à Nemo**, ou dans un terminal `archiviste --sans-bureau`. Tes raccourcis sont gardés.
 

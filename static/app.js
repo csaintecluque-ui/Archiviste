@@ -32,6 +32,7 @@ const ICONS = {
   filePlus: 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5M12 11.5v6M9 14.5h6',
   search: 'M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM20 20l-4.8-4.8',
   up: 'M12 19V5M6 11l6-6 6 6',
+  down: 'M12 5v14M6 13l6 6 6-6',
   refresh: 'M20 12a8 8 0 1 1-2.6-5.9M20 4v5h-5',
   pencil: 'M4 20h4L19.5 8.5a2.1 2.1 0 0 0-3-3L5 17v3zM14.5 7.5l3 3',
   move: 'M4 12h12M12 7l5 5-5 5M20 5v14',
@@ -335,7 +336,14 @@ function showMenu(x, y, items, { search = false } = {}) {
 document.addEventListener('mousedown', (e) => { if (openMenuEl && !openMenuEl.contains(e.target)) closeMenu(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && openMenuEl) { closeMenu(); e.stopPropagation(); } }, true);
 window.addEventListener('resize', closeMenu);
-function menuAt(el, items, opts) { const r = el.getBoundingClientRect(); return showMenu(r.left, r.bottom + 4, items, opts); }
+function menuAt(el, items, opts) {
+  const r = el.getBoundingClientRect();
+  const m = showMenu(r.left, r.bottom + 4, items, opts);
+  // Pas la place en dessous (bouton en bas de l'écran) : le menu s'ouvre au-dessus au lieu de recouvrir le bouton.
+  const h = m.getBoundingClientRect().height;
+  if (r.bottom + 4 + h > innerHeight - 8 && r.top - 4 - h >= 6) m.style.top = (r.top - 4 - h) + 'px';
+  return m;
+}
 
 // ───────────────────────── Markdown ─────────────────────────
 function inline(t) {
