@@ -14,7 +14,7 @@ mkdir -p "$PKG/DEBIAN" "$PKG/opt/archiviste" "$PKG/usr/bin" "$PKG/usr/share/appl
          "$PKG/usr/share/doc/archiviste" "$PKG/usr/share/icons/hicolor/scalable/apps"
 
 # Application
-cp archiviste.py fenetre.py "$PKG/opt/archiviste/"
+cp archiviste.py fenetre.py indexeur.py "$PKG/opt/archiviste/"
 cp -r static "$PKG/opt/archiviste/static"
 find "$PKG/opt/archiviste" -type d -exec chmod 755 {} +
 find "$PKG/opt/archiviste" -type f -exec chmod 644 {} +

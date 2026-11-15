@@ -297,6 +297,50 @@ class SuiviFenetres:
 
 
 # ════════════════════════════════════════════════════════════════════
+#  Dossiers surveillés : le bureau se met à jour tout de suite
+# ════════════════════════════════════════════════════════════════════
+class Surveillance:
+    """Prévient le bureau dès qu'un dossier qu'il affiche change (bureau, corbeille, clés USB, téléchargements),
+    au lieu d'attendre son prochain sondage. Signale aussi le changement à l'index de recherche."""
+
+    def __init__(self, on_change):
+        self._on_change = on_change
+        self._monitors = []
+        self._timers: dict[str, int] = {}
+        user = os.environ.get("USER") or Path.home().name
+        trash = A.TRASH_DIR / "files"
+        try:
+            trash.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        watch = [("bureau", A.desktop_dir()), ("bureau", str(trash)), ("telechargements", A.downloads_dir())]
+        watch += [("bureau", d) for d in (f"/media/{user}", f"/run/media/{user}")]
+        for kind, path in watch:
+            if not os.path.isdir(path):
+                continue
+            try:
+                mon = Gio.File.new_for_path(path).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+                mon.connect("changed", self._changed, kind, path)
+                self._monitors.append(mon)  # gardé en vie : un moniteur libéré ne prévient plus
+            except GLib.Error:
+                pass
+
+    def _changed(self, mon, f, other, event, kind, path) -> None:
+        key = f"{kind}|{path}"
+        if key not in self._timers:  # une rafale de changements (copie de 50 fichiers) ne fait qu'un seul signal
+            self._timers[key] = GLib.timeout_add(180, self._fire, key, kind, path)
+
+    def _fire(self, key, kind, path) -> bool:
+        self._timers.pop(key, None)
+        try:
+            A.changed(os.path.join(path, "x"))
+            self._on_change(kind)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Comportement commun des fenêtres web
 # ════════════════════════════════════════════════════════════════════
 class VueWeb:
@@ -305,10 +349,51 @@ class VueWeb:
     view: WebKit2.WebView
     zoom_key = "zoom"
 
+    def on_drag_data(self, view, context, x, y, selection, info, time_) -> None:
+        """Un fichier glissé depuis une autre appli (Nemo…) survole la page : WebKit ne dit pas à la page où il
+        se trouve, alors on le note pour elle. Sans cela, elle ne pourrait que l'ignorer."""
+        try:
+            if Gtk.drag_get_source_widget(context) is not None:
+                return  # glissé depuis une de nos fenêtres : la page de départ l'a déjà noté
+            if selection.get_target().name() != "text/uri-list":
+                return
+            paths = [Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or []) if u.startswith("file://")]
+            A.drag_set([p for p in paths if p])
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    # La touche Ctrl pendant un glisser (Ctrl = copier, sinon déplacer). WebKitGTK en donne un état périmé à la
+    # page : on lit le clavier ici, on prévient la page quand il change, et on note sa valeur au moment du dépôt.
+    def _ctrl_down(self) -> bool:
+        keymap = Gdk.Keymap.get_for_display(self.view.get_display())
+        return bool(keymap.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK)
+
+    def on_drag_motion(self, view, context, x, y, time_) -> bool:
+        try:
+            ctrl = self._ctrl_down()
+            if ctrl != self._drag_ctrl:
+                self._drag_ctrl = ctrl
+                self.run_js(f"window.archivisteCtrl && archivisteCtrl({'true' if ctrl else 'false'})")
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        return False  # la suite est l'affaire de WebKit
+
+    def on_drag_leave(self, view, context, time_) -> None:
+        self._drag_ctrl = None  # prochain glisser : l'état sera redonné à la page
+
+    def on_drag_drop(self, view, context, x, y, time_) -> bool:
+        try:
+            A.drag_key(self._ctrl_down())
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        return False
+
     def setup_view(self, background: Gdk.RGBA) -> WebKit2.WebView:
         view = WebKit2.WebView.new_with_context(self.app.ctx)
         st = view.get_settings()
         st.set_enable_developer_extras(True)
+        if os.environ.get("ARCHIVISTE_DEBUG"):  # les messages de la page (console.log, erreurs) dans le journal
+            st.set_enable_write_console_messages_to_stdout(True)
         st.set_javascript_can_access_clipboard(True)
         st.set_enable_back_forward_navigation_gestures(False)
         st.set_enable_smooth_scrolling(True)
@@ -316,6 +401,11 @@ class VueWeb:
         view.set_background_color(background)
         view.set_zoom_level(float(load_state().get(self.zoom_key, 1.0)))
         view.connect("decide-policy", self.on_policy)
+        view.connect("drag-data-received", self.on_drag_data)
+        view.connect("drag-motion", self.on_drag_motion)
+        view.connect("drag-leave", self.on_drag_leave)
+        view.connect("drag-drop", self.on_drag_drop)
+        self._drag_ctrl = None
         view.connect("create", self.on_create)
         view.connect("context-menu", self.on_context_menu)
         view.connect("load-failed", self.on_load_failed)
@@ -485,10 +575,24 @@ class Bureau(VueWeb, Gtk.ApplicationWindow):
         screen = self.get_screen()
         screen.connect("monitors-changed", lambda *_: self.place())
         screen.connect("size-changed", lambda *_: self.place())
-        GLib.timeout_add_seconds(5, self.place)  # le panneau de Cinnamon peut arriver après nous
+        self.view.connect("load-changed", self.on_load)
+        # le panneau de Cinnamon peut arriver après nous : on se replace quelques fois au démarrage, puis ce sont
+        # les signaux (écrans, taille, zone de travail) qui s'en chargent — plus de minuterie permanente
+        self._tries = 0
+        GLib.timeout_add_seconds(3, self._place_again)
+        self._watched_monitors: set[int] = set()
         self.place()
         self.load()
         self.show_all()
+
+    def _place_again(self) -> bool:
+        self._tries += 1
+        self.place()
+        return self._tries < 6
+
+    def on_load(self, view, event) -> None:
+        if event == WebKit2.LoadEvent.FINISHED:  # la page saura qu'on la prévient : elle sonde beaucoup moins
+            self.run_js("window.archivistePousse && archivistePousse()")
 
     def draw_own_wallpaper(self) -> bool:
         return not self.composite or A.bureau_state().get("fond") == "archiviste"
@@ -500,9 +604,12 @@ class Bureau(VueWeb, Gtk.ApplicationWindow):
         self.view.load_uri(self.app.base + "bureau?" + urllib.parse.urlencode(q))
 
     def place(self) -> bool:
-        mon = primary_monitor()
+        mon = self.app.desktop_monitor()
         if mon is None:
             return True
+        if id(mon) not in self._watched_monitors:  # panneau déplacé, masqué ou agrandi : la zone de travail change
+            self._watched_monitors.add(id(mon))
+            mon.connect("notify::workarea", lambda *_: self.place())
         g, wa = mon.get_geometry(), mon.get_workarea()
         self.move(g.x, g.y)
         self.resize(g.width, g.height)
@@ -612,6 +719,9 @@ class Application(Gtk.Application):
         self.base = None
         self.ctx = None
         self.suivi = None
+        self.surveillance = None
+        self.ecrans: list[dict] = []
+        self._push_timer = 0
         for name, desc in (("bureau", "Afficher le bureau Archiviste"),
                            ("demander", "Ouvrir « Demander à l'Archiviste »"),
                            ("fenetre", "Ouvrir la fenêtre principale"),
@@ -628,7 +738,23 @@ class Application(Gtk.Application):
         A.RELAUNCH_HOOK = lambda: GLib.idle_add(self.relaunch)
         A.UI_HOOK = lambda action, data=None: GLib.idle_add(self.on_ui, action, data or {})
         A.ICON_HOOK = icon_lookup
+        A.PUSH_HOOK = lambda kind: GLib.idle_add(self.on_push, kind)
+        A.CLIP_HOOK = self.file_clipboard
+        try:  # autre chose est copié ailleurs (texte, fichiers dans Nemo) : notre « coupé » n'a plus cours
+            self._clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            self._clipboard.connect("owner-change", lambda *_: A.clip_clear())
+        except Exception:  # noqa: BLE001
+            self._clipboard = None
+        A.MONITORS_HOOK = lambda: list(self.ecrans)
+        self.list_monitors()
+        scr = Gdk.Screen.get_default()
+        if scr is not None:
+            scr.connect("monitors-changed", lambda *_: self.list_monitors())
         self.start_window_tracking()
+        try:
+            self.surveillance = Surveillance(self.on_folder_changed)
+        except Exception:  # noqa: BLE001 — sans surveillance, le bureau se rafraîchit par sondage, comme avant
+            traceback.print_exc()
         cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "archiviste"
         wdm = WebKit2.WebsiteDataManager(base_data_directory=str(A.DATA_DIR / "webkit"),
                                          base_cache_directory=str(cache / "webkit"))
@@ -657,6 +783,80 @@ class Application(Gtk.Application):
             if gw is not None and isinstance(gw, GdkX11.X11Window):
                 return GdkX11.x11_get_server_time(gw)
         return Gtk.get_current_event_time()
+
+    # ── presse-papiers du système : fichiers copiés ou coupés dans le gestionnaire de fichiers ──
+    def in_gtk(self, fn, timeout: float = 1.5):
+        """Exécute fn dans la boucle GTK depuis un fil du serveur, et rend son résultat (None si trop long)."""
+        done = threading.Event()
+        box = {}
+
+        def run() -> bool:
+            try:
+                box["v"] = fn()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+            done.set()
+            return False
+
+        GLib.idle_add(run)
+        done.wait(timeout)
+        return box.get("v")
+
+    def file_clipboard(self, clear: bool = False):
+        if self._clipboard is None:
+            return None
+        if clear:  # coupé-collé terminé : comme Nemo, on vide le presse-papiers
+            return self.in_gtk(lambda: self._clipboard.set_text("", 0))
+        return self.in_gtk(self._read_file_clipboard)
+
+    def _read_file_clipboard(self):
+        """Format de Nemo, Nautilus, Caja… : « cut » ou « copy », puis une adresse file:// par ligne."""
+        sel = self._clipboard.wait_for_contents(Gdk.Atom.intern("x-special/gnome-copied-files", False))
+        data = sel.get_data() if sel is not None else None
+        if not data:
+            return None
+        lines = bytes(data).decode("utf-8", "replace").split("\n")
+        paths = []
+        for uri in lines[1:]:
+            f = Gio.File.new_for_uri(uri.strip()) if uri.strip().startswith("file://") else None
+            if f is not None and f.get_path():
+                paths.append(f.get_path())
+        return {"mode": "couper" if lines[0].strip() == "cut" else "copier", "paths": paths}
+
+    # ── écrans ──
+    def list_monitors(self) -> None:
+        """Écrans branchés (lus dans la boucle GTK, puis servis tels quels au serveur)."""
+        disp = Gdk.Display.get_default()
+        out = []
+        for i in range(disp.get_n_monitors() if disp is not None else 0):
+            m = disp.get_monitor(i)
+            g = m.get_geometry()
+            out.append({"index": i, "nom": m.get_model() or f"Écran {i + 1}", "principal": bool(m.is_primary()),
+                        "largeur": g.width, "hauteur": g.height})
+        self.ecrans = out
+
+    def desktop_monitor(self):
+        """Écran qui porte le bureau Archiviste : celui choisi dans les réglages s'il est branché, sinon le principal."""
+        disp = Gdk.Display.get_default()
+        idx = A.bureau_state().get("ecran")
+        if isinstance(idx, int) and disp is not None and 0 <= idx < disp.get_n_monitors():
+            return disp.get_monitor(idx)
+        return primary_monitor()
+
+    # ── le bureau est prévenu des changements au lieu de les guetter ──
+    def on_folder_changed(self, kind: str) -> None:
+        if self.bureau is not None:
+            self.bureau.run_js(f"window.archivisteChange && archivisteChange({json.dumps(kind)})")
+
+    def on_push(self, kind: str) -> bool:
+        if not self._push_timer:  # plusieurs écritures d'affilée (une réponse de l'IA) : un seul signal
+            self._push_timer = GLib.timeout_add(150, self._push_now, kind)
+        return False
+
+    def _push_now(self, kind: str) -> bool:
+        self._push_timer = 0
+        self.on_folder_changed(kind)
+        return False
 
     def on_windows_changed(self) -> None:
         if self.bureau is not None:
@@ -756,6 +956,8 @@ class Application(Gtk.Application):
             self.toggle_demande(close=bool(data.get("fermer")))
         elif action == "fond" and self.bureau is not None:
             self.bureau.load()
+        elif action == "ecran" and self.bureau is not None:
+            self.bureau.place()
         return False
 
     # ── téléchargements (export, etc.) : boîte « Enregistrer sous » ──
