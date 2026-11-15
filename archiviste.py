@@ -39,7 +39,10 @@ from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.5.0"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import archives  # noqa: E402  (zip, tar, 7z… : archives.py, à côté)
+
+VERSION = "1.6.0"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -204,6 +207,7 @@ DEFAULT_SETTINGS = {
     "maj_auto": True,
     "index_contenu": True,   # la recherche instantanée lit aussi le texte des documents (PDF, Word, notes…)
     "maj_ignoree": "",       # version qu'on a quittée en revenant à la précédente : elle n'est plus proposée d'office
+    "gestionnaire_precedent": "",  # gestionnaire de fichiers d'avant Archiviste (rendu si on revient en arrière)
 }
 
 
@@ -245,6 +249,7 @@ def _save_settings(body: dict) -> dict:
     s["maj_auto"] = to_bool(s.get("maj_auto"), True)
     s["index_contenu"] = to_bool(s.get("index_contenu"), True)
     s["maj_ignoree"] = str(s.get("maj_ignoree") or "")[:20]
+    s["gestionnaire_precedent"] = str(s.get("gestionnaire_precedent") or "")[:200]
     s["prenom"] = str(s["prenom"]).strip()[:40] or "Cyril"
     roots = []
     for r in s.get("roots") or []:
@@ -263,7 +268,7 @@ def _save_settings(body: dict) -> dict:
 # ════════════════════════════════════════════════════════════════════
 #  Sécurité des chemins
 # ════════════════════════════════════════════════════════════════════
-def allowed_roots(settings: dict | None = None) -> list[str]:
+def allowed_roots(settings: dict | None = None, volumes_too: bool = True) -> list[str]:
     s = settings or get_settings()
     out = []
     for r in s.get("roots") or []:
@@ -274,6 +279,10 @@ def allowed_roots(settings: dict | None = None) -> list[str]:
     desk = desktop_dir()  # le bureau reste toujours accessible
     if desk != "/" and os.path.isdir(desk) and not any(within(desk, r) for r in out):
         out.append(desk)
+    if volumes_too:  # clés USB et disques branchés : on peut y ranger, copier, extraire, comme dans Nemo
+        for v in volumes():
+            if not any(within(v["path"], r) for r in out):
+                out.append(v["path"])
     return out
 
 
@@ -577,7 +586,7 @@ def fs_list(path: str, show_hidden: bool) -> dict:
     entries.sort(key=sort_key)
     root = next((r for r in roots if within(real, r)), roots[0])
     parent = os.path.dirname(real) if real != root else None
-    return {"path": real, "root": root, "parent": parent, "entries": entries}
+    return {"path": real, "root": root, "parent": parent, "entries": entries, "volumes": volumes()}
 
 
 def backup_version(path: str) -> str | None:
@@ -728,6 +737,25 @@ def fs_mkdir(path: str, roots=None, base=None) -> dict:
     os.makedirs(real)
     changed(real, os.path.join(real, "x"))
     return {"path": real, "existait": False}
+
+
+def move_plan(src: str, dest: str, roots=None, base=None, copy: bool = False) -> tuple[str, str | None]:
+    """Vérifie un déplacement ou une copie et choisit le nom d'arrivée (None : rien à faire, déjà là)."""
+    roots = roots or allowed_roots()
+    s = safe_path(src, base=base, roots=roots, must_exist=True, nofollow=True)
+    if is_root(s, roots) and not copy:
+        raise ApiError("On ne déplace pas un dossier racine autorisé.")
+    d = safe_path(dest, base=base, roots=roots)
+    if os.path.isdir(d):
+        target = os.path.join(d, os.path.basename(s))
+    else:
+        target = d
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+    if not os.path.islink(s) and os.path.isdir(s) and within(os.path.realpath(target), s):
+        raise ApiError("Impossible de mettre un dossier dans lui-même.")
+    if lexical_path(target) == s and not copy:
+        return s, None
+    return s, unique_path(target)
 
 
 def fs_move(src: str, dest: str, roots=None, base=None, copy: bool = False) -> dict:
@@ -907,7 +935,8 @@ def start_index() -> None:
         return
     try:
         import indexeur
-        INDEX = indexeur.Indexeur(DATA_DIR / "index.sqlite", allowed_roots, SKIP_DIRS, extract_text, _fold,
+        # les clés USB ne sont pas indexées : elles vont et viennent, et peuvent être énormes
+        INDEX = indexeur.Indexeur(DATA_DIR / "index.sqlite", lambda: allowed_roots(volumes_too=False), SKIP_DIRS, extract_text, _fold,
                                   index_text_ok, lambda: bool(get_settings().get("index_contenu", True)))
         INDEX.start()
     except Exception:  # noqa: BLE001
@@ -4419,6 +4448,10 @@ def r_open(h, q, b):
         if not open_in_grimoire(path):
             raise ApiError("Grimoire n'a pas pu être lancé.")
         return {"ok": True, "app": "grimoire"}
+    if to_bool(b.get("reveal")) and fm_is_archiviste():  # sinon Archiviste se répondrait à lui-même
+        for fm in ("nemo", "nautilus", "caja", "thunar"):
+            if shutil.which(fm) and _launch([fm, path]):
+                return {"ok": True}
     if to_bool(b.get("reveal")) and not os.path.isdir(path):
         uri = Path(path).as_uri()
         if shutil.which("gdbus"):
@@ -4570,16 +4603,466 @@ def r_rename(h, q, b):
 
 @route("POST", "/api/fs/move")
 def r_move(h, q, b):
-    dest = safe_path(b.get("dest_dir"), must_exist=True)
+    return transfer(b.get("paths") or [], b.get("dest_dir"), copy=bool(b.get("copy")))
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Tâches de fond : extractions, compressions, longues copies
+# ════════════════════════════════════════════════════════════════════
+# Elles tournent dans leur propre fil : la fenêtre reste utilisable, la progression se suit en bas à droite
+# (GET /api/taches) et chacune peut être annulée. Rien de ce qu'une tâche annulée a commencé ne reste à moitié.
+class Tache:
+    def __init__(self, genre: str, titre: str, dossier: str):
+        self.id = uuid.uuid4().hex[:12]
+        self.genre, self.titre, self.dossier = genre, titre, dossier
+        self.fait, self.total, self.pourcent = 0, 0, False
+        self.detail, self.erreur, self.mdp = "", None, False
+        self.etat = "en cours"
+        self.resultat: list[str] = []
+        self.source = None
+        self.debut, self.fin = time.time(), None
+        self.stop = threading.Event()
+
+    def avance(self, n: int, detail=None, fait=None, total=None, pourcent=False) -> None:
+        if total is not None:
+            self.total = total
+        if fait is not None:
+            self.fait = fait
+        else:
+            self.fait += n
+        if detail:
+            self.detail = detail
+        if pourcent:
+            self.pourcent = True
+
+    def annulee(self) -> bool:
+        return self.stop.is_set()
+
+    def dict(self) -> dict:
+        return {"id": self.id, "genre": self.genre, "titre": self.titre, "dossier": self.dossier, "etat": self.etat,
+                "fait": self.fait, "total": self.total, "pourcent": self.pourcent, "detail": self.detail,
+                "erreur": self.erreur, "mdp": self.mdp, "resultat": self.resultat, "source": self.source,
+                "debut": self.debut, "fin": self.fin, "maintenant": time.time()}
+
+
+TACHES: dict[str, Tache] = {}
+_taches_lock = threading.Lock()
+
+
+def lancer_tache(t: Tache, travail) -> Tache:
+    def run():
+        try:
+            travail(t)
+            t.etat = "annulee" if t.stop.is_set() else "finie"
+        except archives.Annule:
+            t.etat = "annulee"
+        except archives.MotDePasse as e:
+            t.etat, t.erreur, t.mdp = "erreur", str(e), True
+        except (ApiError, archives.ErreurArchive) as e:
+            t.etat, t.erreur = "erreur", str(e)
+        except OSError as e:
+            t.etat, t.erreur = "erreur", archives.message_os(e)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            t.etat, t.erreur = "erreur", f"Erreur inattendue : {e}"
+        finally:
+            t.fin = time.time()
+            changed(t.dossier, os.path.join(t.dossier, "x"), *t.resultat)
+            push("taches")
+
+    with _taches_lock:
+        old = [k for k, v in TACHES.items() if v.fin and time.time() - v.fin > 1800]
+        for k in old:
+            TACHES.pop(k, None)
+        TACHES[t.id] = t
+    threading.Thread(target=run, name=f"tache-{t.genre}", daemon=True).start()
+    push("taches")
+    return t
+
+
+@route("GET", "/api/taches")
+def r_tasks(h, q, b):
+    with _taches_lock:
+        return {"taches": [t.dict() for t in TACHES.values()]}
+
+
+@route("POST", "/api/taches/annuler")
+def r_task_cancel(h, q, b):
+    t = TACHES.get(str(b.get("id") or ""))
+    if t is None:
+        raise ApiError("Tâche introuvable.", 404)
+    t.stop.set()
+    return t.dict()
+
+
+@route("POST", "/api/taches/oublier")
+def r_task_forget(h, q, b):
+    with _taches_lock:
+        t = TACHES.get(str(b.get("id") or ""))
+        if t is not None and t.etat != "en cours":
+            TACHES.pop(t.id, None)
+    return {"ok": True}
+
+
+# ── copier / déplacer : rapide tout de suite, long en tâche de fond ──
+LOURD = 48 * 1024 * 1024  # au-delà, une copie se suit dans une tâche (barre de progression, Annuler)
+
+
+def _poids(paths: list[str], budget: float = 1.5) -> tuple[int, int, bool]:
+    """Octets et nombre d'éléments, sans suivre les liens. complet=False si le temps a manqué."""
+    size, count, t0 = 0, 0, time.monotonic()
+    stack = list(paths)
+    while stack:
+        p = stack.pop()
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        count += 1
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                stack.extend(os.path.join(p, n) for n in os.listdir(p))
+            except OSError:
+                pass
+        elif stat.S_ISREG(st.st_mode):
+            size += st.st_size
+        if time.monotonic() - t0 > budget:
+            return size, count, False
+    return size, count, True
+
+
+def _copy_tree(src: str, dst: str, t: Tache, base: str) -> None:
+    """Copie avec progression : fichier par fichier, par morceaux, arrêt possible à tout moment."""
+    if t.annulee():
+        raise archives.Annule()
+    if os.path.islink(src):
+        os.symlink(link_target(src), dst)
+        return
+    st = os.lstat(src)
+    if stat.S_ISDIR(st.st_mode):
+        os.mkdir(dst)
+        for e in sorted(os.scandir(src), key=lambda e: e.name):
+            _copy_tree(e.path, os.path.join(dst, e.name), t, base)
+        try:
+            shutil.copystat(src, dst)
+        except OSError:
+            pass
+    elif stat.S_ISREG(st.st_mode):
+        rel = os.path.relpath(src, base)
+        with open(src, "rb") as f, open(dst, "wb") as g:
+            archives._copier(f, g, t.avance, t.annulee, rel)
+        try:
+            shutil.copystat(src, dst)  # une clé en FAT32 ne garde pas les droits : sans importance
+        except OSError:
+            pass
+
+
+def _remove(path: str) -> None:
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+    else:
+        shutil.rmtree(path)
+
+
+def transfer(paths: list, dest_dir, copy: bool) -> dict:
+    """Copie ou déplace des éléments dans un dossier. Un déplacement sur le même disque est immédiat ;
+    une copie, ou un déplacement vers un autre disque (clé USB), passe en tâche de fond au-delà de LOURD."""
+    roots = allowed_roots()
+    dest = safe_path(dest_dir, must_exist=True)
     if not os.path.isdir(dest):
         raise ApiError("La destination doit être un dossier.")
-    done, errors = [], []
-    for p in b.get("paths") or []:
+    plans, errors, same = [], [], 0
+    for p in paths:
         try:
-            done.append(fs_move(p, dest, copy=bool(b.get("copy"))))
+            s, target = move_plan(p, dest, roots, copy=copy)
+            if target is None:
+                same += 1
+            else:
+                plans.append((s, target))
         except (ApiError, OSError) as e:
-            errors.append({"path": p, "erreur": str(e)})
-    return {"ok": done, "erreurs": errors}
+            errors.append({"path": p, "erreur": archives.message_os(e) if isinstance(e, OSError) else str(e)})
+    out = {"ok": [], "erreurs": errors, "deja": same, "tache": None}
+    if not plans:
+        return out
+    dev = os.stat(dest).st_dev
+    slow = [(s, tg) for s, tg in plans if copy or os.lstat(s).st_dev != dev]
+    size, count, complete = _poids([s for s, _ in slow])
+    if not slow or (complete and size < LOURD and count < 3000):
+        for s, target in plans:
+            try:
+                if copy:
+                    if os.path.islink(s):
+                        os.symlink(link_target(s), target)
+                    elif os.path.isdir(s):
+                        shutil.copytree(s, target, symlinks=True)
+                    else:
+                        shutil.copy2(s, target)
+                else:
+                    move_entry(s, target)
+                changed(s, target, os.path.join(target, "x"))
+                out["ok"].append({"de": s, "vers": target})
+            except OSError as e:
+                errors.append({"path": s, "erreur": archives.message_os(e)})
+        return out
+    free = shutil.disk_usage(dest).free
+    if complete and size + archives.marge(dest) > free:
+        raise ApiError(f"Pas assez de place : il faut {archives.taille_lisible(size)}, "
+                       f"il reste {archives.taille_lisible(free)} sur ce disque.")
+    n = len(plans)
+    what = f"« {os.path.basename(plans[0][0])} »" if n == 1 else f"{n} éléments"
+    t = Tache("copie" if copy else "deplacement",
+              f"{'Copie' if copy else 'Déplacement'} de {what} vers {os.path.basename(dest) or dest}", dest)
+    t.total = size if complete else 0
+
+    def travail(t: Tache) -> None:
+        for s, target in plans:
+            if t.annulee():
+                raise archives.Annule()
+            if not copy and os.lstat(s).st_dev == dev:
+                move_entry(s, target)  # même disque : instantané
+            else:
+                try:
+                    _copy_tree(s, target, t, os.path.dirname(s))
+                except BaseException:
+                    if os.path.lexists(target):
+                        _remove(target)  # rien à moitié copié
+                    raise
+                if not copy:
+                    _remove(s)
+            t.resultat.append(target)
+            changed(s, target, os.path.join(target, "x"))
+
+    out["tache"] = lancer_tache(t, travail).dict()
+    return out
+
+
+# ── archives ──
+def _archive_err(e: Exception) -> ApiError:
+    return ApiError(archives.message_os(e) if isinstance(e, OSError) else str(e))
+
+
+@route("GET", "/api/archive")
+def r_archive_list(h, q, b):
+    path = safe_path(q1(q, "path"), must_exist=True)
+    if archives.nature(path) is None:
+        raise ApiError("Ce fichier n'est pas une archive reconnue.")
+    try:
+        out = archives.lister(path, limite=3000)
+    except archives.ErreurArchive as e:
+        raise _archive_err(e)
+    out["nom"] = os.path.basename(path)
+    out["dossier_final"] = out["dossier_unique"] or archives.nom_sans_extension(path)
+    return out
+
+
+@route("POST", "/api/archive/extraire")
+def r_archive_extract(h, q, b):
+    path = safe_path(b.get("path"), must_exist=True)
+    if archives.nature(path) is None:
+        raise ApiError("Ce fichier n'est pas une archive reconnue.")
+    dest = safe_path(b.get("dest") or os.path.dirname(path), must_exist=True)
+    if not os.path.isdir(dest):
+        raise ApiError("La destination doit être un dossier.")
+    mdp = b.get("mdp")
+    mdp = str(mdp) if mdp is not None else None
+    t = Tache("extraction", f"Extraction de « {os.path.basename(path)} »", dest)
+    t.source = path
+
+    def travail(t: Tache) -> None:
+        r = archives.extraire(path, dest, t.avance, t.annulee, unique_path, mdp=mdp)
+        t.resultat.append(r["resultat"])
+
+    return {"tache": lancer_tache(t, travail).dict()}
+
+
+@route("POST", "/api/archive/compresser")
+def r_archive_compress(h, q, b):
+    roots = allowed_roots()
+    paths = [safe_path(p, roots=roots, must_exist=True, nofollow=True) for p in (b.get("paths") or [])][:2000]
+    if not paths:
+        raise ApiError("Rien à compresser.")
+    fmt = "tar.gz" if b.get("format") == "tar.gz" else "zip"
+    name = check_name(str(b.get("nom") or "").strip() or archives.nom_sans_extension(paths[0]))
+    if not name.lower().endswith("." + fmt):
+        name += "." + fmt
+    dest = unique_path(os.path.join(os.path.dirname(paths[0]), name))
+    safe_path(os.path.dirname(dest), roots=roots, must_exist=True)
+    t = Tache("compression", f"Compression vers « {os.path.basename(dest)} »", os.path.dirname(dest))
+
+    def travail(t: Tache) -> None:
+        r = archives.compresser(paths, dest, fmt, t.avance, t.annulee)
+        t.resultat.append(r["resultat"])
+
+    return {"tache": lancer_tache(t, travail).dict()}
+
+
+# ── propriétés, droits ──
+def _iso(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+
+
+@route("GET", "/api/fs/proprietes")
+def r_properties(h, q, b):
+    import grp
+    import pwd
+    roots = allowed_roots()
+    paths = [safe_path(p, roots=roots, must_exist=True, nofollow=True) for p in (q.get("path") or [])][:500]
+    if not paths:
+        raise ApiError("Aucun élément.")
+    size, count, complete = 0, 0, True
+    files = dirs = 0
+    t0 = time.monotonic()
+    for p in paths:
+        stack = [p]
+        while stack:
+            c = stack.pop()
+            try:
+                st = os.lstat(c)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                dirs += c != p or len(paths) > 1
+                try:
+                    stack.extend(os.path.join(c, n) for n in os.listdir(c))
+                except OSError:
+                    pass
+            else:
+                files += 1
+                size += st.st_size if stat.S_ISREG(st.st_mode) else 0
+            if time.monotonic() - t0 > 5:
+                complete = False
+                stack = []
+        if not complete:
+            break
+    out = {"nombre": len(paths), "taille": size, "fichiers": files, "dossiers": dirs, "complet": complete}
+    try:
+        du = shutil.disk_usage(paths[0] if os.path.isdir(paths[0]) else os.path.dirname(paths[0]))
+        out["disque"] = {"libre": du.free, "total": du.total}
+    except OSError:
+        pass
+    if len(paths) == 1:
+        p = paths[0]
+        lst = os.lstat(p)
+        st = os.stat(p) if os.path.exists(p) else lst
+        def name_of(fn, i):
+            try:
+                return fn(i)[0]
+            except KeyError:
+                return str(i)
+        out.update(chemin=p, nom=os.path.basename(p), dossier=stat.S_ISDIR(st.st_mode),
+                   lien=os.readlink(p) if os.path.islink(p) else None,
+                   type=mime_of(p), modifie=_iso(st.st_mtime), acces=_iso(st.st_atime), change=_iso(st.st_ctime),
+                   proprietaire=name_of(pwd.getpwuid, lst.st_uid), groupe=name_of(grp.getgrgid, lst.st_gid),
+                   mode=stat.S_IMODE(st.st_mode), a_moi=lst.st_uid == os.getuid(),
+                   modifiable=not os.path.islink(p) and lst.st_uid == os.getuid())
+        if not out["dossier"]:
+            try:
+                a = apps_for(p)
+                d = next((x for x in a["apps"] if x["id"] == a["defaut"]), None)
+                out["appli"] = d["nom"] if d else None
+            except Exception:  # noqa: BLE001
+                out["appli"] = None
+    return out
+
+
+@route("POST", "/api/fs/droits")
+def r_chmod(h, q, b):
+    p = safe_path(b.get("path"), must_exist=True, nofollow=True)
+    if os.path.islink(p):
+        raise ApiError("Les droits d'un lien sont ceux de sa cible.")
+    st = os.lstat(p)
+    if st.st_uid != os.getuid():
+        raise ApiError("Seul le propriétaire de ce fichier peut changer ses droits.")
+    try:
+        mode = int(b.get("mode")) & 0o777
+    except (TypeError, ValueError):
+        raise ApiError("Droits invalides.")
+    try:
+        os.chmod(p, (stat.S_IMODE(st.st_mode) & 0o7000) | mode | 0o400)  # le propriétaire garde toujours la lecture
+    except OSError as e:
+        raise ApiError(archives.message_os(e))
+    return {"mode": stat.S_IMODE(os.stat(p).st_mode)}
+
+
+# ── ouvrir un terminal ici ──
+TERM_DIR = {"gnome-terminal": "--working-directory={}", "mate-terminal": "--working-directory={}",
+            "xfce4-terminal": "--working-directory={}", "terminator": "--working-directory={}",
+            "tilix": "--working-directory={}", "kgx": "--working-directory={}", "ptyxis": "--working-directory={}",
+            "konsole": "--workdir={}", "alacritty": "--working-directory={}", "kitty": "--directory={}",
+            "wezterm": None, "xterm": None, "urxvt": None, "lxterminal": "--working-directory={}"}
+
+
+@route("POST", "/api/terminal")
+def r_terminal(h, q, b):
+    d = safe_path(b.get("path") or HOME, must_exist=True)
+    if not os.path.isdir(d):
+        d = os.path.dirname(d)
+    pref = gs_get("org.cinnamon.desktop.default-applications.terminal", "exec")
+    cands = ([pref] if isinstance(pref, str) and pref else []) + list(TERM_DIR) + ["x-terminal-emulator"]
+    exe = next((shutil.which(c) for c in cands if shutil.which(c)), None)
+    if not exe:
+        raise ApiError("Aucun terminal trouvé sur ce PC.")
+    flag = TERM_DIR.get(os.path.basename(exe))
+    try:
+        subprocess.Popen([exe] + ([flag.format(d)] if flag else []), cwd=d, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        raise ApiError(f"Le terminal n'a pas pu être lancé ({e.strerror}).")
+    return {"ok": True, "terminal": os.path.basename(exe)}
+
+
+# ── Archiviste, gestionnaire de fichiers par défaut ──
+FM_ID = "fr.csc.Archiviste.desktop"
+FM_HOOK = None  # renseigné par fenetre.py : répond (ou non) au service D-Bus « FileManager1 »
+
+
+def fm_default() -> str | None:
+    exe = shutil.which("xdg-mime")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "query", "default", "inode/directory"], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def fm_is_archiviste() -> bool:
+    return fm_default() == FM_ID
+
+
+def fm_installed() -> bool:
+    dirs = [Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")] + \
+           [Path(p) for p in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if p]
+    return any((d / "applications" / FM_ID).is_file() for d in dirs)
+
+
+@route("GET", "/api/gestionnaire")
+def r_fm_get(h, q, b):
+    cur = fm_default()
+    return {"defaut": cur, "archiviste": cur == FM_ID, "possible": fm_installed() and bool(shutil.which("xdg-mime")),
+            "service": FM_HOOK is not None and FM_HOOK("etat")}
+
+
+@route("POST", "/api/gestionnaire")
+def r_fm_set(h, q, b):
+    exe = shutil.which("xdg-mime")
+    if not exe or not fm_installed():
+        raise ApiError("Il faut Archiviste installé par son paquet (.deb) pour le choisir comme gestionnaire de fichiers.")
+    want = to_bool(b.get("archiviste"))
+    cur = fm_default()
+    if want:
+        if cur and cur != FM_ID:
+            save_settings({"gestionnaire_precedent": cur})
+        target = FM_ID
+    else:
+        target = get_settings().get("gestionnaire_precedent") or "nemo.desktop"
+    r = subprocess.run([exe, "default", target, "inode/directory"], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise ApiError(f"Le réglage n'a pas pu être changé : {(r.stderr or r.stdout).strip()[:200]}")
+    if FM_HOOK is not None:
+        FM_HOOK("marche" if want else "arret")
+    return r_fm_get(h, q, b)
 
 
 # ── Couper / copier / coller : un presse-papiers de fichiers commun au bureau et à la fenêtre principale ──
@@ -4682,16 +5165,9 @@ def r_clip_paste(h, q, b):
     if not st["paths"]:
         raise ApiError("Rien à coller : coupe ou copie d'abord un fichier (Ctrl+X, Ctrl+C).")
     cut = st["mode"] == "couper"
-    done, errors, same = [], [], 0
-    for p in st["paths"]:
-        try:
-            r = fs_move(p, dest, copy=not cut)
-            same += bool(r.get("inchange"))
-            if not r.get("inchange"):
-                done.append(r)
-        except (ApiError, OSError) as e:
-            errors.append({"path": p, "erreur": str(e)})
-    if cut and (done or same):  # coupé-collé : c'est fait, le presse-papiers est vidé (un copié reste collable ailleurs)
+    r = transfer(st["paths"], dest, copy=not cut)
+    done, errors, same = r["ok"], r["erreurs"], r["deja"]
+    if cut and (done or same or r["tache"]):  # coupé-collé : c'est fait, le presse-papiers est vidé (un copié reste collable ailleurs)
         with _clip_lock:
             CLIP.update(paths=[], mode="copier")
         if st["source"] == "systeme" and CLIP_HOOK is not None:
@@ -4700,7 +5176,7 @@ def r_clip_paste(h, q, b):
             except Exception:  # noqa: BLE001
                 pass
         push("presse")
-    return {"ok": done, "erreurs": errors, "mode": st["mode"], "deja": same}
+    return {"ok": done, "erreurs": errors, "mode": st["mode"], "deja": same, "tache": r["tache"]}
 
 
 @route("POST", "/api/fs/trash")
@@ -5142,6 +5618,22 @@ def r_apps(h, q, b):
 @route("GET", "/api/apps/pour")
 def r_apps_for(h, q, b):
     return apps_for(safe_path(q1(q, "path"), must_exist=True))
+
+
+@route("POST", "/api/apps/defaut")
+def r_apps_default(h, q, b):
+    path = safe_path(b.get("path"), must_exist=True)
+    a = apps_index()["by_id"].get(str(b.get("id") or ""))
+    if not a:
+        raise ApiError("Cette application n'est plus installée.", 404)
+    exe = shutil.which("xdg-mime")
+    if not exe:
+        raise ApiError("xdg-mime est introuvable (paquet xdg-utils).")
+    mime = mime_of(path)
+    r = subprocess.run([exe, "default", a["id"], mime], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise ApiError("Le réglage n'a pas pu être changé.")
+    return {"ok": True, "type": mime, "nom": a["nom"]}
 
 
 @route("POST", "/api/apps/lancer")

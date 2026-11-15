@@ -443,6 +443,135 @@ r = call("POST", "/api/app/ouvrir", {"vue": "files"})
 check(r["ok"] is False, "sans fenêtre GTK : ouverture déclinée proprement")
 check(call("GET", "/bureau", raw=True).startswith("<!doctype html>"), "page du bureau servie")
 
+print("— archives : lire, extraire, compresser (tâches de fond)")
+import zipfile, tarfile, subprocess, shutil  # noqa: E401
+
+
+def wait_task(tid, timeout=30):
+    end = time.time() + timeout
+    while time.time() < end:
+        t = next((x for x in call("GET", "/api/taches")["taches"] if x["id"] == tid), None)
+        if t and t["etat"] != "en cours":
+            return t
+        time.sleep(0.1)
+    return t
+
+
+adir = doc_dir + "/archives"
+shutil.rmtree(adir, ignore_errors=True)
+os.makedirs(adir + "/src/Projet/plans")
+open(adir + "/src/Projet/devis.txt", "w").write("devis")
+open(adir + "/src/Projet/plans/rdc.txt", "w").write("rez-de-chaussée")
+with zipfile.ZipFile(adir + "/Projet.zip", "w") as z:
+    z.write(adir + "/src/Projet/devis.txt", "Projet/devis.txt")
+    z.write(adir + "/src/Projet/plans/rdc.txt", "Projet/plans/rdc.txt")
+with zipfile.ZipFile(adir + "/Photos vacances.zip", "w") as z:
+    z.writestr("a.jpg", "a"); z.writestr("b.jpg", "b")
+    z.writestr(zipfile.ZipInfo("Été à Nice.txt".encode("cp850").decode("cp437")), "souvenir")
+with zipfile.ZipFile(adir + "/piege.zip", "w") as z:
+    z.writestr("../../../evasion.txt", "x"); z.writestr("ok.txt", "ok")
+with tarfile.open(adir + "/sauvegarde.tar.gz", "w:gz") as tf:
+    tf.add(adir + "/src/Projet", "Projet")
+a = call("GET", "/api/archive?path=" + urllib.parse.quote(adir + "/Projet.zip"))
+check(a["nombre"] == 2 and a["dossier_unique"] == "Projet" and a["dossier_final"] == "Projet" and a["taille"] == 5 + len("rez-de-chaussée".encode()),
+      f"contenu d'un zip : 2 fichiers, un seul dossier ({a['nombre']}, {a['dossier_unique']}, {a['taille']})")
+r = call("POST", "/api/archive/extraire", {"path": adir + "/Projet.zip"})
+t = wait_task(r["tache"]["id"])
+check(t["etat"] == "finie" and t["resultat"] == [adir + "/Projet"] and open(adir + "/Projet/plans/rdc.txt").read() == "rez-de-chaussée",
+      "« Extraire ici » : un seul dossier dans l'archive → il arrive tel quel à côté")
+r = call("POST", "/api/archive/extraire", {"path": adir + "/Projet.zip"})
+t = wait_task(r["tache"]["id"])
+check(t["resultat"] == [adir + "/Projet (2)"], "extraire une deuxième fois : « Projet (2) », rien n'est écrasé")
+r = call("POST", "/api/archive/extraire", {"path": adir + "/Photos vacances.zip"})
+t = wait_task(r["tache"]["id"])
+check(t["etat"] == "finie" and sorted(os.listdir(adir + "/Photos vacances")) == ["a.jpg", "b.jpg", "Été à Nice.txt"],
+      f"plusieurs éléments → rangés dans « Photos vacances » ; nom venu de Windows bien lu ({os.listdir(adir + '/Photos vacances') if os.path.isdir(adir + '/Photos vacances') else t})")
+r = call("POST", "/api/archive/extraire", {"path": adir + "/piege.zip"})
+t = wait_task(r["tache"]["id"])
+check(t["etat"] == "finie" and not os.path.exists(doc_dir + "/evasion.txt") and not os.path.exists(HOME + "/evasion.txt")
+      and os.path.exists(adir + "/piege/evasion.txt"), "chemin en « ../ » dans une archive : ramené à l'intérieur")
+os.makedirs(adir + "/ailleurs")
+r = call("POST", "/api/archive/extraire", {"path": adir + "/sauvegarde.tar.gz", "dest": adir + "/ailleurs"})
+t = wait_task(r["tache"]["id"])
+check(t["etat"] == "finie" and os.path.isfile(adir + "/ailleurs/Projet/plans/rdc.txt"), "« Extraire vers… » un autre dossier (tar.gz)")
+check(not [n for n in os.listdir(adir) if n.startswith(".archiviste-extraction")], "aucun dossier de travail laissé derrière")
+r = call("POST", "/api/archive/extraire", {"path": "/etc/hostname"}, expect=403)
+check("message" in r, "archive hors des dossiers autorisés : refusée")
+r = call("POST", "/api/archive/compresser", {"paths": [adir + "/src/Projet", adir + "/Photos vacances"], "nom": "Envoi client"})
+t = wait_task(r["tache"]["id"])
+names = sorted(zipfile.ZipFile(adir + "/src/Envoi client.zip").namelist()) if t["etat"] == "finie" else t
+check(t["resultat"] == [adir + "/src/Envoi client.zip"] and "Projet/plans/rdc.txt" in names and any(n.endswith("Été à Nice.txt") for n in names),
+      "« Compresser… » plusieurs éléments en .zip")
+r = call("POST", "/api/archive/compresser", {"paths": [adir + "/src/Projet"], "format": "tar.gz"})
+t = wait_task(r["tache"]["id"])
+check(t["resultat"] == [adir + "/src/Projet.tar.gz"] and "Projet/devis.txt" in tarfile.open(adir + "/src/Projet.tar.gz").getnames(), "compresser en .tar.gz")
+if shutil.which("zip"):
+    subprocess.run(["zip", "-q", "-P", "secret", "-j", adir + "/prive.zip", adir + "/src/Projet/devis.txt"], check=True)
+    check(call("GET", "/api/archive?path=" + urllib.parse.quote(adir + "/prive.zip"))["chiffree"], "archive protégée : signalée")
+    t = wait_task(call("POST", "/api/archive/extraire", {"path": adir + "/prive.zip"})["tache"]["id"])
+    check(t["etat"] == "erreur" and t["mdp"] and not os.path.exists(adir + "/devis.txt"), "sans mot de passe : demandé, rien n'est extrait")
+    t = wait_task(call("POST", "/api/archive/extraire", {"path": adir + "/prive.zip", "mdp": "faux"})["tache"]["id"])
+    check(t["etat"] == "erreur" and t["mdp"] and "incorrect" in t["erreur"], "mauvais mot de passe : dit clairement")
+    t = wait_task(call("POST", "/api/archive/extraire", {"path": adir + "/prive.zip", "mdp": "secret"})["tache"]["id"])
+    check(t["etat"] == "finie" and open(adir + "/devis.txt").read() == "devis", "bon mot de passe : extrait")
+open(adir + "/pas-une-archive.zip", "w").write("ceci n'est pas un zip")
+r = call("GET", "/api/archive?path=" + urllib.parse.quote(adir + "/pas-une-archive.zip"), expect=400)
+check("abîmée" in r.get("message", ""), "fichier abîmé : message clair")
+
+print("— grosses copies : tâche de fond, progression, annulation")
+big = adir + "/gros.bin"
+with open(big, "wb") as f:
+    f.truncate(80 * 1024 * 1024)
+os.makedirs(adir + "/copies")
+r = call("POST", "/api/fs/move", {"paths": [big], "dest_dir": adir + "/copies", "copy": True})
+check(r["tache"] and r["ok"] == [] and r["tache"]["total"] == 80 * 1024 * 1024, "copie de 80 Mo : passée en tâche de fond, taille connue")
+t = wait_task(r["tache"]["id"])
+check(t["etat"] == "finie" and os.path.getsize(adir + "/copies/gros.bin") == 80 * 1024 * 1024 and t["fait"] == t["total"], "copie terminée, octets comptés")
+r = call("POST", "/api/fs/move", {"paths": [adir + "/src/Projet/devis.txt"], "dest_dir": adir + "/copies", "copy": True})
+check(r["tache"] is None and len(r["ok"]) == 1, "petite copie : faite tout de suite, comme avant")
+with open(adir + "/enorme.bin", "wb") as f:
+    f.truncate(1024 ** 3)
+r = call("POST", "/api/fs/move", {"paths": [adir + "/enorme.bin"], "dest_dir": adir + "/copies", "copy": True})
+call("POST", "/api/taches/annuler", {"id": r["tache"]["id"]})
+t = wait_task(r["tache"]["id"])
+check(t["etat"] == "annulee" and not os.path.exists(adir + "/copies/enorme.bin"), "copie annulée : le fichier à moitié copié est retiré")
+shm = "/dev/shm/archi-test-" + str(os.getpid())
+if os.path.isdir("/dev/shm") and os.stat("/dev/shm").st_dev != os.stat(HOME).st_dev:
+    os.makedirs(shm)
+    st0 = call("GET", "/api/settings")
+    call("POST", "/api/settings", {"roots": st0["roots"] + [shm]})
+    r = call("POST", "/api/fs/move", {"paths": [adir + "/copies/gros.bin"], "dest_dir": shm})
+    t = wait_task(r["tache"]["id"]) if r["tache"] else None
+    check(t and t["genre"] == "deplacement" and t["etat"] == "finie" and os.path.getsize(shm + "/gros.bin") == 80 * 1024 * 1024
+          and not os.path.exists(adir + "/copies/gros.bin"), "déplacement vers un autre disque : copié puis retiré de l'origine")
+    call("POST", "/api/settings", {"roots": st0["roots"]})
+    shutil.rmtree(shm, ignore_errors=True)
+r = call("POST", "/api/presse-papiers", {"paths": [adir + "/enorme.bin"], "mode": "copier"})
+r = call("POST", "/api/presse-papiers/coller", {"dest": adir + "/copies"})
+check(r["tache"] is not None, "coller un gros fichier : tâche de fond aussi")
+call("POST", "/api/taches/annuler", {"id": r["tache"]["id"]})
+wait_task(r["tache"]["id"])
+call("POST", "/api/taches/oublier", {"id": r["tache"]["id"]})
+check(all(x["id"] != r["tache"]["id"] for x in call("GET", "/api/taches")["taches"]), "une tâche terminée peut être retirée de la liste")
+os.unlink(adir + "/enorme.bin")
+
+print("— propriétés, droits, terminal, appli par défaut")
+p = call("GET", "/api/fs/proprietes?path=" + urllib.parse.quote(adir + "/src"))
+check(p["dossier"] and p["fichiers"] >= 4 and p["taille"] > 0 and p["complet"] and p["a_moi"], f"propriétés d'un dossier : taille et contenu ({p['fichiers']} fichiers)")
+p = call("GET", "/api/fs/proprietes?path=" + urllib.parse.quote(adir + "/src/Projet/devis.txt") + "&path=" + urllib.parse.quote(adir + "/Projet.zip"))
+check(p["nombre"] == 2 and p["fichiers"] == 2 and p["taille"] == 5 + os.path.getsize(adir + "/Projet.zip"), "propriétés de plusieurs éléments : total")
+f = adir + "/src/script.sh"
+open(f, "w").write("#!/bin/sh\necho ok\n")
+os.chmod(f, 0o644)
+r = call("POST", "/api/fs/droits", {"path": f, "mode": 0o755})
+check(r["mode"] == 0o755 and os.access(f, os.X_OK), "rendre un fichier exécutable")
+r = call("POST", "/api/fs/droits", {"path": f, "mode": 0o000})
+check(r["mode"] == 0o400, "le propriétaire garde toujours la lecture")
+r = call("POST", "/api/terminal", {"path": adir}, expect=200 if shutil.which("xterm") or shutil.which("gnome-terminal") else 400)
+check(r.get("ok") or "terminal" in r.get("message", ""), "ouvrir un terminal ici (ou dire qu'il n'y en a pas)")
+g = call("GET", "/api/gestionnaire")
+check("archiviste" in g and "possible" in g, "réglage du gestionnaire de fichiers par défaut lisible")
+
 print("— couper, copier, coller")
 cdir = doc_dir + "/presse"
 os.makedirs(cdir + "/A", exist_ok=True)

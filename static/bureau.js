@@ -163,6 +163,7 @@ window.archivisteChange = (kind) => {
   D.push = true;
   if (kind === 'telechargements') return loadTodo();
   if (kind === 'presse') return clipLoad();
+  if (kind === 'taches') return tasksPoll();
   return poll();
 };
 async function poll() {
@@ -224,6 +225,7 @@ function openFile(e) {
   if (e.dir) return openFolder(e.path);
   if (e.ext === 'desktop') return launchLauncher(e.path);
   if (hasGrimoire() && GRIM_FIRST.has(e.ext)) return openInGrimoire(e.path);
+  if (e.kind === 'archive') return openArchive(e.path, { launch: (a) => launchApp(a.id, a.nom, [e.path]) });
   return openWithSystem(e.path);
 }
 function openItem(it) {
@@ -233,15 +235,8 @@ function openItem(it) {
   if (it.type === 'volume') return post('/api/bureau/volume', { path: it.path, action: 'ouvrir' }).catch((e) => toast(e.message, 'err'));
   return openFile(it.e);
 }
-async function openWithMenu(e, x, y) {
-  let r;
-  try { r = await api(`/api/apps/pour?path=${enc(e.path)}`); } catch (err) { return toast(err.message, 'err'); }
-  if (!r.apps.length) return toast('Aucune application installée ne déclare savoir ouvrir ce type de fichier.');
-  showMenu(x, y, [{ header: 'Ouvrir avec' }, ...r.apps.map((a) => ({
-    label: a.nom + (a.id === r.defaut ? ' — par défaut' : ''), sub: a.generique || '', icon: 'app',
-    act: () => launchApp(a.id, a.nom, [e.path]),
-  }))], { search: r.apps.length > 8 });
-}
+// « Ouvrir avec… » : le menu commun (app.js), lancé par launchApp pour que le dock suive la fenêtre
+const openWithMenu = (e, x, y) => openWithAt(e.path, x, y, (a) => launchApp(a.id, a.nom, [e.path]));
 
 // ───────────────────────── Actions sur les fichiers ─────────────────────────
 async function renameEntry(e) {
@@ -272,6 +267,7 @@ async function movePaths(paths, dest, copy) {
   try {
     const r = await post('/api/fs/move', { paths, dest_dir: dest, copy });
     if (r.erreurs.length) toast(r.erreurs.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
+    if (r.tache) taskStarted(r.tache);  // grosse copie : elle se suit en bas à droite
     if (r.ok.length) toast(`${r.ok.length} élément(s) ${copy ? 'copié(s)' : 'déplacé(s)'} vers ${dest === D.b.dossier ? 'le bureau' : basename(dest)}`, 'ok');
     return r;
   } catch (e) { toast(e.message, 'err'); return null; } finally { loadElements(); }
@@ -326,6 +322,10 @@ function itemMenu(x, y) {
     } else {
       m.push({ label: e.dir ? 'Ouvrir' : hasGrimoire() && GRIM_FIRST.has(e.ext) ? 'Ouvrir dans Grimoire' : 'Ouvrir', icon: e.dir ? 'folder' : hasGrimoire() && GRIM_FIRST.has(e.ext) ? 'quill' : 'external', kbd: 'Entrée', act: () => openFile(e) });
       if (!e.dir) m.push({ label: 'Ouvrir avec…', icon: 'external', act: () => openWithMenu(e, x, y) });
+      if (isArchive(e)) {
+        m.push({ label: 'Extraire ici', icon: 'archive', act: () => extractArchive(e.path) });
+        m.push({ label: 'Extraire vers…', icon: 'archive', act: () => extractTo(e.path) });
+      }
       if (grimOk(e) && !GRIM_FIRST.has(e.ext)) m.push({ label: 'Ouvrir dans Grimoire', icon: 'quill', act: () => openInGrimoire(e.path) });
       if (e.dir && D.b.dossiers !== 'systeme') m.push({ label: 'Ouvrir dans le gestionnaire de fichiers', icon: 'external', act: () => openWithSystem(e.path) });
       if (e.dir && D.b.dossiers === 'systeme') m.push({ label: 'Ouvrir dans Archiviste', icon: 'folder', act: () => openMain({ vue: 'files', chemin: e.path }) });
@@ -343,12 +343,17 @@ function itemMenu(x, y) {
     if (!e.dir && !e.lanceur) m.push({ label: 'Versions précédentes…', icon: 'undo', act: () => showVersions(e.path, loadElements) });
     m.push({ label: 'Afficher dans Archiviste', icon: 'folder', act: () => openMain({ vue: 'files', chemin: dirname(e.path), select: e.path }) });
     m.push({ label: 'Copier le chemin', icon: 'copy', act: () => copyText(e.path) });
+    if (!e.lanceur) m.push({ label: 'Compresser…', icon: 'archive', act: () => compressDialog([e.path]) });
+    if (e.dir) m.push({ label: 'Ouvrir un terminal ici', icon: 'code', act: () => openTerminal(e.path) });
+    m.push({ label: 'Propriétés', icon: 'info', kbd: 'Alt+Entrée', act: () => showProperties([e.path]) });
   } else if (paths.length) {
     m.push({ label: `Ouvrir les ${paths.length} éléments`, icon: 'external', act: () => ents.forEach((it) => openFile(it.e)) });
     m.push({ label: 'En discuter (joindre)', icon: 'chat', act: () => attachToChat(paths) });
     m.push({ label: 'Couper', icon: 'move', kbd: 'Ctrl+X', act: () => clipSet(paths, 'couper') });
     m.push({ label: 'Copier', icon: 'copy', kbd: 'Ctrl+C', act: () => clipSet(paths, 'copier') });
     m.push({ label: 'Copier les chemins', icon: 'copy', act: () => copyText(paths.join('\n')) });
+    m.push({ label: 'Compresser…', icon: 'archive', act: () => compressDialog(paths) });
+    m.push({ label: 'Propriétés', icon: 'info', kbd: 'Alt+Entrée', act: () => showProperties(paths) });
   }
   if (paths.length) {
     m.push('sep');
@@ -368,6 +373,7 @@ function deskMenu(x, y) {
     { label: 'Nouveau fichier texte', icon: 'filePlus', act: newTextFile },
     'sep',
     { label: 'Ranger le bureau avec l\'IA', icon: 'sparkles', act: () => openMain({ vue: 'sort', chemin: D.b.dossier }) },
+    { label: 'Ouvrir un terminal ici', icon: 'code', act: () => openTerminal(D.b.dossier) },
     { header: 'Trier les icônes' },
     { label: 'Par nom', icon: ck('nom'), act: () => setTri('nom') },
     { label: 'Par date (récents d\'abord)', icon: ck('date'), act: () => setTri('date') },
@@ -465,6 +471,7 @@ function bindDesk() {
     const its = selItems();
     const one = its.length === 1 ? its[0] : null;
     const k = ev.key;
+    if (k === 'Enter' && ev.altKey) { ev.preventDefault(); showProperties(selEntries().length ? selEntries().map((x) => x.path) : [D.b.dossier]); return; }
     if (k === 'Enter' && its.length) { ev.preventDefault(); its.slice(0, 8).forEach(openItem); return; }
     if (k === 'F2' && one?.type === 'entry') { ev.preventDefault(); renameEntry(one.e); return; }
     if (k === 'Delete' && selEntries().length) { ev.preventDefault(); trashPaths(selEntries().map((x) => x.path)); return; }
@@ -1543,6 +1550,13 @@ async function initBureau() {
   S.home = S.settings.home;
   clipListener = refreshSel;
   clipLoad();
+  // tâches de fond : le bureau se relit à la fin, « Afficher » choisit l'icône si elle est sur le bureau
+  taskDone = () => loadElements();
+  taskReveal = (p) => {
+    if (dirname(p) === D.b.dossier) { const it = D.items.find((x) => x.path === p); if (it) selectOnly(it); return; }
+    openMain({ vue: 'files', chemin: dirname(p), select: p });
+  };
+  tasksPoll();
   window.addEventListener('focus', clipLoad);
   refreshVStatus();
   if (MODE === 'demander') {

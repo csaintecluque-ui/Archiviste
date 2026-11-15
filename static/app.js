@@ -274,19 +274,19 @@ function ask(message, { title = 'Confirmer', ok = 'Confirmer', danger = false } 
   });
 }
 
-function promptText({ title, label = '', value = '', placeholder = '', ok = 'Valider', selectStem = false, multiline = false }) {
+function promptText({ title, label = '', value = '', placeholder = '', ok = 'Valider', selectStem = false, multiline = false, password = false }) {
   return new Promise((resolve) => {
     let res = null;
     const input = multiline
       ? `<textarea rows="6" data-v placeholder="${esc(placeholder)}">${esc(value)}</textarea>`
-      : `<input type="text" data-v value="${esc(value)}" placeholder="${esc(placeholder)}">`;
+      : `<input type="${password ? 'password' : 'text'}" data-v value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off">`;
     const m = openModal({
       title, body: `<label class="field">${label ? `<span>${esc(label)}</span>` : ''}${input}</label>`,
       footer: `<button class="btn" data-close>Annuler</button><button class="btn primary" data-ok>${esc(ok)}</button>`,
       onClose: () => resolve(res),
     });
     const inp = $('[data-v]', m.el);
-    const submit = () => { res = inp.value.trim(); if (!res) return; m.close(true); };
+    const submit = () => { res = password ? inp.value : inp.value.trim(); if (!res) return; m.close(true); };
     $('[data-ok]', m.el).onclick = submit;
     inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (!multiline || e.ctrlKey)) { e.preventDefault(); submit(); } });
     setTimeout(() => {
@@ -472,7 +472,7 @@ function routeFromHash() {
   const [main, query = ''] = h.split('?');
   const [view, sub] = main.split('/');
   const params = new URLSearchParams(query);
-  if (view === 'files') return go('files', { path: params.get('p'), select: params.get('s') });
+  if (view === 'files') return go('files', { path: params.get('p'), select: params.get('s'), props: params.get('i') === '1' });
   if (view === 'sort') return go('sort', { path: params.get('p') });
   if (view === 'chat') return go('chat', { conv: sub });
   if (RENDER[view]) return go(view);
@@ -481,7 +481,7 @@ function routeFromHash() {
 
 // Appelé par la fenêtre GTK quand le bureau demande d'ouvrir une vue
 window.archivisteNaviguer = (d = {}) => {
-  if (d.vue === 'files') return go('files', { path: d.chemin, select: d.select });
+  if (d.vue === 'files') return go('files', { path: d.chemin, select: d.select, props: !!d.proprietes });
   if (d.vue === 'sort') return go('sort', { path: d.chemin });
   if (d.vue === 'chat') return go('chat', { conv: d.conv });
   if (RENDER[d.vue]) go(d.vue);
@@ -660,8 +660,11 @@ function buildFiles() {
     </div>
     <div class="ftoolbar">
       <select id="fRoot" title="Dossiers autorisés"></select>
-      <button class="icon-btn" data-act="up" title="Dossier parent (Retour arrière)">${ic('up')}</button>
-      <button class="icon-btn" data-act="refresh" title="Actualiser">${ic('refresh')}</button>
+      <button class="icon-btn" data-act="back" id="fBack" title="Précédent (Alt+←)" disabled>${ic('up', 'rot-l')}</button>
+      <button class="icon-btn" data-act="fwd" id="fFwd" title="Suivant (Alt+→)" disabled>${ic('up', 'rot-r')}</button>
+      <button class="icon-btn" data-act="up" title="Dossier parent (Alt+↑ ou Retour arrière)">${ic('up')}</button>
+      <button class="icon-btn" data-act="refresh" title="Actualiser (F5)">${ic('refresh')}</button>
+      <button class="icon-btn" data-act="terminal" title="Ouvrir un terminal ici">${ic('code')}</button>
       <span class="tbsep"></span>
       <button class="btn ghost sm" data-act="newFolder">${ic('folderPlus', 'sm')} Dossier</button>
       <button class="btn ghost sm" data-act="newMenu" title="Nouveau fichier texte, document Word ou classeur">${ic('filePlus', 'sm')} Fichier ▾</button>
@@ -691,6 +694,31 @@ function buildFiles() {
     if (fn) { e.preventDefault(); fn(b, e); }
   });
   $('#fRoot').addEventListener('change', (e) => openDir(e.target.value));
+  // un clic dans le vide de la barre de chemin : on peut le taper
+  $('#fCrumbs').addEventListener('click', (e) => { if (e.target.id === 'fCrumbs') editAddress(); });
+  // raccourcis de Nemo, valables partout dans la vue Fichiers (sauf pendant une saisie)
+  document.addEventListener('keydown', (e) => {
+    if (S.view !== 'files' || $('.overlay') || openMenuEl) return;
+    const typing = e.target.matches('input, textarea, select, [contenteditable]');
+    const k = e.key;
+    const ctrl = e.ctrlKey || e.metaKey;
+    let fn = null;
+    if (e.altKey && k === 'ArrowLeft') fn = () => histGo(-1);
+    else if (e.altKey && k === 'ArrowRight') fn = () => histGo(1);
+    else if (e.altKey && k === 'ArrowUp') fn = FILE_ACTS.up;
+    else if (e.altKey && k === 'Home') fn = () => openDir(S.home);
+    else if (k === 'F5' || (ctrl && (k === 'r' || k === 'R') && !typing)) fn = () => (F.search ? runSearch(F.search.query) : loadDir());
+    else if (ctrl && (k === 'l' || k === 'L')) fn = editAddress;
+    else if (ctrl && (k === 'f' || k === 'F')) fn = () => { $('#fSearch').focus(); $('#fSearch').select(); };
+    else if (ctrl && (k === 'h' || k === 'H') && !typing) fn = FILE_ACTS.toggleHidden;
+    else if (ctrl && e.shiftKey && (k === 'n' || k === 'N') && !typing) fn = FILE_ACTS.newFolder;
+    else if (ctrl && e.altKey && (k === 't' || k === 'T')) fn = () => openTerminal(F.path);
+    if (!fn || (typing && !['F5', 'l', 'L', 'f', 'F'].includes(k) && !e.altKey)) return;
+    e.preventDefault();
+    fn();
+  });
+  // boutons « précédent / suivant » de la souris
+  v.addEventListener('mouseup', (e) => { if (e.button === 3) { e.preventDefault(); histGo(-1); } else if (e.button === 4) { e.preventDefault(); histGo(1); } });
   $('#fUpload').addEventListener('change', (e) => { uploadFiles(e.target.files, F.path); e.target.value = ''; });
   const doSearch = () => {
     const q = $('#fSearch').value.trim();
@@ -727,7 +755,10 @@ function buildFiles() {
         { label: 'Importer des fichiers…', icon: 'upload', act: FILE_ACTS.upload },
         'sep',
         { label: 'Trier ce dossier avec l\'IA', icon: 'sparkles', act: FILE_ACTS.sortHere },
-        { label: 'Actualiser', icon: 'refresh', act: () => loadDir() },
+        'sep',
+        { label: 'Ouvrir un terminal ici', icon: 'code', act: () => openTerminal(F.path) },
+        { label: 'Actualiser', icon: 'refresh', kbd: 'F5', act: () => loadDir() },
+        { label: 'Propriétés du dossier', icon: 'info', kbd: 'Alt+Entrée', act: () => showProperties([F.path]) },
       ]);
     }
   });
@@ -805,6 +836,7 @@ function buildFiles() {
       const names = new Set(refused.map((x) => basename(x.path)));
       const others = r.erreurs.filter((x) => !refused.includes(x));
       if (others.length) toast(others.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
+      if (r.tache) taskStarted(r.tache);
       if (r.ok.length) toast(`${r.ok.length} élément(s) ${copy ? 'copié(s)' : 'déplacé(s)'} ${t ? `dans ${t.it.name}` : 'ici'}`, 'ok', t ? { label: 'Y aller', action: () => openDir(dest) } : undefined);
       const imp = files.filter((x) => !x.dir && names.has(x.f.name)).map((x) => x.f);
       if (imp.length) { await uploadFiles(imp, dest); toast(`${imp.length} fichier(s) copié(s) : l'original est hors des dossiers autorisés d'Archiviste, il n'a pas été déplacé.`, 'info', { timeout: 8000 }); }
@@ -835,7 +867,10 @@ function buildFiles() {
 }
 
 const FILE_ACTS = {
-  up: () => { if (F.search) { clearSearch(); return; } if (F.parent) openDir(F.parent); },
+  up: () => { if (F.search) { clearSearch(); return; } if (F.parent) openDir(F.parent, { select: F.path }); },
+  back: () => histGo(-1),
+  fwd: () => histGo(1),
+  terminal: () => openTerminal(F.path),
   refresh: () => loadDir(),
   newFolder: async () => {
     const name = await promptText({ title: 'Nouveau dossier', label: `Dans ${tildify(F.path)}`, value: 'Nouveau dossier' });
@@ -875,6 +910,8 @@ const FILE_ACTS = {
   pvOpen: () => { const e = selectedEntries()[0]; if (e) openEntry(e); },
   pvEdit: () => openEditor(selectedEntries()[0].path),
   pvRaw: () => openWithSystem(selectedEntries()[0].path),
+  pvExtract: () => extractArchive(selectedEntries()[0].path),
+  pvExtractTo: () => extractTo(selectedEntries()[0].path),
   pvDownload: () => openWithSystem(selectedEntries()[0].path, true),
   openHere: () => openWithSystem(F.path),
   pvRename: () => renameItem(selectedEntries()[0]),
@@ -906,7 +943,10 @@ function sortedEntries() {
 }
 function selectedEntries() { const l = curList(); return l.filter((e) => F.sel.has(e.path)); }
 
-async function openDir(path, { select } = {}) {
+// Historique de navigation, comme Nemo : précédent / suivant (Alt+← / Alt+→, boutons de la souris)
+F.back = []; F.fwd = [];
+async function openDir(path, { select, history = true } = {}) {
+  if (history && F.path && path !== F.path) { F.back.push(F.path); F.back = F.back.slice(-100); F.fwd = []; }
   F.path = path; F.sel.clear(); F.anchor = null; F.focus = null; F.search = null;
   const si = $('#fSearch'); if (si) si.value = '';
   await loadDir();
@@ -916,7 +956,7 @@ async function openDir(path, { select } = {}) {
 async function loadDir() {
   try {
     const r = await api(`/api/fs/list?path=${enc(F.path || '')}${F.hidden ? '&hidden=1' : ''}`);
-    F.path = r.path; F.parent = r.parent; F.root = r.root; F.entries = r.entries;
+    F.path = r.path; F.parent = r.parent; F.root = r.root; F.entries = r.entries; F.volumes = r.volumes || [];
     const exists = new Set(r.entries.map((e) => e.path));
     F.sel = new Set([...F.sel].filter((p) => exists.has(p)));
   } catch (e) {
@@ -924,6 +964,44 @@ async function loadDir() {
     if (F.path !== S.home) { F.path = S.home; return loadDir(); }
   }
   renderCrumbs(); renderFileList(); renderPreview(); renderSelbar(); updateHash();
+  const bb = $('#fBack'); if (bb) { bb.disabled = !F.back.length; $('#fFwd').disabled = !F.fwd.length; }
+}
+function histGo(dir) {
+  const from = dir < 0 ? F.back : F.fwd;
+  const to = dir < 0 ? F.fwd : F.back;
+  if (!from.length) return;
+  const prev = F.path;
+  const target = from.pop();
+  to.push(prev);
+  openDir(target, { history: false, select: prev && dirname(prev) === target ? prev : undefined });  // en remontant, le dossier d'où l'on vient reste choisi
+}
+// Barre d'adresse : Ctrl+L, ou un clic à droite du chemin. On peut y taper ~/Documents, un chemin relatif, un fichier.
+function editAddress() {
+  const c = $('#fCrumbs');
+  if (!c || $('input', c)) return;
+  c.innerHTML = `<input type="text" class="addr" spellcheck="false" value="${esc(tildify(F.path))}">`;
+  const inp = $('input', c);
+  inp.focus(); inp.select();
+  const done = () => { if (c.contains(inp)) renderCrumbs(); };
+  inp.addEventListener('blur', () => setTimeout(done, 120));
+  inp.addEventListener('keydown', async (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); done(); $('#fList').focus(); return; }
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    let v = inp.value.trim().replace(/^file:\/\//, '');
+    if (!v) return;
+    try { v = decodeURIComponent(v); } catch { /* */ }
+    if (v === '~' || v.startsWith('~/')) v = S.home + v.slice(1);
+    else if (!v.startsWith('/')) v = joinPath(F.path, v);
+    v = v.replace(/\/+$/, '') || '/';
+    try { await api(`/api/fs/list?path=${enc(v)}`); }
+    catch {
+      try { await api(`/api/fs/list?path=${enc(dirname(v))}`); } catch (err) { toast(err.message, 'err'); inp.select(); return; }
+      await openDir(dirname(v), { select: v }); $('#fList').focus(); return;  // un fichier : son dossier, le fichier choisi
+    }
+    await openDir(v);
+    $('#fList').focus();
+  });
 }
 function selectPath(p) {
   const i = curList().findIndex((e) => e.path === p);
@@ -948,7 +1026,9 @@ async function runSearch(q, typing = false) {
 
 function renderCrumbs() {
   const roots = S.settings.roots;
-  $('#fRoot').innerHTML = roots.map((r) => `<option value="${esc(r)}" ${r === F.root ? 'selected' : ''}>${r === S.home ? '🏠 Dossier personnel' : '📁 ' + esc(basename(r))}</option>`).join('');
+  const vols = (F.volumes || []).filter((v) => !roots.includes(v.path));  // clés USB et disques branchés
+  $('#fRoot').innerHTML = roots.map((r) => `<option value="${esc(r)}" ${r === F.root ? 'selected' : ''}>${r === S.home ? '🏠 Dossier personnel' : '📁 ' + esc(basename(r))}</option>`).join('')
+    + vols.map((v) => `<option value="${esc(v.path)}" ${v.path === F.root ? 'selected' : ''}>💾 ${esc(v.nom)}</option>`).join('');
   const root = F.root || S.home;
   const segs = [`<button data-act="crumb" data-path="${esc(root)}">${root === S.home ? ic('home', 'sm') : esc(basename(root))}</button>`];
   const rest = (F.path || '').slice(root.length).split('/').filter(Boolean);
@@ -1027,6 +1107,7 @@ function onFileKey(e) {
   const sel = selectedEntries();
   if (e.key === 'Delete' && sel.length) { e.preventDefault(); trashItems(sel.map((x) => x.path)); }
   else if (e.key === 'F2' && sel.length === 1) { e.preventDefault(); renameItem(sel[0]); }
+  else if (e.key === 'Enter' && e.altKey) { e.preventDefault(); showProperties(sel.length ? sel.map((x) => x.path) : [F.path]); }
   else if (e.key === 'Enter' && sel.length === 1) { e.preventDefault(); openEntry(sel[0]); }
   else if (e.key === 'Backspace') { e.preventDefault(); FILE_ACTS.up(); }
   else if (e.key === 'a' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); F.sel = new Set(list.map((x) => x.path)); refreshSelection(); }
@@ -1055,6 +1136,7 @@ function openEntry(e) {
   if (e.dir) return openDir(e.path);
   if (hasGrimoire() && GRIM_FIRST.has(e.ext)) return openInGrimoire(e.path);
   if (isEditable(e) && (e.size || 0) < 2e6) return openEditor(e.path);
+  if (e.kind === 'archive') return openArchive(e.path);  // zip, rar, 7z, tar… (une BD .cbz s'ouvre dans sa liseuse)
   openWithSystem(e.path);
 }
 // Coller dans le dossier affiché (ou dans un dossier précis, depuis son menu)
@@ -1072,6 +1154,11 @@ function rowMenu(x, y) {
   if (one) {
     items.push({ label: one.dir ? 'Ouvrir' : isEditable(one) ? 'Modifier' : 'Ouvrir', icon: one.dir ? 'folder' : isEditable(one) ? 'pencil' : 'external', kbd: 'Entrée', act: () => openEntry(one) });
     if (!one.dir && isEditable(one)) items.push({ label: 'Ouvrir avec l\'application par défaut', icon: 'external', act: () => openWithSystem(one.path) });
+    if (!one.dir) items.push({ label: 'Ouvrir avec…', icon: 'app', act: () => openWithAt(one.path, x, y) });
+    if (isArchive(one)) {
+      items.push({ label: 'Extraire ici', icon: 'archive', act: () => extractArchive(one.path) });
+      items.push({ label: 'Extraire vers…', icon: 'archive', act: () => extractTo(one.path) });
+    }
     items.push({ label: 'Afficher dans le gestionnaire de fichiers', icon: 'folder', act: () => openWithSystem(one.path, true) });
     if (grimOk(one) && !GRIM_FIRST.has(one.ext)) items.push({ label: 'Ouvrir dans Grimoire', icon: 'quill', act: () => openInGrimoire(one.path) });
     items.push({ label: 'Renommer', icon: 'pencil', kbd: 'F2', act: () => renameItem(one) });
@@ -1088,10 +1175,13 @@ function rowMenu(x, y) {
   items.push('sep');
   if (one && !one.dir) items.push({ label: 'Résumer avec l\'IA', icon: 'sparkles', act: () => summarizeFile(one) });
   items.push({ label: sel.length > 1 ? 'En discuter (joindre)' : 'En discuter', icon: 'chat', act: FILE_ACTS.selChat });
+  items.push({ label: 'Compresser…', icon: 'archive', act: () => compressDialog(sel.map((x) => x.path)) });
+  if (one && one.dir) items.push({ label: 'Ouvrir un terminal ici', icon: 'code', act: () => openTerminal(one.path) });
   if (one && one.dir) {
     items.push({ label: 'Trier avec l\'IA', icon: 'sparkles', act: () => go('sort', { path: one.path }) });
     items.push({ label: 'Lancer un agent ici…', icon: 'bot', act: () => agentPicker(null, one.path, { clientX: x, clientY: y }) });
   }
+  items.push({ label: 'Propriétés', icon: 'info', kbd: 'Alt+Entrée', act: () => showProperties(sel.map((x) => x.path)) });
   items.push('sep');
   items.push({ label: 'Mettre à la corbeille', icon: 'trash', kbd: 'Suppr', danger: true, act: () => trashItems(sel.map((x) => x.path)) });
   showMenu(x, y, items);
@@ -1184,6 +1274,14 @@ async function renderPreview() {
     img.onerror = () => { body.innerHTML = '<p class="muted">Aperçu indisponible (installe poppler-utils, ou le PDF est protégé).</p>'; };
     $('.pv-media', body).onclick = () => openWithSystem(e.path);
   }
+  else if (isArchive(e) && e.kind === 'archive') {
+    body.innerHTML = '<div class="row muted"><span class="spinner"></span> Lecture de l\'archive…</div>';
+    try {
+      const a = await api(`/api/archive?path=${enc(e.path)}`);
+      if (seq !== pvSeq) return;
+      body.innerHTML = `${archiveSummary(a)}${a.outil ? '' : `<div class="row" style="gap:6px;margin-bottom:8px"><button class="btn sm primary" data-act="pvExtract">${ic('archive', 'sm')} Extraire ici</button><button class="btn sm" data-act="pvExtractTo">Extraire vers…</button></div>${archiveListHtml({ ...a, entrees: a.entrees.slice(0, 300) })}`}`;
+    } catch (err) { if (seq === pvSeq) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`; }
+  }
   else if ((e.size || 0) < 25e6 && !['archive', 'app', 'font'].includes(e.kind)) {
     body.innerHTML = '<div class="row muted"><span class="spinner"></span> Lecture…</div>';
     try {
@@ -1243,6 +1341,7 @@ async function moveItems(paths, dest, copy) {
   try {
     const r = await post('/api/fs/move', { paths, dest_dir: dest, copy });
     if (r.erreurs.length) toast(r.erreurs.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
+    if (r.tache) taskStarted(r.tache);  // grosse copie : elle se suit en bas à droite
     if (r.ok.length) toast(`${r.ok.length} élément(s) ${copy ? 'copié(s)' : 'déplacé(s)'} vers ${basename(dest)}`, 'ok', { label: 'Y aller', action: () => openDir(dest) });
   } catch (e) { toast(e.message, 'err'); }
   F.search ? runSearch(F.search.query) : loadDir();
@@ -1267,6 +1366,239 @@ async function trashItems(paths) {
   F.sel.clear();
   F.search ? runSearch(F.search.query) : loadDir();
 }
+// ── Tâches de fond : extractions, compressions, longues copies (commun aux deux fenêtres) ──
+// Elles s'affichent en bas à droite avec leur progression ; la page est prévenue quand l'une se termine
+// (taskDone) pour rafraîchir ce qu'elle montre.
+const TK = { list: [], timer: 0, hidden: new Set(), running: new Set(), loaded: false };
+let taskDone = null;    // la page : rafraîchir ce qui a changé
+let taskReveal = (p) => go('files', { path: dirname(p), select: p });  // « Afficher » : le bureau la remplace
+window.archivisteTaches = () => tasksPoll();
+const TASK_ICON = { extraction: 'archive', compression: 'archive', copie: 'copy', deplacement: 'move' };
+function taskStarted(t) {
+  if (!t) return;
+  TK.list = [...TK.list.filter((x) => x.id !== t.id), t];
+  TK.running.add(t.id);
+  renderTasks();
+  clearTimeout(TK.timer);
+  TK.timer = setTimeout(tasksPoll, 400);
+}
+async function tasksPoll() {
+  clearTimeout(TK.timer);
+  let r;
+  try { r = await api('/api/taches'); } catch { TK.timer = setTimeout(tasksPoll, 3000); return; }
+  const first = !TK.loaded;
+  TK.loaded = true;
+  for (const t of r.taches) {
+    if (t.etat === 'en cours') TK.running.add(t.id);
+    else if (TK.running.has(t.id)) {
+      TK.running.delete(t.id);
+      taskDone?.(t);
+      // comme Nemo : une tâche réussie s'efface d'elle-même ; une erreur reste jusqu'à ce qu'on la ferme
+      if (t.etat !== 'erreur') setTimeout(() => { TK.hidden.add(t.id); TK.list = TK.list.filter((x) => x.id !== t.id); renderTasks(); }, t.etat === 'finie' ? 15000 : 6000);
+    } else if (first) TK.hidden.add(t.id);  // terminée avant l'ouverture de la page
+  }
+  TK.list = r.taches.filter((t) => !TK.hidden.has(t.id));
+  renderTasks();
+  if (TK.list.some((t) => t.etat === 'en cours')) TK.timer = setTimeout(tasksPoll, 500);
+}
+const pct = (t) => (t.total > 0 ? Math.min(100, Math.round((100 * t.fait) / t.total)) : null);
+function taskLine(t) {
+  const el = Math.max(0.5, (t.maintenant || Date.now() / 1000) - t.debut);
+  if (t.etat === 'finie') return t.resultat.length ? `Terminé : « ${esc(basename(t.resultat[0]))} »${t.resultat.length > 1 ? ` et ${t.resultat.length - 1} autre(s)` : ''}` : 'Terminé.';
+  if (t.etat === 'annulee') return 'Annulé : rien n\'a été laissé à moitié.';
+  if (t.etat === 'erreur') return esc(t.erreur || 'Erreur.');
+  if (t.pourcent) return `${pct(t) ?? 0} %${t.detail ? ` · ${esc(t.detail)}` : ''}`;
+  const speed = t.fait / el;
+  const parts = [t.total > 0 ? `${fmtSize(t.fait)} sur ${fmtSize(t.total)}` : fmtSize(t.fait)];
+  if (el > 2 && speed > 0) parts.push(`${fmtSize(speed)}/s`);
+  if (t.total > 0 && el > 2 && speed > 0) {
+    const left = Math.max(0, (t.total - t.fait) / speed);
+    parts.push(left < 60 ? `reste ${Math.ceil(left)} s` : `reste ${Math.ceil(left / 60)} min`);
+  }
+  return esc(parts.join(' · '));
+}
+function renderTasks() {
+  let box = $('#taches');
+  if (!TK.list.length) { box?.remove(); return; }
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'taches';
+    $('#toasts').append(box);
+    box.addEventListener('click', onTaskClick);
+  }
+  const shown = TK.list.slice(-4);  // les plus récentes ; les autres sont résumées
+  const more = TK.list.length - shown.length;
+  box.innerHTML = (more ? `<div class="tache tk-more">${more} autre${more > 1 ? 's' : ''} tâche${more > 1 ? 's' : ''} : ${TK.list.slice(0, more).filter((t) => t.etat === 'en cours').length} en cours</div>` : '') + shown.map((t) => {
+    const p = pct(t);
+    const run = t.etat === 'en cours';
+    return `<div class="tache ${t.etat === 'en cours' ? 'run' : t.etat}" data-tk="${t.id}">
+      <div class="row"><span class="tk-ic">${ic(t.etat === 'erreur' ? 'alert' : t.etat === 'finie' ? 'check' : TASK_ICON[t.genre] || 'file', 'sm')}</span>
+        <b class="grow ellipsis" title="${esc(t.titre)}">${esc(t.titre)}</b>
+        ${run ? '<button class="btn sm ghost" data-tka="annuler">Annuler</button>' : `<button class="icon-btn sm" data-tka="fermer" title="Fermer">${ic('x', 'sm')}</button>`}</div>
+      ${run ? `<div class="tk-bar ${p === null ? 'indet' : ''}"><i style="width:${p ?? 30}%"></i></div>` : ''}
+      <div class="tk-sub">${taskLine(t)}</div>
+      ${run && t.detail && !t.pourcent ? `<div class="tk-sub faint ellipsis">${esc(t.detail)}</div>` : ''}
+      ${t.etat === 'finie' && t.resultat.length ? `<div class="row tk-acts"><button class="btn sm" data-tka="afficher">${ic('folder', 'sm')} Afficher</button>${t.genre === 'extraction' ? `<button class="btn sm" data-tka="ouvrir">${ic('external', 'sm')} Ouvrir</button>` : ''}</div>` : ''}
+      ${t.etat === 'erreur' && t.mdp ? `<div class="row tk-acts"><button class="btn sm primary" data-tka="mdp">Saisir le mot de passe…</button></div>` : ''}
+    </div>`;
+  }).join('');
+}
+async function onTaskClick(ev) {
+  const b = ev.target.closest('[data-tka]');
+  if (!b) return;
+  const id = b.closest('[data-tk]').dataset.tk;
+  const t = TK.list.find((x) => x.id === id);
+  if (!t) return;
+  const forget = () => { TK.hidden.add(id); TK.list = TK.list.filter((x) => x.id !== id); renderTasks(); post('/api/taches/oublier', { id }).catch(() => {}); };
+  switch (b.dataset.tka) {
+    case 'annuler': b.disabled = true; b.textContent = 'Arrêt…'; post('/api/taches/annuler', { id }).then(tasksPoll).catch((e) => toast(e.message, 'err')); break;
+    case 'fermer': forget(); break;
+    case 'afficher': taskReveal(t.resultat[0]); break;
+    case 'ouvrir': post('/api/fs/open', { path: t.resultat[0] }).catch((e) => toast(e.message, 'err')); break;
+    case 'mdp': {
+      const pwd = await promptText({ title: 'Archive protégée', label: `Mot de passe de « ${basename(t.source)} »`, ok: 'Extraire', password: true });
+      if (pwd === null) return;
+      forget();
+      extractArchive(t.source, t.dossier, pwd);
+      break;
+    }
+    default: break;
+  }
+}
+
+// ── Archives : voir le contenu, extraire, compresser ──
+const ARCHIVE_RE = /\.(zip|cbz|cbr|cb7|7z|rar|tar|tgz|tbz2?|txz|tzst|gz|bz2|xz|zst|lz|lzma)$/i;
+const isArchive = (e) => !!e && !e.dir && ARCHIVE_RE.test(e.name || basename(e.path || ''));
+async function extractArchive(path, dest = dirname(path), mdp = undefined) {
+  try { taskStarted((await post('/api/archive/extraire', { path, dest, mdp })).tache); } catch (e) { toast(e.message, 'err'); }
+}
+async function extractTo(path) {
+  const dest = await pickPath({ title: `Extraire « ${basename(path)} » vers…`, mode: 'dir', start: dirname(path), okLabel: 'Extraire ici' });
+  if (dest) extractArchive(path, dest);
+}
+function archiveListHtml(a) {
+  const rows = a.entrees.map((x) => {
+    const depth = x.nom.split('/').length - 1;
+    return `<div class="arc-row" style="padding-left:${8 + depth * 16}px">${ic(x.dossier ? 'folder' : 'file', 'sm')}<span class="grow ellipsis">${esc(basename(x.nom))}</span>${x.dossier || x.taille == null ? '' : `<span class="faint">${fmtSize(x.taille)}</span>`}</div>`;
+  }).join('');
+  const more = a.nombre > a.entrees.length ? `<div class="faint" style="padding:6px 8px">… et d'autres (seuls les ${a.entrees.length} premiers éléments sont listés)</div>` : '';
+  return `<div class="arc-list">${rows}${more}</div>`;
+}
+function archiveSummary(a) {
+  if (a.outil) return `<div class="banner">${ic('info')}<div>${esc(a.outil)}</div></div>`;
+  const what = `${a.nombre.toLocaleString('fr-FR')} fichier${a.nombre > 1 ? 's' : ''}${a.taille_connue && a.taille ? ` · ${fmtSize(a.taille)} une fois extrait${a.nombre > 1 ? 's' : ''}` : ''}`;
+  return `<p style="margin:0 0 4px">${esc(what)}${a.chiffree ? ` · ${ic('alert', 'sm')} protégée par un mot de passe` : ''}</p>
+    <p class="muted" style="margin:0 0 10px;font-size:12.5px">« Extraire ici » crée ${a.dossier_unique ? 'directement' : 'le dossier'} « ${esc(a.dossier_final)} » à côté de l'archive.</p>`;
+}
+// Double-clic sur une archive : son contenu, et de quoi l'extraire
+async function openArchive(path, { launch } = {}) {
+  const m = openModal({
+    title: basename(path), cls: 'wide',
+    body: '<div class="row muted"><span class="spinner"></span> Lecture de l\'archive…</div>',
+    footer: `<button class="btn ghost" data-ar="avec">${ic('external', 'sm')} Ouvrir avec…</button><span class="grow"></span>
+      <button class="btn" data-ar="vers">Extraire vers…</button><button class="btn primary" data-ar="ici">${ic('archive', 'sm')} Extraire ici</button>`,
+  });
+  let a = null;
+  try { a = await api(`/api/archive?path=${enc(path)}`); m.mb.innerHTML = archiveSummary(a) + (a.outil ? '' : archiveListHtml(a)); }
+  catch (e) { m.mb.innerHTML = `<div class="banner danger">${ic('alert')}<div>${esc(e.message)}</div></div>`; }
+  if (!a || a.outil) $$('[data-ar="ici"], [data-ar="vers"]', m.el).forEach((b) => { b.disabled = true; });
+  m.el.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('[data-ar]');
+    if (!b) return;
+    if (b.dataset.ar === 'avec') { const r = b.getBoundingClientRect(); openWithAt(path, r.left, r.top - 8, launch); return; }
+    m.close(true);
+    if (b.dataset.ar === 'ici') extractArchive(path);
+    else extractTo(path);
+  });
+  return m;
+}
+function compressDialog(paths) {
+  if (!paths.length) return;
+  const name = paths.length === 1 ? basename(paths[0]).replace(/\.[^.\/]{1,5}$/, '') || basename(paths[0]) : basename(dirname(paths[0])) || 'Archive';
+  const m = openModal({
+    title: paths.length === 1 ? `Compresser « ${basename(paths[0])} »` : `Compresser ${paths.length} éléments`,
+    body: `<label class="field"><span>Nom de l'archive</span><input type="text" data-cn value="${esc(name)}"></label>
+      <label class="field"><span>Format</span><select data-cf><option value="zip">.zip — s'ouvre partout (Windows, Mac, téléphone)</option><option value="tar.gz">.tar.gz — habituel sous Linux, garde les droits des fichiers</option></select></label>
+      <p class="muted" style="font-size:12.5px;margin:4px 0 0">L'archive est créée à côté, dans ${esc(tildify(dirname(paths[0])))}.</p>`,
+    footer: `<button class="btn" data-close>Annuler</button><button class="btn primary" data-cok>${ic('archive', 'sm')} Compresser</button>`,
+  });
+  const go2 = async () => {
+    const nom = $('[data-cn]', m.el).value.trim();
+    if (!nom) return;
+    m.close(true);
+    try { taskStarted((await post('/api/archive/compresser', { paths, nom, format: $('[data-cf]', m.el).value })).tache); } catch (e) { toast(e.message, 'err'); }
+  };
+  $('[data-cok]', m.el).onclick = go2;
+  $('[data-cn]', m.el).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go2(); } });
+  setTimeout(() => $('[data-cn]', m.el).select(), 40);
+  return m;
+}
+
+// ── Ouvrir avec… (et choisir l'application par défaut d'un type de fichier) ──
+async function openWithAt(path, x, y, launch) {
+  let r;
+  try { r = await api(`/api/apps/pour?path=${enc(path)}`); } catch (err) { return toast(err.message, 'err'); }
+  if (!r.apps.length) return toast('Aucune application installée ne déclare savoir ouvrir ce type de fichier.');
+  const run = launch || (async (a) => {
+    try { await post('/api/apps/lancer', { id: a.id, fichiers: [path] }); toast(`Ouverture avec ${a.nom}…`); } catch (e) { toast(e.message, 'err'); }
+  });
+  showMenu(x, y, [{ header: 'Ouvrir avec' }, ...r.apps.map((a) => ({
+    label: a.nom + (a.id === r.defaut ? ' — par défaut' : ''), sub: a.generique || '', icon: 'app', act: () => run(a),
+  })), 'sep', { label: 'Toujours ouvrir ce type avec…', icon: 'star', act: () => showMenu(x, y, [
+    { header: 'Application par défaut pour ce type' },
+    ...r.apps.map((a) => ({ label: a.nom, icon: a.id === r.defaut ? 'check' : 'app', act: async () => {
+      try { const d = await post('/api/apps/defaut', { path, id: a.id }); toast(`Les fichiers « ${d.type} » s'ouvriront avec ${d.nom}`, 'ok'); } catch (e) { toast(e.message, 'err'); }
+    } })),
+  ], { search: r.apps.length > 8 }) }], { search: r.apps.length > 8 });
+  return null;
+}
+
+// ── Propriétés : taille (aussi d'un dossier), dates, droits ──
+const MODE_BITS = [['Propriétaire', 0o400, 0o200, 0o100], ['Groupe', 0o040, 0o020, 0o010], ['Autres', 0o004, 0o002, 0o001]];
+async function showProperties(paths) {
+  if (!paths.length) return null;
+  const m = openModal({ title: paths.length > 1 ? `Propriétés de ${paths.length} éléments` : `Propriétés — ${basename(paths[0])}`, body: '<div class="row muted"><span class="spinner"></span> Calcul…</div>', footer: '<button class="btn" data-close>Fermer</button>' });
+  let p;
+  try { p = await api(`/api/fs/proprietes?${paths.map((x) => `path=${enc(x)}`).join('&')}`); } catch (e) { m.mb.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return m; }
+  const nb = (n) => n.toLocaleString('fr-FR');
+  const content = `${fmtSize(p.taille)} (${nb(p.taille)} octets)${p.fichiers + p.dossiers > 1 || p.dossier ? ` — ${nb(p.fichiers)} fichier${p.fichiers > 1 ? 's' : ''}, ${nb(p.dossiers)} dossier${p.dossiers > 1 ? 's' : ''}` : ''}${p.complet ? '' : ' (calcul arrêté au bout de 5 s : au moins)'}`;
+  const when = (d) => new Date(d).toLocaleString('fr-FR', { dateStyle: 'long', timeStyle: 'short' });
+  const rows = [];
+  if (p.nombre === 1) {
+    rows.push(['Type', `${p.dossier ? 'Dossier' : esc(p.type)}${p.appli ? ` — s'ouvre avec ${esc(p.appli)}` : ''}`]);
+    rows.push(['Emplacement', `<span class="mono">${esc(tildify(dirname(p.chemin)))}</span>`]);
+    if (p.lien) rows.push(['Lien vers', `<span class="mono">${esc(p.lien)}</span>`]);
+  }
+  rows.push([p.dossier || p.nombre > 1 ? 'Contenu' : 'Taille', content]);
+  if (p.nombre === 1) {
+    rows.push(['Modifié', when(p.modifie)], ['Consulté', when(p.acces)], ['Propriétaire', `${esc(p.proprietaire)} (groupe ${esc(p.groupe)})`]);
+  }
+  if (p.disque) rows.push(['Disque', `${fmtSize(p.disque.libre)} libres sur ${fmtSize(p.disque.total)}`]);
+  let perms = '';
+  if (p.nombre === 1 && !p.lien) {
+    const dis = p.modifiable ? '' : 'disabled';
+    perms = `<h3 class="prop-h">Droits${p.modifiable ? '' : ' <span class="faint" style="font-weight:400">(seul le propriétaire peut les changer)</span>'}</h3>
+      <div class="perm-grid"><span></span><span>Lecture</span><span>Écriture</span><span>${p.dossier ? 'Ouvrir' : 'Exécution'}</span>
+      ${MODE_BITS.map(([who, r, w, x]) => `<span>${who}</span>${[r, w, x].map((bit) => `<label class="check"><input type="checkbox" data-bit="${bit}" ${p.mode & bit ? 'checked' : ''} ${dis || (bit === 0o400 ? 'disabled' : '')}></label>`).join('')}`).join('')}</div>
+      ${p.dossier ? '' : `<label class="switch" style="margin-top:10px"><input type="checkbox" data-exe ${p.mode & 0o100 ? 'checked' : ''} ${dis}><i></i>Autoriser l'exécution du fichier comme un programme</label>`}`;
+  }
+  m.mb.innerHTML = `<dl class="props">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>${perms}`;
+  let mode = p.mode;
+  const apply = async (next) => {
+    try { mode = (await post('/api/fs/droits', { path: p.chemin, mode: next })).mode; } catch (e) { toast(e.message, 'err'); }
+    $$('[data-bit]', m.el).forEach((c) => { c.checked = !!(mode & +c.dataset.bit); });
+    const exe = $('[data-exe]', m.el); if (exe) exe.checked = !!(mode & 0o100);
+  };
+  m.el.addEventListener('change', (e) => {
+    if (e.target.dataset.bit) apply(e.target.checked ? mode | +e.target.dataset.bit : mode & ~+e.target.dataset.bit);
+    if (e.target.dataset.exe !== undefined) apply(e.target.checked ? mode | ((mode & 0o444) >> 2) | 0o100 : mode & ~0o111);
+  });
+  return m;
+}
+async function openTerminal(path) {
+  try { const r = await post('/api/terminal', { path }); toast(`Terminal ouvert dans ${tildify(path)}`); return r; } catch (e) { toast(e.message, 'err'); return null; }
+}
+
 // ── Couper / copier / coller des fichiers (commun au bureau et à la fenêtre principale) ──
 // Le presse-papiers est tenu par le serveur : ce qui est coupé sur le bureau se colle dans la fenêtre principale,
 // et inversement. Sous l'appli, ce qui a été coupé ou copié dans Nemo se colle aussi ici.
@@ -1289,8 +1621,9 @@ async function clipPaste(dest, label) {
   let r;
   try { r = await post('/api/presse-papiers/coller', { dest }); } catch (e) { toast(e.message, e.message.startsWith('Rien à coller') ? 'info' : 'err'); return null; }
   if (r.erreurs.length) toast(r.erreurs.map((x) => `${basename(x.path)} : ${x.erreur}`).join('\n'), 'err');
+  if (r.tache) taskStarted(r.tache);
   if (r.ok.length) toast(`${r.ok.length} élément(s) ${r.mode === 'couper' ? 'déplacé(s)' : 'copié(s)'} ${label || `dans ${basename(dest)}`}`, 'ok');
-  else if (r.deja && !r.erreurs.length) toast('Déjà dans ce dossier.');
+  else if (r.deja && !r.erreurs.length && !r.tache) toast('Déjà dans ce dossier.');
   await clipLoad();
   return r;
 }
@@ -1525,7 +1858,7 @@ async function openEditor(path) {
 
 RENDER.files = (opts = {}) => {
   if (!F.built) buildFiles();
-  if (opts.path) openDir(opts.path, { select: opts.select });
+  if (opts.path) openDir(opts.path, { select: opts.select }).then(() => { if (opts.props) showProperties([opts.select || opts.path]); });
   else if (!F.path) openDir(S.home);
   else loadDir();
   setTimeout(() => $('#fList')?.focus({ preventScroll: true }), 30);
@@ -2538,6 +2871,7 @@ function renderSettings() {
         <div class="roots-list" id="stRoots"></div>
         <div class="pathbox" style="margin-top:8px"><input type="text" id="stNewRoot" placeholder="/media/${esc((S.home || '').split('/').pop() || 'moi')}/Disque"><button class="btn" data-act="pickRoot">${ic('folder', 'sm')} Parcourir…</button><button class="btn" data-act="addRoot">${ic('plus', 'sm')} Ajouter</button></div>
         <label class="switch" style="margin-top:12px"><input type="checkbox" data-f="show_hidden" ${s.show_hidden ? 'checked' : ''}><i></i>Afficher les fichiers cachés par défaut</label></div>
+      <div class="card" id="stFm"></div>
       <div class="card" id="stIndex"><h2>${ic('search')} Recherche instantanée</h2><p class="muted" style="margin:0;font-size:13px"><span class="spinner"></span> Chargement…</p></div>
       <div class="card" id="stBureau"><h2>${ic('panel')} Bureau</h2><p class="muted" style="margin:0;font-size:13px"><span class="spinner"></span> Chargement…</p></div>
       <div class="card"><h2>${ic('save')} Sauvegarde</h2>
@@ -2556,11 +2890,37 @@ function renderSettings() {
           <label class="switch"><input type="checkbox" data-f="maj_auto" ${s.maj_auto !== false ? 'checked' : ''}><i></i>Vérifier automatiquement (au démarrage puis toutes les 6 heures)</label></div></div>
     </div>`;
   renderRoots();
+  renderFmCard();
   renderIndexCard();
   renderBureauCard();
   $('[data-f="temperature"]', v).addEventListener('input', (e) => { $('[data-tv]', v).textContent = e.target.value; });
   $('#stImport').addEventListener('change', importBackup);
 }
+// Gestionnaire de fichiers par défaut : les dossiers ouverts depuis les autres applis (Firefox, menu de Mint,
+// clé USB branchée…) s'ouvrent dans Archiviste au lieu de Nemo.
+async function renderFmCard() {
+  const el = $('#stFm');
+  if (!el) return;
+  let g;
+  try { g = await api('/api/gestionnaire'); } catch { el.remove(); return; }
+  const other = g.defaut && !g.archiviste ? g.defaut.replace(/\.desktop$/, '').replace(/^.*\./, '') : 'Nemo';
+  el.innerHTML = `<h2>${ic('folder')} Gestionnaire de fichiers</h2>
+    <p class="muted" style="margin-top:-4px;font-size:13px">${g.archiviste
+      ? 'Archiviste est ton gestionnaire de fichiers : un dossier ouvert depuis une autre appli (Firefox « Afficher dans le dossier », menu de Mint, clé USB branchée…) s\'ouvre ici. « Afficher dans le gestionnaire de fichiers » ouvre alors Nemo.'
+      : `Aujourd'hui, les dossiers ouverts depuis les autres applis s'ouvrent dans ${esc(other.charAt(0).toUpperCase() + other.slice(1))}. Tu peux les ouvrir dans Archiviste à la place.`}</p>
+    <div class="row wrap">${g.possible
+      ? `<button class="btn sm ${g.archiviste ? '' : 'primary'}" data-fm="${g.archiviste ? 'non' : 'oui'}">${g.archiviste ? `Revenir à ${esc(other === 'Nemo' ? 'Nemo' : other)}` : 'Utiliser Archiviste comme gestionnaire de fichiers'}</button>`
+      : '<span class="faint" style="font-size:12.5px">Disponible avec Archiviste installé par son paquet (.deb).</span>'}
+      ${g.archiviste && !g.service ? '<span class="faint" style="font-size:12px">« Afficher dans le dossier » de Firefox ouvre encore Nemo tant que Nemo est ouvert ; tout le reste passe par Archiviste.</span>' : ''}</div>`;
+  el.onclick = async (e) => {
+    const b = e.target.closest('[data-fm]');
+    if (!b) return;
+    b.disabled = true;
+    try { await post('/api/gestionnaire', { archiviste: b.dataset.fm === 'oui' }); toast(b.dataset.fm === 'oui' ? 'Les dossiers s\'ouvriront maintenant dans Archiviste' : 'Les dossiers s\'ouvriront de nouveau dans le gestionnaire d\'avant', 'ok'); } catch (err) { toast(err.message, 'err'); }
+    renderFmCard();
+  };
+}
+
 // Index de recherche : Archiviste retient la liste de tes fichiers (et le texte des documents) pour répondre
 // tout de suite. Tout reste sur le PC, dans ses données.
 async function renderIndexCard() {
@@ -2886,6 +3246,14 @@ async function init() {
   setInterval(() => { if (!document.hidden) refreshStatus(); }, 30000);
   clipListener = refreshSelection;
   clipLoad();
+  // une tâche finie : le dossier affiché est relu s'il est concerné
+  taskDone = (t) => {
+    if (S.view !== 'files') return;
+    const touched = [t.dossier, ...(t.resultat || []).map(dirname)];
+    if (touched.includes(F.path) || t.genre === 'deplacement') { if (F.search) runSearch(F.search.query); else loadDir(); }
+    if (t.etat === 'finie' && t.genre === 'extraction' && t.dossier === F.path && t.resultat[0]) setTimeout(() => selectPath(t.resultat[0]), 300);
+  };
+  tasksPoll();
   window.addEventListener('focus', clipLoad);  // ce qui a été coupé dans l'autre fenêtre (bureau ↔ fenêtre principale)
   api('/api/index').then((x) => { S.index = x; }).catch(() => {});
   setInterval(() => api('/api/index').then((x) => { S.index = x; }).catch(() => {}), 60000);

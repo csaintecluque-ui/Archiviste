@@ -336,6 +336,25 @@ async function main() {
   check(fs.existsSync(`${DESK}/Vrai dossier/à déplacer.txt`) && !fs.existsSync(`${DESK}/à déplacer.txt`), 'Ctrl+V sur un dossier choisi : le fichier y est déplacé');
   check(await page.locator('#icons .dicon.cut').count() === 0 && await page.locator('#icons .dicon[title$="à déplacer.txt"]').count() === 0, 'l\'icône quitte le bureau');
 
+  console.log('— bureau : archives');
+  require('child_process').execFileSync('python3', ['-c', `
+import zipfile
+with zipfile.ZipFile("${DESK}/Photos.zip", "w") as z:
+    z.writestr("Photos/a.jpg", "a"); z.writestr("Photos/b.jpg", "b")
+`]);
+  await page.evaluate(() => loadElements());
+  await page.waitForSelector('#icons .dicon[title$="Photos.zip"]');
+  await page.click('#icons .dicon[title$="Photos.zip"]', { button: 'right' });
+  const dz = await page.innerText('.menu');
+  check(dz.includes('Extraire ici') && dz.includes('Compresser') && dz.includes('Propriétés'), 'clic droit sur une archive du bureau : Extraire ici, Compresser, Propriétés');
+  await page.keyboard.press('Escape');
+  await page.dblclick('#icons .dicon[title$="Photos.zip"]');
+  await page.waitForSelector('.modal .arc-row', { timeout: 5000 }).catch(() => {});
+  check(await page.locator('.modal .arc-row').count() === 3 && (await page.innerText('.modal .arc-list')).includes('Photos'), 'double-clic : le contenu (dossier compris)');
+  await page.click('.modal [data-ar="ici"]');
+  await page.waitForSelector('#icons .dicon[title$="/Photos"]', { timeout: 8000 }).catch(() => {});
+  check(fs.existsSync(`${DESK}/Photos/b.jpg`) && await page.locator('#icons .dicon[title$="/Photos"]').count() === 1, '« Extraire ici » : le dossier apparaît sur le bureau');
+
   console.log('— bureau : versions précédentes d\'un fichier');
   const vfile = `${DESK}/journal.txt`;
   fs.writeFileSync(vfile, 'premier jet');
@@ -429,6 +448,98 @@ async function main() {
   await sleep(500);
   check(fs.existsSync(`${dnd}/Dest/venu.txt`) && fs.existsSync(`${dnd}/venu.txt`), 'avec Ctrl : copié');
   check(await main.locator('.drop-overlay').count() === 0, 'le bandeau de dépôt disparaît une fois le fichier lâché');
+
+  // archives : double-clic, contenu, extraction suivie en bas à droite
+  console.log('— fenêtre principale : archives, tâches de fond, propriétés, navigation');
+  const arc = `${HOME}/Documents/arc-ui`;
+  fs.rmSync(arc, { recursive: true, force: true });
+  fs.mkdirSync(arc, { recursive: true });
+  require('child_process').execFileSync('python3', ['-c', `
+import zipfile
+with zipfile.ZipFile("${arc}/Manga.zip", "w") as z:
+    for i in range(3): z.writestr(f"Tome {i + 1}.cbz", "x" * 1000)
+`]);
+  await openIn(arc);
+  await main.dblclick(rowOf('Manga.zip'));
+  await main.waitForSelector('.modal .arc-row', { timeout: 5000 }).catch(() => {});
+  check(await main.locator('.modal .arc-row').count() === 3 && (await main.innerText('.modal')).includes('3 fichiers') && (await main.innerText('.modal')).includes('« Manga »'),
+    'double-clic sur un zip : son contenu, et le dossier qui sera créé');
+  await main.click('.modal [data-ar="ici"]');
+  await main.waitForFunction(() => TK.list.some((t) => t.genre === 'extraction' && t.etat === 'finie'), null, { timeout: 8000 }).catch(() => {});
+  await sleep(500);
+  check(fs.existsSync(`${arc}/Manga/Tome 3.cbz`) && await main.locator('#taches .tache.finie').count() === 1 && await main.locator(rowOf('Manga')).count() === 1,
+    '« Extraire ici » : tâche suivie en bas à droite, le dossier apparaît dans la liste');
+  await main.click('#taches [data-tka="fermer"]');
+  await main.click(rowOf('Manga'), { button: 'right' });
+  const amenu = await main.innerText('.menu');
+  check(amenu.includes('Compresser') && amenu.includes('Propriétés') && amenu.includes('Ouvrir un terminal ici'), 'menu d\'un dossier : Compresser, Propriétés, terminal');
+  await main.keyboard.press('Escape');
+  await main.click(rowOf('Manga.zip'), { button: 'right' });
+  const zmenu = await main.innerText('.menu');
+  check(zmenu.includes('Extraire ici') && zmenu.includes('Extraire vers') && zmenu.includes('Ouvrir avec'), 'menu d\'une archive : Extraire ici, Extraire vers…, Ouvrir avec…');
+  await main.keyboard.press('Escape');
+  // grosse copie : barre de progression, Annuler
+  const fd = fs.openSync(`${arc}/gros.iso`, 'w'); fs.ftruncateSync(fd, 1024 ** 3); fs.closeSync(fd);
+  fs.mkdirSync(`${arc}/Copies`);
+  await main.evaluate(([a]) => moveItems([`${a}/gros.iso`], `${a}/Copies`, true), [arc]);
+  await main.waitForSelector('#taches .tache.run', { timeout: 4000 }).catch(() => {});
+  check(await main.locator('#taches .tache.run .tk-bar').count() === 1 && (await main.innerText('#taches')).includes('Copie de « gros.iso »'), 'grosse copie : barre de progression en bas à droite');
+  await main.click('#taches [data-tka="annuler"]');
+  await main.waitForFunction(() => TK.list.some((t) => t.etat === 'annulee'), null, { timeout: 8000 }).catch(() => {});
+  await sleep(300);
+  check(!fs.existsSync(`${arc}/Copies/gros.iso`) && (await main.innerText('#taches')).includes('Annulé'), 'Annuler : la copie s\'arrête et ne laisse rien');
+  await main.click('#taches [data-tka="fermer"]');
+  fs.unlinkSync(`${arc}/gros.iso`);
+  // propriétés
+  await main.evaluate(() => loadDir());
+  await sleep(300);
+  await main.click(rowOf('Manga'));
+  await main.keyboard.press('Alt+Enter');
+  await main.waitForSelector('.modal dl.props', { timeout: 5000 }).catch(() => {});
+  const props = (await main.innerText('.modal').catch(() => '')).replace(/[\u202f\u00a0]/g, ' ');
+  check(props.includes('3 fichiers') && props.includes('3 000 octets') && await main.locator('.modal .perm-grid input').count() === 9, `Alt+Entrée : propriétés (taille du dossier, droits)${props.includes('3 fichiers') ? '' : ` — ${props.slice(0, 300)}`}`);
+  await main.keyboard.press('Escape');
+  fs.writeFileSync(`${arc}/lancer.sh`, '#!/bin/sh\n'); fs.chmodSync(`${arc}/lancer.sh`, 0o644);
+  await main.evaluate((p) => showProperties([p]), `${arc}/lancer.sh`);
+  await main.waitForSelector('.modal [data-exe]', { state: 'attached' });
+  await main.click('.modal label.switch:has([data-exe])');
+  await sleep(400);
+  check((fs.statSync(`${arc}/lancer.sh`).mode & 0o111) === 0o111, '« Autoriser l\'exécution » rend le fichier exécutable');
+  await main.keyboard.press('Escape');
+  // navigation : précédent / suivant, Alt+↑, barre d'adresse
+  await openIn(arc);
+  await main.dblclick(rowOf('Manga'));
+  await sleep(400);
+  await main.keyboard.press('Alt+ArrowLeft');
+  await sleep(400);
+  const backAt = await main.evaluate(() => F.path);
+  await main.click('#fFwd');
+  await sleep(400);
+  const fwdAt = await main.evaluate(() => F.path);
+  await main.keyboard.press('Alt+ArrowUp');
+  await sleep(400);
+  check(backAt === arc && fwdAt === `${arc}/Manga` && await main.evaluate(() => F.path) === arc && await main.evaluate(() => [...F.sel][0]) === `${arc}/Manga`,
+    'précédent (Alt+←), suivant, dossier parent (Alt+↑) qui garde choisi le dossier d\'où l\'on vient');
+  await main.keyboard.press('Control+l');
+  await main.keyboard.type('~/Documents/arc-ui/Manga');
+  await main.keyboard.press('Enter');
+  await sleep(500);
+  check(await main.evaluate(() => F.path) === `${arc}/Manga`, 'Ctrl+L : taper un chemin (avec ~) et y aller');
+  await main.keyboard.press('Control+l');
+  await main.keyboard.type('~/Documents/arc-ui/lancer.sh');
+  await main.keyboard.press('Enter');
+  await sleep(500);
+  check(await main.evaluate(() => [F.path, [...F.sel][0]]).then(([p, s]) => p === arc && s === `${arc}/lancer.sh`), 'taper le chemin d\'un fichier : son dossier, le fichier choisi');
+  // compresser depuis le menu
+  await main.click(rowOf('Manga'), { button: 'right' });
+  await main.click('.menu button:has-text("Compresser")');
+  await main.waitForSelector('.modal [data-cn]');
+  await main.fill('.modal [data-cn]', 'Envoi');
+  await main.click('.modal [data-cok]');
+  await main.waitForFunction(() => TK.list.some((t) => t.genre === 'compression' && t.etat === 'finie'), null, { timeout: 8000 }).catch(() => {});
+  await main.waitForSelector(rowOf('Envoi.zip'), { timeout: 4000 }).catch(() => {});
+  const dbgC = await main.evaluate(() => JSON.stringify({ p: F.path, s: !!F.search, l: curList().map((e) => e.name), t: TK.list.map((t) => [t.genre, t.etat, t.dossier]) }));
+  check(fs.existsSync(`${arc}/Envoi.zip`) && await main.locator(rowOf('Envoi.zip')).count() === 1, `« Compresser… » : Envoi.zip créé et affiché${fs.existsSync(`${arc}/Envoi.zip`) && !(await main.locator(rowOf('Envoi.zip')).count()) ? ` ${dbgC}` : ''}`);
 
   await main.evaluate(() => go('settings'));
   await main.waitForSelector('#stIndex [data-ix="refaire"]', { timeout: 5000 }).catch(() => {});

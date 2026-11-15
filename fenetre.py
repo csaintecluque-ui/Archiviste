@@ -10,6 +10,8 @@ dans ses propres fenêtres : pas de navigateur, pas d'onglet. Une seule instance
     archiviste --bureau        bureau Archiviste (remplace les icônes de Nemo, volet à droite)
     archiviste --demander      petite fenêtre « Demander à l'Archiviste » (Super + Espace)
     archiviste --sans-bureau   rend le bureau à Nemo (en cas de souci)
+    archiviste DOSSIER         ouvre ce dossier (ou montre ce fichier) : c'est ainsi que Mint l'appelle quand
+                               Archiviste est le gestionnaire de fichiers par défaut
 """
 import json
 import os
@@ -294,6 +296,78 @@ class SuiviFenetres:
         except Exception:  # noqa: BLE001
             traceback.print_exc()
         return False
+
+
+# ════════════════════════════════════════════════════════════════════
+#  org.freedesktop.FileManager1 : « afficher dans le dossier » depuis les autres applis
+# ════════════════════════════════════════════════════════════════════
+FM1_XML = """<node><interface name="org.freedesktop.FileManager1">
+  <method name="ShowFolders"><arg type="as" name="URIs" direction="in"/><arg type="s" name="StartupId" direction="in"/></method>
+  <method name="ShowItems"><arg type="as" name="URIs" direction="in"/><arg type="s" name="StartupId" direction="in"/></method>
+  <method name="ShowItemProperties"><arg type="as" name="URIs" direction="in"/><arg type="s" name="StartupId" direction="in"/></method>
+</interface></node>"""
+
+
+class ServiceFichiers:
+    """Quand Archiviste est le gestionnaire de fichiers par défaut, il répond à la place de Nemo aux
+    applis qui demandent d'« afficher dans le dossier » un fichier (Firefox après un téléchargement…).
+    Si Nemo tient déjà ce nom sans vouloir le céder, on n'insiste pas : rien ne change."""
+
+    def __init__(self, app):
+        self.app = app
+        self.owner = 0
+        self.reg = 0
+        self.conn = None
+        self.actif = False
+
+    def demarrer(self) -> None:
+        if self.owner:
+            return
+        try:
+            self.owner = Gio.bus_own_name(
+                Gio.BusType.SESSION, "org.freedesktop.FileManager1",
+                Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT | Gio.BusNameOwnerFlags.REPLACE,
+                self.on_bus, self.on_acquired, self.on_lost)
+        except Exception:  # noqa: BLE001 — pas de bus de session : rien à faire
+            self.owner = 0
+
+    def arreter(self) -> None:
+        if self.conn is not None and self.reg:
+            self.conn.unregister_object(self.reg)
+        if self.owner:
+            Gio.bus_unown_name(self.owner)
+        self.owner = self.reg = 0
+        self.conn = None
+        self.actif = False
+
+    def on_bus(self, conn, name) -> None:
+        try:
+            iface = Gio.DBusNodeInfo.new_for_xml(FM1_XML).interfaces[0]
+            self.reg = conn.register_object("/org/freedesktop/FileManager1", iface, self.on_call, None, None)
+            self.conn = conn
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def on_acquired(self, conn, name) -> None:
+        self.actif = True
+
+    def on_lost(self, conn, name) -> None:
+        self.actif = False
+
+    def on_call(self, conn, sender, path, iface, method, params, invocation) -> None:
+        try:
+            uris = params.unpack()[0]
+            paths = [p for p in (Gio.File.new_for_uri(u).get_path() for u in uris) if p and os.path.exists(p)]
+            if paths:
+                if method == "ShowFolders":
+                    self.app.show_path(paths[0])
+                elif method == "ShowItemProperties":
+                    self.app.show_path(paths[0], props=True)
+                else:  # ShowItems : le dossier qui le contient, l'élément choisi
+                    self.app.open_main({"vue": "files", "chemin": os.path.dirname(paths[0]) or "/", "select": paths[0]})
+            invocation.return_value(None)
+        except Exception as e:  # noqa: BLE001
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed", str(e))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -722,6 +796,8 @@ class Application(Gtk.Application):
         self.surveillance = None
         self.ecrans: list[dict] = []
         self._push_timer = 0
+        self._push_kinds: set[str] = set()
+        self.service_fichiers = None
         for name, desc in (("bureau", "Afficher le bureau Archiviste"),
                            ("demander", "Ouvrir « Demander à l'Archiviste »"),
                            ("fenetre", "Ouvrir la fenêtre principale"),
@@ -751,6 +827,9 @@ class Application(Gtk.Application):
         if scr is not None:
             scr.connect("monitors-changed", lambda *_: self.list_monitors())
         self.start_window_tracking()
+        A.FM_HOOK = lambda what: self.in_gtk(lambda: self.fm_service(what)) if what != "etat" else \
+            bool(self.service_fichiers and self.service_fichiers.actif)
+        self.fm_service("marche" if A.fm_is_archiviste() else "arret")
         try:
             self.surveillance = Surveillance(self.on_folder_changed)
         except Exception:  # noqa: BLE001 — sans surveillance, le bureau se rafraîchit par sondage, comme avant
@@ -847,15 +926,20 @@ class Application(Gtk.Application):
     def on_folder_changed(self, kind: str) -> None:
         if self.bureau is not None:
             self.bureau.run_js(f"window.archivisteChange && archivisteChange({json.dumps(kind)})")
+        if kind == "taches" and self.window is not None:  # une tâche de fond commence ou se termine
+            self.window.run_js("window.archivisteTaches && archivisteTaches()")
 
     def on_push(self, kind: str) -> bool:
-        if not self._push_timer:  # plusieurs écritures d'affilée (une réponse de l'IA) : un seul signal
-            self._push_timer = GLib.timeout_add(150, self._push_now, kind)
+        self._push_kinds.add(kind)
+        if not self._push_timer:  # plusieurs écritures d'affilée (une réponse de l'IA) : un seul signal par sorte
+            self._push_timer = GLib.timeout_add(150, self._push_now)
         return False
 
-    def _push_now(self, kind: str) -> bool:
+    def _push_now(self) -> bool:
         self._push_timer = 0
-        self.on_folder_changed(kind)
+        kinds, self._push_kinds = self._push_kinds, set()
+        for kind in sorted(kinds):
+            self.on_folder_changed(kind)
         return False
 
     def on_windows_changed(self) -> None:
@@ -894,9 +978,49 @@ class Application(Gtk.Application):
         if opts.get("demander"):
             shown = True
             self.toggle_demande()
+        target = self.path_from_args(cmdline)
+        if target is not None:
+            self.show_path(target)
+            return 0
         if opts.get("fenetre") or not shown:
             self.open_main()
         return 0
+
+    @staticmethod
+    def path_from_args(cmdline):
+        """Premier dossier ou fichier donné en argument (chemin, relatif ou non, ou adresse file://)."""
+        for arg in list(cmdline.get_arguments() or [])[1:]:
+            if not arg or arg.startswith("-"):
+                continue
+            f = Gio.File.new_for_uri(arg) if "://" in arg else Gio.File.new_for_path(
+                arg if os.path.isabs(arg) else os.path.join(cmdline.get_cwd() or str(Path.home()), arg))
+            p = f.get_path()
+            if p and os.path.exists(p):
+                return os.path.normpath(p)
+        return None
+
+    def show_path(self, path: str, props: bool = False) -> None:
+        """Ouvre un dossier dans la fenêtre principale, ou montre un fichier dans son dossier. Un dossier hors de
+        ceux qu'Archiviste a le droit de toucher (/etc, /usr…) s'ouvre dans Nemo : Archiviste n'y va pas."""
+        if not any(A.within(os.path.realpath(path), r) for r in A.allowed_roots()):
+            for fm in ("nemo", "nautilus", "caja", "thunar"):
+                if shutil.which(fm) and A._launch([fm, path]):
+                    return
+        if os.path.isdir(path) and not props:
+            self.open_main({"vue": "files", "chemin": path})
+        else:
+            self.open_main({"vue": "files", "chemin": os.path.dirname(path) or "/", "select": path,
+                            **({"proprietes": True} if props else {})})
+
+    # ── service D-Bus « FileManager1 » : Firefox, Chrome, VS Code… demandent d'« afficher dans le dossier » ──
+    def fm_service(self, what: str) -> bool:
+        if what == "marche":
+            if self.service_fichiers is None:
+                self.service_fichiers = ServiceFichiers(self)
+            self.service_fichiers.demarrer()
+        elif what == "arret" and self.service_fichiers is not None:
+            self.service_fichiers.arreter()
+        return bool(self.service_fichiers and self.service_fichiers.actif)
 
     def do_activate(self):
         self.open_main()
@@ -916,6 +1040,8 @@ class Application(Gtk.Application):
             h = f"#/{vue}?p={urllib.parse.quote(d['chemin'], safe='')}"
             if d.get("select"):
                 h += f"&s={urllib.parse.quote(d['select'], safe='')}"
+            if d.get("proprietes"):
+                h += "&i=1"
             return h
         if vue == "chat" and d.get("conv"):
             return f"#/chat/{d['conv']}"

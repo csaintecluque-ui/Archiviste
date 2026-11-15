@@ -64,6 +64,20 @@ Pour revenir au bureau de Mint : **Réglages → Bureau → Rendre le bureau à 
 
 Commandes : `archiviste` (fenêtre), `archiviste --bureau`, `archiviste --demander`, `archiviste --sans-bureau`.
 
+## Gestionnaire de fichiers
+
+Archiviste peut remplacer Nemo au quotidien :
+
+| | |
+|---|---|
+| Archives | double-clic : contenu ; clic droit : **Extraire ici**, **Extraire vers…**, **Compresser…** (.zip ou .tar.gz). zip, cbz, tar, tar.gz/bz2/xz, .gz/.bz2/.xz en Python ; 7z, rar, cbr, tar.zst avec 7-Zip (`sudo apt install 7zip`). Mot de passe demandé si besoin. |
+| Longues opérations | extractions, compressions et copies de plus de ~50 Mo tournent en arrière-plan, suivies en bas à droite (progression, vitesse, temps restant, Annuler). Place vérifiée avant ; rien n'est laissé à moitié en cas d'annulation. |
+| Clés USB | parcourues, remplies, extraites comme le reste (menu des dossiers en haut à gauche). Elles ne sont pas indexées par la recherche instantanée. |
+| Clic droit | Ouvrir avec… (et « Toujours ouvrir ce type avec… »), Couper / Copier / Coller, Compresser, Ouvrir un terminal ici, **Propriétés** (taille d'un dossier, droits, « exécutable »). |
+| Clavier | <kbd>Alt</kbd>+<kbd>←</kbd>/<kbd>→</kbd> précédent/suivant · <kbd>Alt</kbd>+<kbd>↑</kbd> ou <kbd>Retour arrière</kbd> parent · <kbd>Ctrl</kbd>+<kbd>L</kbd> taper un chemin · <kbd>F5</kbd> actualiser · <kbd>Ctrl</kbd>+<kbd>H</kbd> fichiers cachés · <kbd>Ctrl</kbd>+<kbd>Maj</kbd>+<kbd>N</kbd> nouveau dossier · <kbd>Ctrl</kbd>+<kbd>F</kbd> rechercher · <kbd>Alt</kbd>+<kbd>Entrée</kbd> propriétés · <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd> terminal · <kbd>Ctrl</kbd>+<kbd>X</kbd>/<kbd>C</kbd>/<kbd>V</kbd> |
+
+**Le choisir par défaut** : Réglages → Gestionnaire de fichiers → « Utiliser Archiviste comme gestionnaire de fichiers ». Les dossiers ouverts depuis les autres applis (Firefox « Afficher dans le dossier », menu de Mint, clé USB qu'on branche) s'ouvrent alors dans Archiviste (c'est le réglage `inode/directory` de `xdg-mime`, le même que Paramètres système → Applications préférées → Fichiers). Archiviste répond aussi au service D-Bus `org.freedesktop.FileManager1` tant qu'il tourne. Un dossier hors des dossiers autorisés (`/etc`, `/usr`…) s'ouvre toujours dans Nemo. « Revenir à Nemo » rend le réglage d'avant. En ligne de commande : `archiviste ~/Documents` ouvre ce dossier, `archiviste ~/Documents/facture.pdf` le montre dans son dossier.
+
 ## Recherche, versions précédentes
 
 **Recherche instantanée.** Archiviste tient à jour, en arrière-plan, un index de tes dossiers autorisés (`~/.local/share/archiviste/index.sqlite`) : noms des fichiers, et texte des documents (PDF, Word, Excel, notes) si l'option est cochée dans **Réglages → Recherche instantanée**. La recherche de l'onglet Fichiers répond pendant que tu tapes, sur tout le dossier affiché, sans tenir compte des accents ni des majuscules ; coche « contenu » pour chercher dans le texte. <kbd>Entrée</kbd> vérifie en plus le disque avant de répondre. Les fichiers cachés ne sont pas indexés (la recherche les parcourt directement quand ils sont affichés). Rien ne quitte le PC ; « Reconstruire l'index » le refait de zéro.
@@ -143,6 +157,7 @@ Sauvegarde / transfert de tes agents et prompts : **Réglages → Sauvegarde →
 ## Pour bidouiller
 
 - `archiviste.py` — le serveur (Python, bibliothèque standard uniquement) : fichiers, corbeille, Ollama, agents et leurs outils (`TOOLS`), tri.
+- `archives.py` — lire, extraire et créer les archives (zip, tar, 7z/rar via 7-Zip) ; côté serveur, les tâches de fond (`Tache`, `lancer_tache`, `/api/taches`) et `transfer()` pour les copies longues ; côté page : `taskStarted()`, `openArchive()`, `compressDialog()` dans `static/app.js`.
 - `indexeur.py` — l'index de recherche (SQLite + FTS5) : passage complet toutes les heures, passage léger toutes les 3 minutes (un `stat` par dossier), relecture immédiate des dossiers modifiés par Archiviste ou signalés par la fenêtre ; côté serveur : `fs_search()` et `_index_search()`.
 - Glisser-déposer et presse-papiers sous WebKitGTK : la page qui reçoit un fichier ne peut lire ni son emplacement ni l'état réel de la touche Ctrl. `fenetre.py` les relève donc lui-même (`on_drag_data`, `on_drag_motion`, `on_drag_drop`, `file_clipboard`) et les note auprès du serveur (`/api/glisse`, `/api/presse-papiers`) ; côté page : `dropInfo()`, `clipSet()`, `clipPaste()` dans `static/app.js`.
 - La discussion (fenêtre principale, volet, « Demander ») est rendue par un seul code : `chatHtml()`, `chatLiveTurn()`, `chatAction()` dans `static/app.js`, habillés par `MAIN_SKIN` et `VOLET_SKIN`.
