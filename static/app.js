@@ -895,17 +895,24 @@ function renderCrumbs() {
   $('#fCrumbs').scrollLeft = 9999;
 }
 
+// Une recherche arrêtée avant la fin le dit, au lieu de laisser croire qu'il n'y a rien d'autre.
+function searchCutText(r) {
+  if (!r || !r.incomplet) return '';
+  if (r.incomplet === 'temps') return `Recherche arrêtée au bout de ${String(r.delai).replace('.', ',')} s : tout n'a pas été parcouru. Ouvre un sous-dossier plus précis et relance.`;
+  return 'Seuls les premiers résultats sont affichés : précise le mot cherché.';
+}
 function renderFileList() {
   const list = curList();
   const el = $('#fList');
   const arrow = (c) => (F.sortBy === c ? (F.sortDir > 0 ? ' ↑' : ' ↓') : '');
   let html = '';
   if (F.search) {
-    html += `<div class="banner" style="margin:8px 4px">${ic('search')}<div class="grow"><b>${list.length}${F.search.tronque ? '+' : ''} résultat(s)</b> pour « ${esc(F.search.query)} » dans ${esc(tildify(F.search.base))}</div><button class="btn sm" data-act="clearSearch">Effacer</button></div>`;
+    const why = searchCutText(F.search);
+    html += `<div class="banner" style="margin:8px 4px">${ic('search')}<div class="grow"><b>${list.length}${F.search.tronque ? '+' : ''} résultat(s)</b> pour « ${esc(F.search.query)} » dans ${esc(tildify(F.search.base))}${why ? `<br><span class="search-cut">${ic('alert', 'sm')} ${esc(why)}</span>` : ''}</div><button class="btn sm" data-act="clearSearch">Effacer</button></div>`;
   }
   html += `<div class="frow head"><span></span><span></span><span class="sortable" data-act="sortCol" data-col="name">Nom${arrow('name')}</span><span class="sortable size" data-act="sortCol" data-col="size">Taille${arrow('size')}</span><span class="sortable date" data-act="sortCol" data-col="mtime">Modifié${arrow('mtime')}</span><span></span></div>`;
   if (!list.length) {
-    html += `<div class="empty">${ic(F.search ? 'search' : 'folder')}<p>${F.search ? 'Aucun résultat.' : 'Ce dossier est vide.'}</p>${F.search ? '' : '<p class="faint">Glisse des fichiers ici pour les importer.</p>'}</div>`;
+    html += `<div class="empty">${ic(F.search ? 'search' : 'folder')}<p>${F.search ? (F.search.incomplet ? 'Rien trouvé pour l\'instant : la recherche n\'a pas pu tout parcourir.' : 'Aucun résultat.') : 'Ce dossier est vide.'}</p>${F.search ? '' : '<p class="faint">Glisse des fichiers ici pour les importer.</p>'}</div>`;
   }
   html += list.map((e, i) => `<div class="frow ${F.sel.has(e.path) ? 'sel' : ''} ${e.hidden ? 'hiddenf' : ''}" data-i="${i}" draggable="true" title="${esc(e.name)}">
       <input type="checkbox" data-act="chk" ${F.sel.has(e.path) ? 'checked' : ''} tabindex="-1">
@@ -1635,7 +1642,7 @@ const CHAT_ACTS = {
     if (!C.conv) return;
     const t = await promptText({ title: 'Renommer la discussion', value: C.conv.titre || '' });
     if (!t) return;
-    C.conv = await post(`/api/conversations/${C.conv.id}`, { titre: t });
+    try { C.conv = await post(`/api/conversations/${C.conv.id}`, { titre: t }); } catch (e) { return toast(e.message, 'err'); }
     renderChatHead(); loadConvs();
   },
   ws: async () => {
@@ -1659,6 +1666,7 @@ const CHAT_ACTS = {
   toDocx: (b) => sendToOffice(msgText(+b.dataset.m), 'docx', C.conv?.titre),
   toXlsx: (b) => sendToOffice(msgText(+b.dataset.m), 'xlsx', C.conv?.titre),
   regen: () => sendMessage({ regenerate: true }),
+  retry: () => sendMessage({ regenerate: true }),
   asPrompt: (b) => editPrompt(null, { contenu: msgText(+b.dataset.m), categorie: 'Divers' }),
   cfYes: (b) => { const seg = b.closest('.seg'); $$('button', seg).forEach((x) => x.classList.toggle('on', x === b)); },
   cfNo: (b) => { const seg = b.closest('.seg'); $$('button', seg).forEach((x) => x.classList.toggle('on', x === b)); },
@@ -1735,6 +1743,7 @@ async function openConv(id) {
   updateHash();
 }
 async function updateCur(patch) {
+  if (C.busy) { toast('Attends la fin de la réponse (ou clique sur Stop).'); renderChatHead(); return; }
   if (C.conv) {
     try { C.conv = await post(`/api/conversations/${C.conv.id}`, patch); } catch (e) { toast(e.message, 'err'); }
   } else Object.assign(C.draft, patch);
@@ -1789,6 +1798,11 @@ function stepHtml(s) {
   const cls = s.pending || s.waiting ? '' : s.refuse ? 'refused' : s.ok ? 'ok' : 'err';
   return `<div class="step ${cls}" data-step="${esc(s.id || '')}"><span class="st">${st}</span><span class="lbl">${esc(toolLabel(s.name))}</span><span class="desc" title="${esc(s.description || '')}">${esc(s.description || '')}</span><span class="res" title="${esc(s.summary || '')}">${esc(s.waiting ? 'en attente de ta validation' : s.summary || '')}</span></div>`;
 }
+// Erreur de l'IA : gardée dans la discussion (rôle « error »), donc toujours là après le rafraîchissement.
+// « Réessayer » n'est proposé que sur la dernière, et seulement si recommencer peut aboutir.
+function errorHtml(text, retry) {
+  return `<div class="err-box err-row"><span class="err-txt">${ic('alert', 'sm')} ${esc(text)}</span>${retry ? `<button class="btn sm" data-act="retry" title="Relancer la même demande">${ic('refresh', 'sm')} Réessayer</button>` : ''}</div>`;
+}
 function confirmHtml(pending) {
   return `<div class="confirm-card">
     <div class="ttl">${ic('alert', 'sm')} L'agent demande ta validation avant d'agir</div>
@@ -1828,6 +1842,7 @@ function renderMessages() {
     }
     if (!turn) turn = [];
     if (m.role === 'tool') { turn.push(stepHtml({ ...m, name: m.tool_name, id: m.call_id })); return; }
+    if (m.role === 'error') { turn.push(errorHtml(m.content, i === msgs.length - 1 && m.reessayer !== false && !C.conv?.pending)); return; }
     // assistant
     if (m.thinking) turn.push(`<details class="seg-think"><summary>${ic('info', 'sm')} Réflexion (${m.thinking.length} caractères)</summary><div class="tx">${esc(m.thinking)}</div></details>`);
     if (m.content) {
@@ -1911,12 +1926,12 @@ function createLiveTurn() {
           body.insertAdjacentHTML('beforeend', `<div class="notice">${esc(ev.d)}</div>`); break;
         case 'error':
           untype();
-          body.insertAdjacentHTML('beforeend', `<div class="err-box">${ic('alert', 'sm')} ${esc(ev.d)}</div>`);
+          body.insertAdjacentHTML('beforeend', errorHtml(ev.d, false));
           scrollChat(true); break;
         default: break;
       }
     },
-    error(msg) { untype(); body.insertAdjacentHTML('beforeend', `<div class="err-box">${esc(msg)}</div>`); },
+    error(msg) { untype(); body.insertAdjacentHTML('beforeend', errorHtml(msg, false)); },
     el,
   };
 }
@@ -1963,13 +1978,16 @@ async function sendMessage({ regenerate = false, decisions = null } = {}) {
   C.stick = true;
   setBusy(true);
   C.ctrl = new AbortController();
+  let localErr = null;  // erreur que le serveur n'a pas pu enregistrer (Archiviste injoignable, discussion occupée…)
+  let failed = false;
   try {
     await streamApi('/api/chat', body, (ev) => {
       live.on(ev);
+      if (ev.t === 'error') failed = true;
       if (ev.t === 'user_saved' && ev.titre && C.conv && !C.conv.titre) { C.conv.titre = ev.titre; renderChatHead(); }
     }, C.ctrl.signal);
   } catch (e) {
-    if (e.name !== 'AbortError') live.error(e.message);
+    if (e.name !== 'AbortError') { localErr = e.message; live.error(e.message); }
   } finally {
     setBusy(false);
     C.ctrl = null;
@@ -1977,7 +1995,12 @@ async function sendMessage({ regenerate = false, decisions = null } = {}) {
     try { C.conv = await api(`/api/conversations/${C.conv.id}`); } catch { /* */ }
     const atBottom = C.stick;
     renderMessages();
-    if (!atBottom) $('#cMsgs').scrollTop = keepScroll;
+    if (localErr) {  // le rafraîchissement vient d'effacer l'affichage en direct : on remet le message
+      if (text && !C.conv.messages.some((m) => m.role === 'user' && m.content === text)) { inp.value = text; inp.dispatchEvent(new Event('input')); }  // le message non envoyé n'est pas perdu
+      inner.insertAdjacentHTML('beforeend', errorHtml(localErr, false));
+      scrollChat(true);
+    } else if (!atBottom) $('#cMsgs').scrollTop = keepScroll;
+    if (failed || localErr || !S.status?.ok) refreshStatus();  // la pastille dit tout de suite si Ollama est tombé, ou revenu
     renderChatHead();
     loadConvs();
     inp.focus();
@@ -2315,6 +2338,7 @@ async function renderBureauCard(rapport) {
     ${rapport ? `<ul class="bu-rapport">${rapport.map((r) => `<li class="${r.ok === false ? 'bad' : r.ok ? 'ok' : ''}"><b>${okIc(r.ok)} ${esc(r.titre)}</b> — ${esc(r.message)}</li>`).join('')}</ul>` : ''}
     <div class="settings-grid" style="margin-top:12px">
       <label class="field"><span>Un dossier du bureau s'ouvre dans</span><select data-bf="dossiers">${[['archiviste', 'Archiviste'], ['systeme', 'Le gestionnaire de fichiers (Nemo)']].map(([k, l]) => `<option value="${k}" ${b.dossiers === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label class="field"><span>Nouvelle discussion dans le volet</span><select data-bf="conv_heures">${[[1, 'Après 1 heure sans échange'], [4, 'Après 4 heures sans échange (conseillé)'], [12, 'Après 12 heures sans échange'], [24, 'Après 24 heures sans échange'], [0, 'Jamais : toujours la même discussion']].map(([k, l]) => `<option value="${k}" ${+b.conv_heures === k ? 'selected' : ''}>${l}</option>`).join('')}</select><small>Un vieux sujet ne pollue pas la question suivante. L'ancienne discussion reste dans l'onglet Discussion.</small></label>
       <label class="field"><span>Fond d'écran</span><select data-bf="fond">${[['auto', 'Celui de Cinnamon (conseillé)'], ['archiviste', 'Dessiné par Archiviste (si le fond reste noir)']].map(([k, l]) => `<option value="${k}" ${b.fond === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     </div>
     <dl class="muted" style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:12px 0 0;font-size:13px">

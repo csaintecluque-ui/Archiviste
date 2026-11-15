@@ -349,6 +349,12 @@ input[type=range] { accent-color: var(--accent); }
 .confirm-item .seg button.on.no { background: var(--danger); color: #fff; }
 .err-box { border: 1px solid var(--danger); background: var(--danger-soft); color: var(--danger); border-radius: 10px; padding: 9px 12px; font-size: 13px; }
 .notice { font-size: 12px; color: var(--warn); font-style: italic; }
+.err-box.err-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.err-box .err-txt { flex: 1; min-width: 160px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.err-box .err-txt .i { vertical-align: -3px; margin-right: 2px; }
+.err-box .btn { flex: none; color: var(--text); }
+.search-cut { color: var(--warn); font-size: 12.5px; }
+.search-cut .i { vertical-align: -3px; }
 .chat-empty { margin: auto; text-align: center; max-width: 620px; padding: 40px 20px; }
 .chat-empty svg.logo { width: 76px; height: 76px; margin-bottom: 8px; }
 .chat-empty h2 { font: 600 30px/1.2 var(--font-title); margin: 0 0 6px; }

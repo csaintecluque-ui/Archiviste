@@ -12,3 +12,15 @@ HOME="$H" XDG_DATA_HOME= ARCHIVISTE_PORT=8766 ARCHIVISTE_SANS_MAJ=1 python3 "$RA
 trap 'kill $MOCK $SRV 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do python3 -c "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8766/', timeout=1)" 2>/dev/null && break; sleep 0.25; done
 python3 "$ICI/test_api.py"
+HOME="$H" XDG_DATA_HOME= ARCHIVISTE_DATA="$H/.unites" python3 "$ICI/test_unites.py"
+
+# Tests d'interface (volet du bureau, fenêtre principale) dans Chrome sans affichage.
+# Il faut Node.js et, une fois :  npm install --prefix tests
+if (cd "$ICI" && node -e "try { require('playwright-core') } catch (e) { require('playwright') }" 2>/dev/null); then
+  (cd "$ICI" && ARCHI_HOME="$H" node test_interface.cjs)
+elif [ -n "${CI:-}" ]; then
+  echo "Tests d'interface impossibles : playwright-core est absent (npm install --prefix tests)." >&2
+  exit 1
+else
+  echo "(tests d'interface non lancés : installe Node.js puis « npm install --prefix tests »)"
+fi

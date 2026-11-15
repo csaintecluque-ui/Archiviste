@@ -45,10 +45,13 @@ class H(BaseHTTPRequestHandler):
         self.cors()
         self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
-        for c in chunks:
-            self.wfile.write((json.dumps(c) + "\n").encode())
-            self.wfile.flush()
-            time.sleep(0.02)
+        try:
+            for c in chunks:
+                self.wfile.write((json.dumps(c) + "\n").encode())
+                self.wfile.flush()
+                time.sleep(0.02)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Archiviste a abandonné cette réponse (discussion reprise par une autre requête)
 
     def do_POST(self):
         p = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -61,6 +64,8 @@ class H(BaseHTTPRequestHandler):
             return self.j({"error": f'"{model}" does not support thinking'}, 400)
         msgs = p["messages"]
         last = msgs[-1]
+        if "[lent]" in (last.get("content") or ""):  # modèle qui met du temps à répondre
+            time.sleep(1.5)
         if "format" in p:
             lines = re.findall(r"^(\d+)\. (\S+)", last["content"], re.M)
             out = []
