@@ -1,0 +1,27 @@
+{
+  "name": "Archiviste",
+  "short_name": "Archiviste",
+  "description": "Gestionnaire de fichiers et assistant IA local (Ollama)",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#17120f",
+  "theme_color": "#1B1512",
+  "lang": "fr",
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

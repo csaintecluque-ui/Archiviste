@@ -1,0 +1,58 @@
+# Archiviste — teste, construit le paquet .deb et le publie.
+# - Pull request : tests + construction pour vérifier ; le .deb est dans l'onglet Actions (« Artifacts »).
+# - main : si la version de archiviste.py (VERSION) n'a pas encore de release, crée la release vX.Y.Z
+#   avec le .deb et les notes de NOUVEAUTES.md ; les Archiviste installés la proposent ensuite.
+name: Paquet .deb
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: paquet-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paquet:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Outils
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq librsvg2-bin poppler-utils
+
+      - name: Tests de bout en bout
+        run: ./tests/lancer.sh
+
+      - name: Construire le .deb
+        id: deb
+        run: |
+          ./construire-deb.sh
+          V=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' archiviste.py)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          dpkg-deb -I "dist/archiviste_${V}_all.deb" | sed -n '1,12p'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archiviste-deb
+          path: dist/*.deb
+
+      - name: Publier la release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.deb.outputs.version }}"
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "La version $V est déjà publiée : rien à faire."
+            exit 0
+          fi
+          awk -v t="## $V" '$0==t{f=1;next} /^## /{f=0} f' NOUVEAUTES.md > notes.md
+          [ -s notes.md ] || echo "Archiviste $V" > notes.md
+          printf '\n---\nInstallation : télécharge `archiviste_%s_all.deb` ci-dessous et double-clique dessus. Les versions déjà installées proposent la mise à jour d'"'"'elles-mêmes.\n' "$V" >> notes.md
+          gh release create "v$V" "dist/archiviste_${V}_all.deb" --title "Archiviste $V" --notes-file notes.md

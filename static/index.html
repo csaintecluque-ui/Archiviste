@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="fr" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="archiviste-token" content="__ARCHIVISTE_TOKEN__">
+  <meta name="theme-color" content="#1B1512">
+  <title>Archiviste</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <img src="/favicon.svg" alt="Anamnesis · CSC" width="40" height="40">
+      <div><b>Archiviste</b><small id="brandModel">IA locale</small></div>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-view="files"><span data-icon="folder"></span><span>Fichiers</span></button>
+      <button data-view="sort"><span data-icon="sparkles"></span><span>Tri intelligent</span></button>
+      <div class="sep"></div>
+      <button data-view="chat"><span data-icon="chat"></span><span>Discussion</span></button>
+      <button data-view="agents"><span data-icon="bot"></span><span>Agents</span><span class="count" id="countAgents"></span></button>
+      <button data-view="prompts"><span data-icon="scroll"></span><span>Prompts</span><span class="count" id="countPrompts"></span></button>
+      <div class="sep"></div>
+      <button data-view="trash"><span data-icon="trash"></span><span>Corbeille</span></button>
+      <button data-view="settings"><span data-icon="sliders"></span><span>Réglages</span></button>
+    </nav>
+    <div class="side-foot">
+      <div class="status-pill update" id="updatePill" hidden></div>
+      <div class="status-pill" id="statusPill" title="État d'Ollama">
+        <span class="dot"></span>
+        <div class="grow ellipsis"><span id="statusText">Connexion…</span><small id="statusSub">Ollama</small></div>
+      </div>
+    </div>
+  </aside>
+
+  <main>
+    <section class="view" id="view-files"></section>
+    <section class="view" id="view-sort"></section>
+    <section class="view" id="view-chat"></section>
+    <section class="view" id="view-agents"></section>
+    <section class="view" id="view-prompts"></section>
+    <section class="view" id="view-trash"></section>
+    <section class="view" id="view-settings"></section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
