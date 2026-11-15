@@ -56,6 +56,8 @@ La colonne des raccourcis sert aussi de **dock** : un repère sur le raccourci i
 
 Les raccourcis sont en colonne sur le bord droit du volet, pour laisser toute la hauteur à la discussion ; s'il y en a beaucoup, la colonne défile. Clic pour ouvrir, glisser pour réordonner, clic droit pour renommer, monter, descendre ou retirer, crayon en bas de la colonne pour en retirer plusieurs, « + » pour ajouter une application (toutes celles du menu, tes favoris en premier), un dossier ou un fichier.
 
+**Raccourcis par-dessus les applis** : quand une appli occupe tout l'écran, pousse la souris contre le bord de l'écran où se tient le volet : la colonne des raccourcis apparaît par-dessus (fenêtre `DockBord` de `fenetre.py`, page `bureau?mode=dock`), sans réduire l'appli ni lui prendre le clavier ; elle s'efface quand la souris s'en éloigne ou qu'une appli est choisie. Il faut laisser la souris un quart de seconde contre le bord, sans bouton enfoncé, hors des coins : les barres de défilement et le bouton « fermer » restent tranquilles. Désactivable dans Réglages → Bureau. <kbd>Super</kbd>+<kbd>Espace</kbd> montre aussi les raccourcis, sous la saisie.
+
 Quand une appli a plusieurs fenêtres, le clic sur son raccourci propose de choisir laquelle ramener. Le volet peut se tenir **à gauche** de l'écran (clic droit sur le bureau → « Mettre le volet à gauche », ou **Réglages → Bureau → Position du volet**) ; avec deux écrans, **Réglages → Bureau → Écran du bureau Archiviste** choisit celui qui porte les icônes et le volet.
 
 Le bureau n'a plus besoin de guetter le disque : la fenêtre est prévenue quand le dossier Bureau, les téléchargements, la corbeille ou les clés USB changent, et les icônes suivent dans le quart de seconde.

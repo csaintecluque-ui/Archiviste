@@ -42,7 +42,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import archives  # noqa: E402  (zip, tar, 7z… : archives.py, à côté)
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()
@@ -2996,6 +2996,7 @@ BUREAU_DEFAUT = {
     "conv_precedente": None,   # discussion du volet d'avant, pour « Reprendre la précédente »
     "volet_cote": "droite",    # bord de l'écran où se tient le volet : droite | gauche
     "ecran": None,             # écran qui porte le bureau Archiviste (None : l'écran principal)
+    "dock_bord": True,         # souris poussée contre le bord du volet : les raccourcis apparaissent par-dessus les applis
 }
 MONITORS_HOOK = None  # renseigné par fenetre.py : liste des écrans branchés
 CONV_HEURES = (0, 1, 4, 12, 24)
@@ -5460,6 +5461,8 @@ def r_bureau_reglages(h, q, b):
         patch["volet_largeur"] = max(VOLET_MIN, min(VOLET_MAX, w)) if w > 0 else None
     if b.get("volet_cote") in ("droite", "gauche"):
         patch["volet_cote"] = b["volet_cote"]
+    if "dock_bord" in b:
+        patch["dock_bord"] = to_bool(b["dock_bord"])
     if "ecran" in b:
         try:
             patch["ecran"] = None if b["ecran"] in (None, "", "principal") else max(0, int(b["ecran"]))

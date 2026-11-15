@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import urllib.parse
 from pathlib import Path
@@ -781,6 +782,80 @@ class Demande(VueWeb, Gtk.ApplicationWindow):
             self.hide()
 
 
+class DockBord(VueWeb, Gtk.ApplicationWindow):
+    """Les raccourcis du volet, par-dessus les applis : ils apparaissent quand la souris est poussée contre
+    le bord de l'écran où se tient le volet, et s'effacent dès qu'on s'en éloigne ou qu'une appli est choisie.
+    La fenêtre ne prend jamais le clavier : l'appli en cours le garde."""
+    zoom_key = "zoom_bureau"
+
+    def __init__(self, app: "Application"):
+        Gtk.ApplicationWindow.__init__(self, application=app, title="Raccourcis Archiviste")
+        self.app = app
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        app.set_icon(self)
+        self.composite = transparent_window(self)
+        # transparente, la fenêtre est large pour que les menus (choix d'une fenêtre…) tiennent à côté de la colonne
+        self.W = 420 if self.composite else 104
+        self.setup_view(TRANSPARENT if self.composite else ENCRE)
+        ucm = self.view.get_user_content_manager()
+        ucm.register_script_message_handler("archiviste")
+        ucm.connect("script-message-received::archiviste", self.on_message)
+        self.add(self.view)
+        self.menu_open = False
+        self.shown_at = 0.0
+        self.active_at_show = None
+        self.connect("delete-event", lambda *_: self.hide() or True)
+        self.connect("destroy", lambda *_: app.forget(self))
+        self.view.load_uri(app.base + "bureau?mode=dock&fond=" + ("0" if self.composite else "1"))
+        self.place()
+        self.view.show()
+
+    def place(self) -> None:
+        mon = self.app.desktop_monitor()
+        if mon is None:
+            return
+        wa = mon.get_workarea()
+        left = A.bureau_state().get("volet_cote") == "gauche"
+        self.set_size_request(self.W, wa.height)
+        self.resize(self.W, wa.height)
+        self.move(wa.x if left else wa.x + wa.width - self.W, wa.y)
+
+    def reveal(self) -> None:
+        self.place()
+        self.menu_open = False
+        self.shown_at = time.monotonic()
+        self.active_at_show = self.app.active_xid()
+        self.show()
+        gw = self.get_window()
+        if gw is not None:
+            gw.raise_()
+        self.run_js("window.archivisteMontrer && archivisteMontrer()")
+
+    def on_message(self, ucm, res):
+        val = res.get_js_value() if hasattr(res, "get_js_value") else res
+        try:
+            msg = json.loads(val.to_string())
+        except (ValueError, TypeError):
+            return
+        if msg.get("t") == "fermer":
+            self.hide()
+        elif msg.get("t") == "menu":
+            self.menu_open = bool(msg.get("ouvert"))
+
+    def contains_pointer(self, x: int, y: int) -> bool:
+        if not self.get_visible():
+            return False
+        ox, oy = self.get_position()
+        w, h = self.get_size()
+        return ox <= x < ox + w and oy <= y < oy + h
+
+
 # ════════════════════════════════════════════════════════════════════
 #  Application (une seule instance : les lignes de commande vont à la première)
 # ════════════════════════════════════════════════════════════════════
@@ -798,6 +873,10 @@ class Application(Gtk.Application):
         self._push_timer = 0
         self._push_kinds: set[str] = set()
         self.service_fichiers = None
+        self.dock = None
+        self._edge_since = 0.0
+        self._outside_since = 0.0
+        self._dock_cfg = {"on": True, "gauche": False}
         for name, desc in (("bureau", "Afficher le bureau Archiviste"),
                            ("demander", "Ouvrir « Demander à l'Archiviste »"),
                            ("fenetre", "Ouvrir la fenêtre principale"),
@@ -830,6 +909,8 @@ class Application(Gtk.Application):
         A.FM_HOOK = lambda what: self.in_gtk(lambda: self.fm_service(what)) if what != "etat" else \
             bool(self.service_fichiers and self.service_fichiers.actif)
         self.fm_service("marche" if A.fm_is_archiviste() else "arret")
+        self.read_dock_cfg()
+        GLib.timeout_add(110, self._edge_tick)
         try:
             self.surveillance = Surveillance(self.on_folder_changed)
         except Exception:  # noqa: BLE001 — sans surveillance, le bureau se rafraîchit par sondage, comme avant
@@ -902,6 +983,90 @@ class Application(Gtk.Application):
                 paths.append(f.get_path())
         return {"mode": "couper" if lines[0].strip() == "cut" else "copier", "paths": paths}
 
+    # ── raccourcis au bord de l'écran (par-dessus les applis) ──
+    def read_dock_cfg(self) -> None:
+        st = A.bureau_state()
+        self._dock_cfg = {"on": bool(st.get("dock_bord", True)), "gauche": st.get("volet_cote") == "gauche"}
+
+    def active_xid(self):
+        """Fenêtre active (identifiant X), ou None : le bureau est devant."""
+        try:
+            if self.suivi is not None:
+                w = self.suivi.screen.get_active_window()
+                return w.get_xid() if w is not None else None
+            gw = Gdk.Screen.get_default().get_active_window()
+            return gw.get_xid() if gw is not None and hasattr(gw, "get_xid") else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _xid_of(self, win):
+        gw = win.get_window() if win is not None else None
+        return gw.get_xid() if gw is not None and hasattr(gw, "get_xid") else None
+
+    def _edge_tick(self) -> bool:
+        """Dix fois par seconde : la souris est-elle poussée contre le bord du volet, par-dessus une appli ?
+        Rien n'intercepte les clics au bord de l'écran (barres de défilement) : on regarde seulement où est
+        la souris, et il faut l'y laisser un instant, sans bouton enfoncé."""
+        try:
+            if self.bureau is None or not self._dock_cfg["on"]:
+                self._edge_since = 0.0
+                if self.dock is not None and self.dock.get_visible():
+                    self.dock.hide()
+                return True
+            disp = Gdk.Display.get_default()
+            ptr = disp.get_default_seat().get_pointer() if disp is not None else None
+            root = Gdk.get_default_root_window()
+            if ptr is None or root is None:
+                return True
+            _w, x, y, mask = root.get_device_position(ptr)
+            now = time.monotonic()
+            dock = self.dock
+            if dock is not None and dock.get_visible():
+                self._dock_watch(dock, x, y, now)
+                return True
+            buttons = Gdk.ModifierType.BUTTON1_MASK | Gdk.ModifierType.BUTTON2_MASK | Gdk.ModifierType.BUTTON3_MASK
+            mon = self.desktop_monitor()
+            if mon is None or mask & buttons:
+                self._edge_since = 0.0
+                return True
+            g, wa = mon.get_geometry(), mon.get_workarea()
+            at = (x <= g.x) if self._dock_cfg["gauche"] else (x >= g.x + g.width - 1)
+            at = at and wa.y + 48 <= y < wa.y + wa.height - 24  # pas dans les coins (bouton « fermer » d'une appli agrandie)
+            if not at:
+                self._edge_since = 0.0
+                return True
+            if not self._edge_since:
+                self._edge_since = now
+            elif now - self._edge_since >= 0.25:
+                self._edge_since = 0.0
+                active = self.active_xid()
+                if active is not None and active != self._xid_of(self.bureau):  # une appli est devant le volet
+                    if self.dock is None:
+                        self.dock = DockBord(self)
+                    self.dock.reveal()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        return True
+
+    def _dock_watch(self, dock, x, y, now) -> None:
+        """Le dock s'efface quand on s'en éloigne, ou quand une autre appli passe devant."""
+        if now - dock.shown_at < 0.4:
+            return
+        active = self.active_xid()
+        if active is not None and active != dock.active_at_show and active != self._xid_of(dock):
+            dock.hide()
+            return
+        if dock.menu_open:
+            self._outside_since = 0.0
+            return
+        if dock.contains_pointer(x, y):
+            self._outside_since = 0.0
+        elif not self._outside_since:
+            self._outside_since = now
+        elif now - self._outside_since > 0.5:
+            self._outside_since = 0.0
+            dock.hide()
+
     # ── écrans ──
     def list_monitors(self) -> None:
         """Écrans branchés (lus dans la boucle GTK, puis servis tels quels au serveur)."""
@@ -926,6 +1091,10 @@ class Application(Gtk.Application):
     def on_folder_changed(self, kind: str) -> None:
         if self.bureau is not None:
             self.bureau.run_js(f"window.archivisteChange && archivisteChange({json.dumps(kind)})")
+        if kind == "etat":  # réglages du bureau ou raccourcis changés
+            self.read_dock_cfg()
+            if self.dock is not None:
+                self.dock.run_js("window.archivisteChange && archivisteChange('etat')")
         if kind == "taches" and self.window is not None:  # une tâche de fond commence ou se termine
             self.window.run_js("window.archivisteTaches && archivisteTaches()")
 
@@ -945,6 +1114,8 @@ class Application(Gtk.Application):
     def on_windows_changed(self) -> None:
         if self.bureau is not None:
             self.bureau.run_js("window.archivisteFenetres && archivisteFenetres()")
+        if self.dock is not None and self.dock.get_visible():
+            self.dock.run_js("window.archivisteFenetres && archivisteFenetres()")
 
     def set_icon(self, win: Gtk.Window) -> None:
         icon = HERE / "static" / "icon-512.png"
@@ -954,13 +1125,15 @@ class Application(Gtk.Application):
             win.set_icon_from_file(str(icon))
 
     def forget(self, win) -> None:
-        for attr in ("window", "bureau", "demande"):
+        for attr in ("window", "bureau", "demande", "dock"):
             if getattr(self, attr) is win:
                 setattr(self, attr, None)
         # une fenêtre « Demander » masquée ne doit pas garder Archiviste ouvert pour rien
         if self.window is None and self.bureau is None and self.demande is not None \
                 and not self.demande.get_visible():
             self.demande.destroy()
+        if self.window is None and self.bureau is None and self.dock is not None:
+            self.dock.destroy()  # le dock seul ne garde pas Archiviste ouvert
 
     # ── ligne de commande ──
     def do_command_line(self, cmdline):
@@ -1056,6 +1229,9 @@ class Application(Gtk.Application):
         if self.bureau is not None:
             win, self.bureau = self.bureau, None
             win.destroy()
+        if self.dock is not None:
+            dock, self.dock = self.dock, None
+            dock.destroy()
 
     def toggle_demande(self, close: bool = False) -> None:
         if self.demande is None:

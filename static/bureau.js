@@ -7,7 +7,9 @@
 'use strict';
 
 const Q = new URLSearchParams(location.search);
-const MODE = Q.get('mode') === 'demander' ? 'demander' : 'bureau';
+// bureau : le bureau et son volet ; demander : la petite fenêtre Super + Espace ;
+// dock : les raccourcis seuls, par-dessus les applis, quand la souris pousse contre le bord de l'écran
+const MODE = ['demander', 'dock'].includes(Q.get('mode')) ? Q.get('mode') : 'bureau';
 const D = {
   b: null, items: [], sel: new Set(), anchor: null, sig: '', rv: '', apps: null, favs: [], sc: [], todo: null,
   conv: null, busy: false, ctrl: null, atts: [], editSc: false, ownFond: Q.get('fond') === '1', fondKey: '',
@@ -164,6 +166,7 @@ window.archivisteChange = (kind) => {
   if (kind === 'telechargements') return loadTodo();
   if (kind === 'presse') return clipLoad();
   if (kind === 'taches') return tasksPoll();
+  if (MODE === 'dock') return Promise.all([loadShortcuts(), loadWindows()]);
   return poll();
 };
 async function poll() {
@@ -925,6 +928,14 @@ function setVolet(open) {
 async function onVoletClick(ev) {
   const b = ev.target.closest('[data-v], [data-act], [data-sc], [data-run], [data-todo], [data-chip]');
   if (!b) return;
+  if (MODE === 'demander' && (b.dataset.sc !== undefined || b.dataset.run !== undefined)) {
+    // petite fenêtre Super + Espace : l'appli vient devant (toutes ses fenêtres), la fenêtre se referme
+    const s = D.sc.find((x) => x.id === b.dataset.sc);
+    const cle = s ? winKey(s) : b.dataset.run;
+    if (cle && D.win.map[cle]?.n) await toggleWindows(cle, s ? () => runShortcut(s, true) : null, 'afficher');
+    else if (s) runShortcut(s, true);
+    return closePopup();
+  }
   if (b.dataset.sc !== undefined) {
     if (ev.target.closest('.x')) return removeShortcut(b.dataset.sc);
     if (D.editSc) return;
@@ -962,6 +973,17 @@ async function onVoletClick(ev) {
   }
 }
 function onVoletContext(ev) {
+  if (MODE === 'dock') {  // le dock ne prend pas le clavier : pas de renommage ici, seulement les fenêtres
+    ev.preventDefault();
+    const t = ev.target.closest('[data-sc], [data-run]');
+    if (!t) return null;
+    const s = D.sc.find((x) => x.id === t.dataset.sc);
+    const g = s ? winOf(s) : D.win.map[t.dataset.run];
+    const m = [{ header: s ? s.titre : g?.nom }, ...winMenuItems(g)];
+    if (s && s.type === 'app') m.push({ label: 'Nouvelle fenêtre', icon: 'plus', act: () => runShortcut(s, true) });
+    if (m.length > 1) showMenu(ev.clientX, ev.clientY, m);
+    return null;
+  }
   const t = ev.target.closest('[data-sc]');
   if (t) { ev.preventDefault(); return shortcutMenu(D.sc.find((s) => s.id === t.dataset.sc), ev.clientX, ev.clientY); }
   const o = ev.target.closest('[data-run]');
@@ -1020,7 +1042,6 @@ function winHint(g) {
 }
 function winMarks(g) { return g && g.n ? `<i class="run-dot"></i>${g.n > 1 ? `<span class="nb">${g.n}</span>` : ''}` : ''; }
 async function loadWindows() {
-  if (MODE !== 'bureau') return;
   let r;
   try { r = await api('/api/fenetres'); } catch { return; }
   if (r.sig === D.win.sig && r.dispo === D.win.dispo) return;
@@ -1484,6 +1505,32 @@ const chatAct = (b) => chatAction(b, { conv: () => D.conv, send: sendChat });
 // ───────────────────────── Fenêtre « Demander » (Super + Espace) ─────────────────────────
 function postToGtk(msg) { try { window.webkit.messageHandlers.archiviste.postMessage(JSON.stringify(msg)); } catch { /* hors de la fenêtre GTK */ } }
 let sizeRaf = 0;
+// ── Dock au bord de l'écran ──
+// La fenêtre GTK est large et transparente ; seule la colonne est visible. On s'efface dès que la souris
+// quitte la colonne (sauf pendant un menu), et après avoir choisi une appli.
+function initDock() {
+  const v = $('#volet');
+  v.hidden = false;
+  v.className = 'dock';
+  v.innerHTML = '<nav class="rail glass in" id="rail" aria-label="Raccourcis"><div class="sc" id="sc"></div></nav>';
+  document.body.classList.toggle('volet-gauche', D.b.volet_cote === 'gauche');
+  v.addEventListener('click', onVoletClick);
+  v.addEventListener('contextmenu', onVoletContext);
+  bindShortcutDnD();
+  loadShortcuts();
+  loadWindows();
+  let timer = 0;
+  const busy = () => !!(openMenuEl || $('.overlay'));
+  const close = (delay) => { clearTimeout(timer); timer = setTimeout(() => { if (!busy()) postToGtk({ t: 'fermer' }); }, delay); };
+  document.addEventListener('mousemove', (e) => { if (busy()) return; if (e.target.closest('#rail')) clearTimeout(timer); else close(150); });
+  document.documentElement.addEventListener('mouseleave', () => close(250));
+  // une appli choisie (ou un menu refermé par un choix) : le dock s'en va
+  document.addEventListener('click', () => setTimeout(() => { if (!busy()) postToGtk({ t: 'fermer' }); }, 300));
+  // la fenêtre GTK doit savoir quand un menu est ouvert : il déborde de la colonne, il ne faut pas fermer
+  let menu = false;
+  new MutationObserver(() => { const m = busy(); if (m !== menu) { menu = m; postToGtk({ t: 'menu', ouvert: m }); } })
+    .observe(document.body, { childList: true });
+}
 function reportSize() {
   if (MODE !== 'demander' || sizeRaf) return;
   sizeRaf = requestAnimationFrame(() => { sizeRaf = 0; postToGtk({ t: 'taille', h: Math.ceil($('#ask').getBoundingClientRect().bottom) + 4 }); });
@@ -1518,7 +1565,15 @@ function finishAnswer(from) {
   reportSize();
   $('#askIn').focus();
 }
-window.archivisteMontrer = () => { const i = $('#askIn'); i.focus(); i.select(); reportSize(); if (!D.busy) syncConv(false); };
+window.archivisteMontrer = () => {
+  if (MODE === 'dock') {  // le dock réapparaît : raccourcis et fenêtres à jour, petite entrée par le bord
+    loadShortcuts(); loadWindows();
+    const r = $('#rail'); r.classList.remove('in'); void r.offsetWidth; r.classList.add('in');
+    return;
+  }
+  const i = $('#askIn'); i.focus(); i.select(); reportSize(); if (!D.busy) syncConv(false);
+  loadShortcuts(); loadWindows();
+};
 
 // ───────────────────────── Fond d'écran (si Archiviste le dessine) ─────────────────────────
 async function applyFond() {
@@ -1556,10 +1611,17 @@ async function initBureau() {
     if (dirname(p) === D.b.dossier) { const it = D.items.find((x) => x.path === p); if (it) selectOnly(it); return; }
     openMain({ vue: 'files', chemin: dirname(p), select: p });
   };
-  tasksPoll();
+  if (MODE !== 'dock') tasksPoll();  // le dock n'affiche pas les tâches : il s'efface trop vite
   window.addEventListener('focus', clipLoad);
   refreshVStatus();
+  if (MODE === 'dock') return initDock();
   if (MODE === 'demander') {
+    // les raccourcis du volet, en ligne sous la saisie : un clic ramène l'appli devant
+    $('#askSc').innerHTML = '<div class="sc row" id="sc"></div>';
+    $('#askSc').addEventListener('click', onVoletClick);
+    loadShortcuts().then(() => { $('#askSc').hidden = !D.sc.length; reportSize(); });
+    loadWindows();
+    $('#askIn').addEventListener('input', () => { $('#askSc').hidden = !!$('#askIn').value.trim() || !D.sc.length; reportSize(); });
     const inp = $('#askIn');
     const askNow = (t) => { if (!t) return; inp.value = ''; sendChat({ text: t }); };
     makeLauncher({ input: inp, box: $('#askRes'), onAsk: askNow, always: true });
