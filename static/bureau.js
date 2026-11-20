@@ -1505,9 +1505,11 @@ const chatAct = (b) => chatAction(b, { conv: () => D.conv, send: sendChat });
 // ───────────────────────── Fenêtre « Demander » (Super + Espace) ─────────────────────────
 function postToGtk(msg) { try { window.webkit.messageHandlers.archiviste.postMessage(JSON.stringify(msg)); } catch { /* hors de la fenêtre GTK */ } }
 let sizeRaf = 0;
+let dockZone = () => {};  // dock : redonne à la fenêtre GTK la place de la colonne
 // ── Dock au bord de l'écran ──
-// La fenêtre GTK est large et transparente ; seule la colonne est visible. On s'efface dès que la souris
-// quitte la colonne (sauf pendant un menu), et après avoir choisi une appli.
+// La fenêtre GTK est large et transparente ; seule la colonne est visible et cliquable. C'est la fenêtre GTK
+// qui décide quand s'effacer, d'après la position de la souris (elle tolère qu'on passe à côté de la colonne) :
+// la page lui dit seulement où est la colonne, quand un menu est ouvert, et quand une appli a été choisie.
 function initDock() {
   const v = $('#volet');
   v.hidden = false;
@@ -1519,13 +1521,26 @@ function initDock() {
   bindShortcutDnD();
   loadShortcuts();
   loadWindows();
-  let timer = 0;
   const busy = () => !!(openMenuEl || $('.overlay'));
-  const close = (delay) => { clearTimeout(timer); timer = setTimeout(() => { if (!busy()) postToGtk({ t: 'fermer' }); }, delay); };
-  document.addEventListener('mousemove', (e) => { if (busy()) return; if (e.target.closest('#rail')) clearTimeout(timer); else close(150); });
-  document.documentElement.addEventListener('mouseleave', () => close(250));
-  // une appli choisie (ou un menu refermé par un choix) : le dock s'en va
-  document.addEventListener('click', () => setTimeout(() => { if (!busy()) postToGtk({ t: 'fermer' }); }, 300));
+  // une appli choisie (un raccourci, ou un choix dans un menu) : le dock s'en va. Un clic à côté ne le ferme pas.
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('button, [data-run], [data-sc]')) return;
+    setTimeout(() => { if (!busy()) postToGtk({ t: 'fermer' }); }, 300);
+  });
+  // la place de la colonne, pour que seule elle prenne les clics (le reste laisse passer vers l'appli)
+  const rail = $('#rail');
+  let zoneKey = '';
+  const zone = () => {
+    const r = rail.getBoundingClientRect();
+    const z = { t: 'zone', x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height), vw: innerWidth, vh: innerHeight };
+    const key = `${z.x},${z.y},${z.w},${z.h},${z.vw}`;
+    if (key !== zoneKey) { zoneKey = key; postToGtk(z); }
+  };
+  dockZone = () => { zoneKey = ''; zone(); };
+  rail.addEventListener('animationend', zone);
+  window.addEventListener('resize', zone);
+  if (window.ResizeObserver) new ResizeObserver(zone).observe(rail);
+  setTimeout(zone, 250);
   // la fenêtre GTK doit savoir quand un menu est ouvert : il déborde de la colonne, il ne faut pas fermer
   let menu = false;
   new MutationObserver(() => { const m = busy(); if (m !== menu) { menu = m; postToGtk({ t: 'menu', ouvert: m }); } })
@@ -1567,8 +1582,10 @@ function finishAnswer(from) {
 }
 window.archivisteMontrer = () => {
   if (MODE === 'dock') {  // le dock réapparaît : raccourcis et fenêtres à jour, petite entrée par le bord
+    closeMenu();  // un menu resté ouvert quand il s'est effacé
     loadShortcuts(); loadWindows();
     const r = $('#rail'); r.classList.remove('in'); void r.offsetWidth; r.classList.add('in');
+    setTimeout(() => dockZone(), 250);  // la fenêtre GTK redemande la place de la colonne à chaque apparition
     return;
   }
   const i = $('#askIn'); i.focus(); i.select(); reportSize(); if (!D.busy) syncConv(false);
