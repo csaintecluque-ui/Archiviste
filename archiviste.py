@@ -42,7 +42,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import archives  # noqa: E402  (zip, tar, 7z… : archives.py, à côté)
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 HOME = Path.home()

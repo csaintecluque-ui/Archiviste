@@ -1,5 +1,12 @@
 # Nouveautés
 
+## 1.6.2
+- **La colonne des raccourcis au bord de l'écran ne disparaît plus d'un coup.** Avant, le moindre mouvement de souris qui ne tombait pas pile sur la colonne la faisait partir en 0,15 s — y compris juste après son apparition, puisque la souris est alors contre le bord, à côté de la colonne. Maintenant elle reste tant que la souris est dans sa bande : contre le bord, sur la colonne ou un peu à côté, en montant ou en descendant. Elle s'efface quand tu t'éloignes franchement (après une demi-seconde, le temps de revenir si c'était un écart), quand tu cliques dans ton appli, ou quand tu choisis un raccourci.
+- **Elle apparaît un peu moins vite** (0,4 s contre le bord au lieu de 0,25 s) : passer par le bord de l'écran ne la fait plus surgir par accident.
+- **Les clics à côté de la colonne vont à ton appli.** La fenêtre du dock est large et transparente (pour ses menus) : jusqu'ici, elle avalait les clics sur cette partie invisible. Seule la colonne les prend désormais.
+- **Barre de défilement contre le bord** : un clic dessus fait partir la colonne, et elle ne revient pas tant que la souris reste contre le bord ; écarte-la puis reviens pour la rappeler.
+- Un clic droit sur un raccourci du dock ouvre son menu sans que la colonne file pendant qu'on s'en sert ; un clic dans l'appli referme les deux.
+
 ## 1.6.1
 - **Les raccourcis par-dessus les applis** : une appli en plein écran (Claude, Firefox…) ? Pousse la souris contre le bord droit de l'écran (celui du volet) : la colonne des raccourcis apparaît par-dessus, sans rien réduire. Un clic ramène l'appli choisie devant (ou propose de choisir sa fenêtre s'il y en a plusieurs), et la colonne s'efface dès que la souris s'en éloigne. Elle ne prend pas le clavier, ne gêne pas les barres de défilement (il faut laisser la souris un instant contre le bord, sans bouton enfoncé) ni le bouton « fermer » dans le coin. Réglages → Bureau → « Raccourcis par-dessus les applis » pour la désactiver.
 - **Super + Espace** montre aussi les raccourcis, en ligne sous la saisie : un clic ramène l'appli devant et referme la petite fenêtre.

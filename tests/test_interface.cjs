@@ -411,9 +411,20 @@ with zipfile.ZipFile("${DESK}/Photos.zip", "w") as z:
   await q.p.click('#sc [data-sc="q2"]');
   await sleep(500);
   check(q.starts2.length === 1 && q.starts2[0].id === 'org.gnome.Terminal.desktop', 'dock : une appli fermée est lancée');
+  // c'est la fenêtre GTK qui décide de s'effacer, d'après la souris : la page lui dit où est la colonne
+  const zones = (await q.gtk()).filter((m) => m.t === 'zone');
+  const railBox = await q.p.evaluate(() => { const r = document.querySelector('#rail').getBoundingClientRect(); return { x: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; });
+  const z = zones[zones.length - 1];
+  check(z && z.x === railBox.x && z.w === railBox.w && z.h === railBox.h && z.vw > 0, 'dock : la page donne la place de la colonne (seule elle prendra les clics)');
+  const fermes = (await q.gtk()).filter((m) => m.t === 'fermer').length;
+  await q.p.mouse.move(railBox.x + railBox.w + 3, 300);  // juste à côté de la colonne, contre le bord de l'écran
+  await sleep(150);
   await q.p.mouse.move(20, 300);
   await sleep(400);
-  check((await q.gtk()).filter((m) => m.t === 'fermer').length >= 2, 'dock : la souris s\'éloigne de la colonne → il s\'efface');
+  await q.p.mouse.click(railBox.x + railBox.w / 2, 8 + Math.round((await q.p.evaluate(() => document.querySelector('#rail').getBoundingClientRect().top))));  // rembourrage de la colonne
+  await sleep(450);
+  check((await q.gtk()).filter((m) => m.t === 'fermer').length === fermes,
+    'dock : bouger la souris à côté de la colonne, ou cliquer sur son rembourrage, ne le ferme plus d\'un coup');
   await q.p.close();
   // Super + Espace : les raccourcis en ligne sous la saisie
   q = await quick('demander');

@@ -53,6 +53,11 @@ try:  # suivi des fenêtres ouvertes (repères sur les raccourcis du volet) : fa
     from gi.repository import Wnck
 except (ImportError, ValueError):
     Wnck = None
+try:  # zone cliquable du dock (le reste de sa fenêtre laisse passer les clics vers l'appli) : facultatif
+    import cairo
+    gi.require_foreign("cairo")
+except (ImportError, ValueError):
+    cairo = None
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -63,6 +68,10 @@ STATE_FILE = A.DATA_DIR / "fenetre.json"
 ZOOMS = [0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0]
 TRANSPARENT = Gdk.RGBA(0, 0, 0, 0)
 ENCRE = Gdk.RGBA(0.09, 0.07, 0.06, 1.0)
+# Raccourcis au bord de l'écran (dock)
+DOCK_APPARITION = 0.4   # secondes contre le bord de l'écran avant que la colonne apparaisse
+DOCK_DISPARITION = 0.6  # secondes hors de la zone du dock avant qu'elle s'efface
+DOCK_MARGE = 72         # pixels autour de la colonne où la souris peut aller et venir sans la faire partir
 
 GLib.set_prgname("archiviste")
 GLib.set_application_name("Archiviste")
@@ -784,8 +793,13 @@ class Demande(VueWeb, Gtk.ApplicationWindow):
 
 class DockBord(VueWeb, Gtk.ApplicationWindow):
     """Les raccourcis du volet, par-dessus les applis : ils apparaissent quand la souris est poussée contre
-    le bord de l'écran où se tient le volet, et s'effacent dès qu'on s'en éloigne ou qu'une appli est choisie.
-    La fenêtre ne prend jamais le clavier : l'appli en cours le garde."""
+    le bord de l'écran où se tient le volet, et s'effacent quand on s'en éloigne franchement, qu'on clique
+    ailleurs ou qu'une appli est choisie. La fenêtre ne prend jamais le clavier : l'appli en cours le garde.
+
+    Sa fenêtre est large et transparente (pour les menus) mais seule la colonne reçoit les clics : le reste
+    les laisse passer vers l'appli en dessous. Tant que la souris reste dans la bande qui va de la colonne
+    (marge comprise) au bord de l'écran, sur toute la hauteur, le dock reste là, même si elle n'est pas
+    exactement sur la colonne."""
     zoom_key = "zoom_bureau"
 
     def __init__(self, app: "Application"):
@@ -810,8 +824,12 @@ class DockBord(VueWeb, Gtk.ApplicationWindow):
         self.menu_open = False
         self.shown_at = 0.0
         self.active_at_show = None
+        self.left = False
+        self.geom = (0, 0, self.W, 0)  # position et taille demandées (écran), plus sûres que celles du gestionnaire de fenêtres
+        self.rail = None               # rectangle de la colonne dans la fenêtre (x, y, l, h), donné par la page
         self.connect("delete-event", lambda *_: self.hide() or True)
         self.connect("destroy", lambda *_: app.forget(self))
+        self.connect("realize", lambda *_: self.apply_input_shape())
         self.view.load_uri(app.base + "bureau?mode=dock&fond=" + ("0" if self.composite else "1"))
         self.place()
         self.view.show()
@@ -821,16 +839,19 @@ class DockBord(VueWeb, Gtk.ApplicationWindow):
         if mon is None:
             return
         wa = mon.get_workarea()
-        left = A.bureau_state().get("volet_cote") == "gauche"
+        self.left = A.bureau_state().get("volet_cote") == "gauche"
+        x = wa.x if self.left else wa.x + wa.width - self.W
+        self.geom = (x, wa.y, self.W, wa.height)
         self.set_size_request(self.W, wa.height)
         self.resize(self.W, wa.height)
-        self.move(wa.x if left else wa.x + wa.width - self.W, wa.y)
+        self.move(x, wa.y)
 
     def reveal(self) -> None:
         self.place()
         self.menu_open = False
         self.shown_at = time.monotonic()
         self.active_at_show = self.app.active_xid()
+        self.apply_input_shape()
         self.show()
         gw = self.get_window()
         if gw is not None:
@@ -847,13 +868,62 @@ class DockBord(VueWeb, Gtk.ApplicationWindow):
             self.hide()
         elif msg.get("t") == "menu":
             self.menu_open = bool(msg.get("ouvert"))
+            self.apply_input_shape()
+        elif msg.get("t") == "zone":
+            self.set_rail(msg)
 
-    def contains_pointer(self, x: int, y: int) -> bool:
-        if not self.get_visible():
-            return False
-        ox, oy = self.get_position()
-        w, h = self.get_size()
+    def set_rail(self, msg: dict) -> None:
+        """La page donne la place de la colonne (pixels CSS) : on la convertit en pixels de la fenêtre (zoom)."""
+        try:
+            vw = float(msg.get("vw") or 0)
+            k = self.view.get_allocated_width() / vw if vw > 0 and self.view.get_allocated_width() > 1 else 1.0
+            x, y, w, h = (float(msg[c]) * k for c in ("x", "y", "w", "h"))
+        except (KeyError, TypeError, ValueError):
+            return
+        if w < 8 or h < 8:
+            return
+        self.rail = (int(x), int(y), int(round(w)), int(round(h)))
+        self.apply_input_shape()
+
+    def apply_input_shape(self) -> None:
+        """Seule la colonne prend les clics ; le reste de la fenêtre (transparent) les laisse passer vers l'appli.
+        Pendant un menu, toute la fenêtre les prend (le menu déborde de la colonne)."""
+        if cairo is None or self.get_window() is None:
+            return
+        try:
+            if self.menu_open or self.rail is None:
+                self.input_shape_combine_region(None)
+            else:
+                x, y, w, h = self.rail
+                self.input_shape_combine_region(cairo.Region(cairo.RectangleInt(x - 4, y - 4, w + 8, h + 8)))
+        except Exception:  # noqa: BLE001 — sans forme, la fenêtre entière prend les clics, comme avant
+            traceback.print_exc()
+
+    def on_window(self, x: int, y: int) -> bool:
+        ox, oy, w, h = self.geom
         return ox <= x < ox + w and oy <= y < oy + h
+
+    def on_rail(self, x: int, y: int) -> bool:
+        """La souris (coordonnées de l'écran) est sur la colonne elle-même."""
+        if self.rail is None:
+            return self.in_zone(x, y)
+        ox, oy = self.geom[:2]
+        rx, ry, rw, rh = self.rail
+        return ox + rx - 4 <= x < ox + rx + rw + 4 and oy + ry - 4 <= y < oy + ry + rh + 4
+
+    def in_zone(self, x: int, y: int) -> bool:
+        """La souris est dans la bande du dock : de la colonne (marge comprise) jusqu'au bord de l'écran, sur
+        toute la hauteur. On peut y monter, descendre ou longer le bord sans que le dock s'en aille."""
+        ox, oy, w, h = self.geom
+        if not oy - DOCK_MARGE <= y < oy + h + DOCK_MARGE:
+            return False
+        if self.rail is None:  # la page n'a pas encore dit où est la colonne : on prend sa place habituelle
+            inner = 8 + 80 + DOCK_MARGE
+            return ox <= x < ox + inner if self.left else ox + w - inner <= x < ox + w
+        rx, _ry, rw, _rh = self.rail
+        if self.left:
+            return ox <= x < ox + rx + rw + DOCK_MARGE
+        return ox + rx - DOCK_MARGE <= x < ox + w
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -875,6 +945,9 @@ class Application(Gtk.Application):
         self.service_fichiers = None
         self.dock = None
         self._edge_since = 0.0
+        self._edge_armed = True  # après un dock effacé, la souris doit quitter le bord avant qu'il revienne
+        self._was_pressed = False
+        self._press_outside = False
         self._outside_since = 0.0
         self._dock_cfg = {"on": True, "gauche": False}
         for name, desc in (("bureau", "Afficher le bureau Archiviste"),
@@ -910,7 +983,7 @@ class Application(Gtk.Application):
             bool(self.service_fichiers and self.service_fichiers.actif)
         self.fm_service("marche" if A.fm_is_archiviste() else "arret")
         self.read_dock_cfg()
-        GLib.timeout_add(110, self._edge_tick)
+        GLib.timeout_add(50, self._edge_tick)  # assez souvent pour voir passer un clic
         try:
             self.surveillance = Surveillance(self.on_folder_changed)
         except Exception:  # noqa: BLE001 — sans surveillance, le bureau se rafraîchit par sondage, comme avant
@@ -1004,9 +1077,9 @@ class Application(Gtk.Application):
         return gw.get_xid() if gw is not None and hasattr(gw, "get_xid") else None
 
     def _edge_tick(self) -> bool:
-        """Dix fois par seconde : la souris est-elle poussée contre le bord du volet, par-dessus une appli ?
+        """Vingt fois par seconde : la souris est-elle poussée contre le bord du volet, par-dessus une appli ?
         Rien n'intercepte les clics au bord de l'écran (barres de défilement) : on regarde seulement où est
-        la souris, et il faut l'y laisser un instant, sans bouton enfoncé."""
+        la souris, et il faut l'y laisser un instant (DOCK_APPARITION), sans bouton enfoncé."""
         try:
             if self.bureau is None or not self._dock_cfg["on"]:
                 self._edge_since = 0.0
@@ -1021,10 +1094,10 @@ class Application(Gtk.Application):
             _w, x, y, mask = root.get_device_position(ptr)
             now = time.monotonic()
             dock = self.dock
-            if dock is not None and dock.get_visible():
-                self._dock_watch(dock, x, y, now)
-                return True
             buttons = Gdk.ModifierType.BUTTON1_MASK | Gdk.ModifierType.BUTTON2_MASK | Gdk.ModifierType.BUTTON3_MASK
+            if dock is not None and dock.get_visible():
+                self._dock_watch(dock, x, y, bool(mask & buttons), now)
+                return True
             mon = self.desktop_monitor()
             if mon is None or mask & buttons:
                 self._edge_since = 0.0
@@ -1034,38 +1107,58 @@ class Application(Gtk.Application):
             at = at and wa.y + 48 <= y < wa.y + wa.height - 24  # pas dans les coins (bouton « fermer » d'une appli agrandie)
             if not at:
                 self._edge_since = 0.0
+                self._edge_armed = True
+                return True
+            if not self._edge_armed:  # elle n'a pas quitté le bord depuis que le dock s'est effacé
                 return True
             if not self._edge_since:
                 self._edge_since = now
-            elif now - self._edge_since >= 0.25:
+            elif now - self._edge_since >= DOCK_APPARITION:
                 self._edge_since = 0.0
                 active = self.active_xid()
                 if active is not None and active != self._xid_of(self.bureau):  # une appli est devant le volet
                     if self.dock is None:
                         self.dock = DockBord(self)
+                    self._outside_since = 0.0
+                    self._was_pressed = self._press_outside = False
                     self.dock.reveal()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
         return True
 
-    def _dock_watch(self, dock, x, y, now) -> None:
-        """Le dock s'efface quand on s'en éloigne, ou quand une autre appli passe devant."""
-        if now - dock.shown_at < 0.4:
+    def _dock_watch(self, dock, x, y, pressed: bool, now) -> None:
+        """Le dock reste tant que la souris est dans sa bande (colonne + marge → bord de l'écran) ; il s'efface
+        quand elle en est sortie depuis un moment, quand on clique ailleurs, ou quand une autre appli passe devant."""
+        if now - dock.shown_at < 0.4:  # il vient d'apparaître : on le laisse s'installer
             return
         active = self.active_xid()
         if active is not None and active != dock.active_at_show and active != self._xid_of(dock):
-            dock.hide()
+            self._dock_hide(dock, rearm=False)
+            return
+        if pressed and not self._was_pressed:  # un bouton vient d'être enfoncé : dans le dock, ou dans l'appli ?
+            # (menu ouvert, toute la fenêtre du dock prend les clics ; sinon seulement la colonne)
+            self._press_outside = not (dock.on_window(x, y) if dock.menu_open else dock.on_rail(x, y))
+        self._was_pressed = pressed
+        if pressed and self._press_outside:  # un clic dans l'appli : on ne la gêne pas plus longtemps
+            self._dock_hide(dock, rearm=False)
             return
         if dock.menu_open:
             self._outside_since = 0.0
             return
-        if dock.contains_pointer(x, y):
+        if pressed or dock.in_zone(x, y):  # bouton tenu sur la colonne (glisser un raccourci) : on ne part pas
             self._outside_since = 0.0
         elif not self._outside_since:
             self._outside_since = now
-        elif now - self._outside_since > 0.5:
-            self._outside_since = 0.0
-            dock.hide()
+        elif now - self._outside_since >= DOCK_DISPARITION:
+            self._dock_hide(dock)
+
+    def _dock_hide(self, dock, rearm: bool = True) -> None:
+        """rearm=False : effacé par un clic dans l'appli (souvent sa barre de défilement, contre le bord) ; il ne
+        revient pas tant que la souris n'a pas quitté le bord."""
+        self._outside_since = 0.0
+        self._edge_since = 0.0
+        self._edge_armed = rearm
+        dock.hide()
 
     # ── écrans ──
     def list_monitors(self) -> None:
